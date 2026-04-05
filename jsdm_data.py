@@ -152,6 +152,7 @@ class JSDMDataset(Dataset):
             "target_species": torch.tensor(target_species, dtype=torch.float32),
             "source_species": torch.tensor(source_species, dtype=torch.float32),
             "source_env": torch.tensor(source_env, dtype=torch.float32),
+            "target_env": torch.tensor(self.env_data[idx], dtype=torch.float32),  # (E,) — target site covariates/effort
             "target_idx": torch.tensor(idx, dtype=torch.long),
             "source_idx": torch.tensor(source_idx, dtype=torch.long),
         }
@@ -182,8 +183,11 @@ class JSDMDataCollator:
             if not masked_indices[b].any():
                 masked_indices[b, torch.randint(S, (1,))] = True
 
+        # Convert to discrete token ids for target embedding: 0=absent, 1=present, 2=mask
+        # Source ids remain float (masked with self.mask_value below)
+        target_ids = target_species.long()  # (B, S)
         indices_replaced = torch.bernoulli(torch.full((B, S), 0.9)).bool() & masked_indices
-        target_species[indices_replaced] = self.mask_value
+        target_ids[indices_replaced] = 2  # mask token; 10% of masked positions keep original token
 
         if self.cluster_labels is not None:
             source_idx = batch["source_idx"]
@@ -199,7 +203,7 @@ class JSDMDataCollator:
 
         labels[~masked_indices] = -100
 
-        batch["input_ids"] = target_species.unsqueeze(-1)
+        batch["input_ids"] = target_ids.unsqueeze(-1)  # (B, S, 1) long
         batch["source_ids"] = source_species
         batch["labels"] = labels.unsqueeze(-1)
         batch["env_data"] = batch.pop("source_env")

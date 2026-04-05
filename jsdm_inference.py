@@ -39,6 +39,7 @@ def run_forward(model, batch, cluster_info, device, output_attentions=False):
         source_idx=batch["source_idx"],
         target_site_idx=batch["target_site_idx"],
         env_data=batch["env_data"],
+        target_env=batch["target_env"],
         labels=batch["labels"],
         cluster_dict=cluster_info["cluster_dict"],
         cluster_labels=cluster_info["cluster_labels"],

@@ -150,32 +150,45 @@ def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
 
 
 # =============================================================================
-# Target Input (NO embedding needed)
+# RMSNorm — faster and simpler than LayerNorm; standard in modern transformers
+# =============================================================================
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
+        return (x / rms) * self.weight
+
+
+# =============================================================================
+# Target Input
 #
 # GPN-star: nucleotides are categorical → nn.Embedding(6, H) → (B, L, T, H)
-# Here: species states are already numeric 0/1 → use directly as 1-dim embeddings
-#   Input: (B, S, T) float values {0.0, 1.0, mask_value}
-#   Output: (B, S, T, 1) — the "H=1" embedding, expanded by attention Q/K/V projections
+# Here: species states are categorical with 3 tokens → nn.Embedding(3, H) → (B, S, T, H)
+#   0 = absent, 1 = present, 2 = mask
 #
-# The mask token is a learned parameter distinct from 0 and 1.
+# Using a 3-token embedding instead of nn.Linear(1, H) gives each state
+# an unrestricted H-dim vector, rather than 3 collinear points on a 1-D line.
 # =============================================================================
 
 class TargetInput(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
-        # Learned mask value — distinct from 0.0 (absent) and 1.0 (present)
-        # Initialized to -1.0 so it's clearly different from valid states
-        self.mask_value = nn.Parameter(torch.tensor(config.mask_value_init))
+        # 3 discrete tokens: 0=absent, 1=present, 2=mask
+        self.embedding = nn.Embedding(3, config.hidden_size)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            input_ids: (B, S, T) float tensor
-                       0.0 = absent, 1.0 = present, mask_value for masked species
+            input_ids: (B, S, T) long tensor — 0=absent, 1=present, 2=mask
         Returns:
-            (B, S, T, 1) — each species state as a 1-dim "embedding"
+            (B, S, T, H)
         """
-        return input_ids.unsqueeze(-1)  # (B, S, T, 1)
+        return self.embedding(input_ids)  # (B, S, T, H)
 
 
 # =============================================================================
@@ -192,132 +205,82 @@ class TargetInput(nn.Module):
 #   → returns (B, S, C_st, H) = cluster-pooled embeddings at each species
 # =============================================================================
 
-class STAttentionPool(nn.Module):
-    """
-    Attention pool source sites within a spatial-temporal cluster.
-    Mirrors GPNStarAttentionPool structure.
-
-    GPN-star: uses nn.Embedding(vocab_size, ...) because nucleotides are discrete tokens.
-    Here: uses nn.Linear(1, ...) because species states are raw 0/1 floats.
-    The 0/1 value at each species position is a 1-dim input.
-    """
-
-    def __init__(self, config: JSDMConfig):
-        super().__init__()
-        self.num_attention_heads = config.num_attention_heads // 2
-        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
-        self.all_head_size = self.num_attention_heads * self.attention_head_size
-
-        # Linear projections from 1-dim input (instead of Embedding lookups)
-        self.attention_weights = nn.Linear(1, self.num_attention_heads)
-        self.value = nn.Linear(1, self.all_head_size)
-
-        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
-        self.ffn = nn.Linear(self.all_head_size, config.hidden_size)
-
-    def transpose_for_scores(self, x):
-        new_x_shape = x.size()[:-1] + (
-            self.num_attention_heads,
-            self.attention_head_size,
-        )
-        x = x.view(*new_x_shape)
-        return x.transpose(-2, -3)
-
-    def forward(self, source_ids, in_cluster_dist_bias):
-        """
-        Args:
-            source_ids: (B, S, N_c) float species states at N_c sites in this cluster
-            in_cluster_dist_bias: broadcastable bias for within-cluster distances
-
-        Returns:
-            pooled: (B, S, H)
-        """
-        x = source_ids.unsqueeze(-1).float()  # (B, S, N_c, 1)
-
-        attention_scores = (
-            self.attention_weights(x).transpose(-1, -2).unsqueeze(-2)
-        )  # (B, S, A, 1, N_c)
-        value_layer = self.transpose_for_scores(
-            self.value(x)
-        )  # (B, S, A, N_c, D)
-
-        attention_scores = attention_scores + in_cluster_dist_bias
-        attention_probs = F.softmax(attention_scores, dim=-1)
-        attention_probs = self.dropout(attention_probs)
-
-        pooled = torch.matmul(attention_probs, value_layer)  # (B, S, A, 1, D)
-        pooled = pooled.transpose(-2, -3).contiguous()       # (B, S, 1, A, D)
-        new_shape = pooled.size()[:-3] + (self.all_head_size,)
-        pooled = pooled.view(*new_shape)  # (B, S, H//2)
-        pooled = self.ffn(pooled)         # (B, S, H)
-
-        return pooled
-
-
 class STSourceModule(nn.Module):
     """
-    Spatial-temporal source module. Mirrors GPNStarSourceModule exactly.
+    Vectorized spatial-temporal source module.
 
     GPN-star: source_ids (B,L,N) → group by clade → pool → (B,L,C,H)
     Here: source_ids (B,S,N) → group by ST cluster → pool → (B,S,C_st,H)
+
+    Fully vectorized: for each cluster, a masked softmax over the N sampled source sites
+    ensures only member sites contribute. Empty clusters produce zero embeddings.
+    Memory: O(B·S·N·A·C) for the masked logit tensor.
     """
 
     def __init__(self, config: JSDMConfig):
         super().__init__()
-        self.attn_pool = STAttentionPool(config)
-        # For single-site clusters: project 1-dim float → hidden_size
-        self.single_site_proj = nn.Linear(1, config.hidden_size)
+        self.num_heads = config.num_attention_heads // 2
+        self.head_size = config.hidden_size // config.num_attention_heads
+        self.all_head_size = self.num_heads * self.head_size
+
+        # Source sites remain float {0, 1, mask_value} — projected from 1-dim input
+        self.attention_weights = nn.Linear(1, self.num_heads)
+        self.value = nn.Linear(1, self.all_head_size)
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+        self.ffn = nn.Linear(self.all_head_size, config.hidden_size)
 
         self.fire_spatial = FIREDistanceBias(config.max_spatial_dist, config.fire_hidden_size)
         self.fire_temporal = FIREDistanceBias(config.max_temporal_dist, config.fire_hidden_size)
 
     def forward(
         self,
-        source_ids: torch.Tensor,
-        source_cluster_labels: torch.Tensor,
-        in_cluster_spatial_dist: torch.Tensor,
-        in_cluster_temporal_dist: torch.Tensor,
+        source_ids: torch.Tensor,                # (B, S, N)
+        source_cluster_labels: torch.Tensor,      # (B, N) long
+        in_cluster_spatial_dist: torch.Tensor,   # (B, N)
+        in_cluster_temporal_dist: torch.Tensor,  # (B, N)
         num_clusters: int,
     ) -> torch.Tensor:
-        """
-        Args:
-            source_ids: (B, S, N) species states at S species for N source sites
-            source_cluster_labels: (B, N) cluster id for each sampled source site
-            in_cluster_spatial_dist: (B, N) dist from each source to its cluster center
-            in_cluster_temporal_dist: (B, N) temporal dist to cluster center
-            num_clusters: total number of spatial-temporal clusters
+        B, S, N = source_ids.shape
+        C = num_clusters
 
-        Returns:
-            cluster_pooled: (B, S, C_st, H)
-        """
-        # Compute within-cluster distance bias per sampled site
-        spatial_bias = self.fire_spatial(in_cluster_spatial_dist)  # (B, N)
-        temporal_bias = self.fire_temporal(in_cluster_temporal_dist)  # (B, N)
-        in_cluster_bias = spatial_bias + temporal_bias  # (B, N)
+        # Within-cluster distance bias: (B, N)
+        in_cluster_bias = (
+            self.fire_spatial(in_cluster_spatial_dist)
+            + self.fire_temporal(in_cluster_temporal_dist)
+        )
 
-        B, S, _ = source_ids.shape
-        out_dim = self.single_site_proj.out_features
-        cluster_pooled = []
-        for cluster_id in range(num_clusters):
-            pooled_per_batch = []
-            for b in range(B):
-                pos = (source_cluster_labels[b] == cluster_id).nonzero(as_tuple=True)[0]
-                if pos.numel() == 0:
-                    pooled = source_ids.new_zeros(S, out_dim)
-                elif pos.numel() == 1:
-                    single = source_ids[b, :, pos[0]].unsqueeze(-1).float()  # (S, 1)
-                    pooled = self.single_site_proj(single)
-                else:
-                    bias = in_cluster_bias[b, pos][None, None, None, None, :]  # (1,1,1,1,N_c)
-                    pooled = self.attn_pool(
-                        source_ids[b:b + 1, :, pos],
-                        bias,
-                    ).squeeze(0)
-                pooled_per_batch.append(pooled)
-            cluster_pooled.append(torch.stack(pooled_per_batch, dim=0))
+        x = source_ids.unsqueeze(-1).float()                          # (B, S, N, 1)
+        attn_logits = self.attention_weights(x)                        # (B, S, N, A)
+        v = self.value(x).view(B, S, N, self.num_heads, self.head_size)  # (B, S, N, A, D)
 
-        cluster_pooled = torch.stack(cluster_pooled, dim=-2)  # (B, S, C_st, H)
-        return cluster_pooled
+        # Add distance bias, broadcast over S and A dims
+        attn_logits = attn_logits + in_cluster_bias[:, None, :, None]  # (B, S, N, A)
+
+        # Cluster membership mask: 1.0 if site n belongs to cluster c
+        member = F.one_hot(source_cluster_labels, num_classes=C).float()  # (B, N, C)
+        # Non-member sites get a large negative penalty: (B, 1, N, 1, C)
+        non_member_mask = (1.0 - member[:, None, :, None, :]) * -1e9
+
+        # Masked logits per cluster, then softmax over N within each cluster
+        masked_logits = attn_logits.unsqueeze(-1) + non_member_mask   # (B, S, N, A, C)
+        # nan_to_num: empty clusters (all -inf) produce nan from softmax → replace with 0
+        attn_probs = torch.nan_to_num(
+            F.softmax(masked_logits, dim=2), nan=0.0
+        )  # (B, S, N, A, C)
+        attn_probs = self.dropout(attn_probs)
+
+        # Weighted sum: (B, S, A, C, N) @ (B, S, A, N, D) → (B, S, A, C, D)
+        pooled = torch.matmul(
+            attn_probs.permute(0, 1, 3, 4, 2),   # (B, S, A, C, N)
+            v.permute(0, 1, 3, 2, 4),             # (B, S, A, N, D)
+        )  # (B, S, A, C, D)
+        pooled = pooled.permute(0, 1, 3, 2, 4).reshape(B, S, C, self.all_head_size)
+
+        result = self.ffn(pooled)  # (B, S, C, H)
+
+        # Zero out embeddings for clusters with no sampled sources in this batch
+        has_member = member.any(dim=1)  # (B, C)
+        return result * has_member[:, None, :, None].float()
 
 
 # =============================================================================
@@ -340,7 +303,7 @@ class EcoSourceModule(nn.Module):
         self.key_proj = nn.Linear(config.hidden_size, config.hidden_size)
         self.value_proj = nn.Linear(config.hidden_size, config.hidden_size)
         self.out_proj = nn.Linear(config.hidden_size, config.hidden_size)
-        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layer_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, env_data: torch.Tensor) -> torch.Tensor:
         """
@@ -456,13 +419,10 @@ class SpeciesSelfOutput(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size // 2, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states, input_tensor):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        return self.LayerNorm(hidden_states + input_tensor)
+    def forward(self, hidden_states):
+        return self.dropout(self.dense(hidden_states))
 
 
 class SpeciesRowAttention(nn.Module):
@@ -473,7 +433,7 @@ class SpeciesRowAttention(nn.Module):
 
     def forward(self, hidden_states, sinusoidal_pos=None, output_attentions=False):
         self_outputs = self.self_attn(hidden_states, sinusoidal_pos, output_attentions)
-        output = (self.output(self_outputs[0], hidden_states),)
+        output = (self.output(self_outputs[0]),)  # project+dropout only; residual in JSDMAttention
         if output_attentions:
             output = output + (self_outputs[1],)
         return output
@@ -554,13 +514,10 @@ class STCrossOutput(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size // 2, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states, input_tensor):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        return self.LayerNorm(hidden_states + input_tensor)
+    def forward(self, hidden_states):
+        return self.dropout(self.dense(hidden_states))
 
 
 class STColAttention(nn.Module):
@@ -597,7 +554,7 @@ class STColAttention(nn.Module):
         cross_outputs = self.cross_attn(
             hidden_states, source_embeddings, attention_mask, st_dist_bias, output_attentions,
         )
-        output = (self.output(cross_outputs[0], hidden_states),)
+        output = (self.output(cross_outputs[0]),)  # project+dropout only; residual in JSDMAttention
         if output_attentions:
             output = output + (cross_outputs[1],)
         return output
@@ -663,13 +620,10 @@ class EcoCrossOutput(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size // 2, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states, input_tensor):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        return self.LayerNorm(hidden_states + input_tensor)
+    def forward(self, hidden_states):
+        return self.dropout(self.dense(hidden_states))
 
 
 class EcoColAttention(nn.Module):
@@ -680,7 +634,7 @@ class EcoColAttention(nn.Module):
 
     def forward(self, hidden_states, eco_embeddings, output_attentions=False):
         cross_outputs = self.cross_attn(hidden_states, eco_embeddings, output_attentions)
-        output = (self.output(cross_outputs[0], hidden_states),)
+        output = (self.output(cross_outputs[0]),)  # project+dropout only; residual in JSDMAttention
         if output_attentions:
             output = output + (cross_outputs[1],)
         return output
@@ -699,38 +653,39 @@ class JSDMAttention(nn.Module):
         self.row_attention = SpeciesRowAttention(config)
         self.st_col_attention = STColAttention(config)
         self.eco_col_attention = EcoColAttention(config)
-        self.combine_gate = nn.Parameter(torch.tensor(0.5))
+        # Per-species gate: each species learns its own ST vs ecological context balance.
+        # init=0 → sigmoid(0)=0.5 for all species. Learns habitat-specialists vs range-generalists.
+        self.combine_gate = nn.Parameter(torch.zeros(config.num_species))
+        # Pre-norm layers: applied before each sub-block; residual added here, not inside sub-modules
+        self.row_norm  = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.cross_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(
         self, hidden_states, st_source_embeddings, eco_embeddings,
         st_attention_mask=None, st_dist=None, sinusoidal_pos=None,
         output_attentions=False,
     ):
-        # 1. Species self-attention (transpose (B,S,T,H) → (B,T,S,H))
+        # 1. Pre-norm → species self-attention → residual  (B,S,T,H) ↔ (B,T,S,H)
         row_output = self.row_attention(
-            hidden_states=hidden_states.transpose(-2, -3),
+            hidden_states=self.row_norm(hidden_states).transpose(-2, -3),
             sinusoidal_pos=sinusoidal_pos,
             output_attentions=output_attentions,
         )
-        h = row_output[0].transpose(-2, -3)  # back to (B, S, T, H)
+        h = hidden_states + row_output[0].transpose(-2, -3)
 
-        # 2. ST cross-attention
-        st_output = self.st_col_attention(
-            h, st_source_embeddings, st_attention_mask, st_dist, output_attentions,
-        )
+        # 2 & 3. Shared pre-norm → ST and eco cross-attention in parallel → gated residual
+        h_normed = self.cross_norm(h)
+        st_output  = self.st_col_attention(h_normed, st_source_embeddings, st_attention_mask, st_dist, output_attentions)
+        eco_output = self.eco_col_attention(h_normed, eco_embeddings, output_attentions)
 
-        # 3. Ecological cross-attention
-        eco_output = self.eco_col_attention(h, eco_embeddings, output_attentions)
+        gate = torch.sigmoid(self.combine_gate)[None, :, None, None]  # (1, S, 1, 1)
+        h = h + gate * st_output[0] + (1 - gate) * eco_output[0]
 
-        # 4. Combine
-        gate = torch.sigmoid(self.combine_gate)
-        combined = gate * st_output[0] + (1 - gate) * eco_output[0]
-
-        out = (combined,)
+        out = (h,)
         if output_attentions:
             out = out + (
                 row_output[1] if len(row_output) > 1 else None,
-                st_output[1] if len(st_output) > 1 else None,
+                st_output[1]  if len(st_output)  > 1 else None,
                 eco_output[1] if len(eco_output) > 1 else None,
             )
         return out
@@ -741,21 +696,21 @@ class JSDMAttention(nn.Module):
 # =============================================================================
 
 class FeedForward(nn.Module):
+    """
+    SwiGLU FFN: down(SiLU(gate(x)) * up(x))
+    Pre-norm and residual are applied externally in JSDMLayer.
+    Note: gate + up doubles the first-layer params vs vanilla FFN.
+    Set intermediate_size to ~2/3 of the original value to keep param count equal.
+    """
     def __init__(self, config: JSDMConfig):
         super().__init__()
-        self.dense1 = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.act = nn.GELU()
-        self.dense2 = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.gate = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up   = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states):
-        residual = hidden_states
-        x = self.dense1(hidden_states)
-        x = self.act(x)
-        x = self.dense2(x)
-        x = self.dropout(x)
-        return self.LayerNorm(x + residual)
+    def forward(self, x):
+        return self.dropout(self.down(F.silu(self.gate(x)) * self.up(x)))
 
 
 # =============================================================================
@@ -767,6 +722,7 @@ class JSDMLayer(nn.Module):
         super().__init__()
         self.attention = JSDMAttention(config)
         self.ffn = FeedForward(config)
+        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(
         self, hidden_states, st_source_embeddings, eco_embeddings,
@@ -777,16 +733,15 @@ class JSDMLayer(nn.Module):
             hidden_states, st_source_embeddings, eco_embeddings,
             st_attention_mask, st_dist, sinusoidal_pos, output_attentions,
         )
-        layer_output = self.ffn(attn_outputs[0])
-        return (layer_output,) + attn_outputs[1:]
+        h = attn_outputs[0]
+        h = h + self.ffn(self.ffn_norm(h))  # pre-norm + residual
+        return (h,) + attn_outputs[1:]
 
 
 class JSDMEncoder(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
-        # Project raw 1-dim species states to hidden_size
-        # This is the only place where dim expansion happens
-        self.input_proj = nn.Linear(1, config.hidden_size)
+        # TargetInput's nn.Embedding already outputs (B, S, T, H) — no projection needed here
 
         self.layers = nn.ModuleList(
             [JSDMLayer(config) for _ in range(config.num_hidden_layers)]
@@ -809,9 +764,6 @@ class JSDMEncoder(nn.Module):
         all_sp_attn = () if output_attentions else None
         all_st_attn = () if output_attentions else None
         all_eco_attn = () if output_attentions else None
-
-        # Project raw 1-dim input to hidden_size: (B, S, T, 1) → (B, S, T, H)
-        hidden_states = self.input_proj(hidden_states)
 
         sinusoidal_pos = self.embed_positions(
             hidden_states.shape[:-1], 0
@@ -1044,8 +996,8 @@ class JSDMPredictionHead(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.act = nn.GELU()
-        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.act = nn.SiLU()
+        self.layer_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.decoder = nn.Linear(config.hidden_size, 1)
 
     def forward(self, hidden_states):
@@ -1054,16 +1006,64 @@ class JSDMPredictionHead(nn.Module):
         return self.decoder(x).squeeze(-1)
 
 
+# =============================================================================
+# Occupancy-Detection Model (commented out)
+# Uncomment cls init line and occupancy blocks in forward() to activate.
+#
+# Handles imperfect species detection and uneven sampling effort.
+# Assumption: no false positives (x=1 ↔ z=1). Only false negatives possible.
+#
+# P(x_s=1) = ψ_s · p_s        P(x_s=0) = 1 − ψ_s · p_s
+#
+# p_s = σ(species_detect_logit[s] + effort_proj(target_env)[s])
+#   species_detect_logit: per-species crypticity baseline (always learned)
+#   effort_proj: maps site effort-proxy covariates → per-species correction
+#                (zero-init so it's inactive if no effort columns are in env_data)
+#
+# Identifiability: effort is a site-wide effect shared across all S species;
+# detectability is a species-wide effect across sites. The species self-attention
+# sees all S species at once, enabling separation without repeat visits.
+# =============================================================================
+#
+# class OccupancyDetectionHead(nn.Module):
+#     def __init__(self, config: JSDMConfig):
+#         super().__init__()
+#         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+#         self.act = nn.SiLU()
+#         self.layer_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+#         self.occupancy_decoder = nn.Linear(config.hidden_size, 1)
+#         # Per-species detection baseline; init logit(0.9)≈+2.2 → high detection by default
+#         self.species_detect_logit = nn.Parameter(torch.full((config.num_species,), 2.2))
+#         # Effort modulation; zero-init → inactive until data provides signal
+#         self.effort_proj = nn.Linear(config.num_env_vars, config.num_species)
+#         nn.init.zeros_(self.effort_proj.weight)
+#         nn.init.zeros_(self.effort_proj.bias)
+#
+#     def forward(self, hidden_states, target_env=None):
+#         x = self.act(self.dense(hidden_states))
+#         x = self.layer_norm(x)
+#         psi_logit = self.occupancy_decoder(x).squeeze(-1)  # (B, S, T) — occupancy logit
+#         p_detect_logit = self.species_detect_logit          # (S,)
+#         if target_env is not None:
+#             p_detect_logit = p_detect_logit.unsqueeze(0) + self.effort_proj(target_env)  # (B, S)
+#         return psi_logit, p_detect_logit
+
+
 class JSDMForMaskedSpeciesPrediction(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         self.config = config
         self.model = JSDMModel(config)
         self.cls = JSDMPredictionHead(config)
+        # self.occupancy_cls = OccupancyDetectionHead(config)  # uncomment to use occupancy model
 
-    def forward(self, labels=None, loss_weight=None, output_attentions=False, **kwargs):
+    def forward(self, labels=None, loss_weight=None, output_attentions=False, target_env=None, **kwargs):
         encoder_out = self.model(output_attentions=output_attentions, **kwargs)
         logits = self.cls(encoder_out.last_hidden_state)  # (B, S, T)
+
+        # === Occupancy-detection model (uncomment to replace simple BCE) ===
+        # psi_logit, p_detect_logit = self.occupancy_cls(encoder_out.last_hidden_state, target_env)
+        # logits = psi_logit  # output occupancy ψ (true presence), not composite P(x=1)
 
         loss = None
         if labels is not None:
@@ -1079,6 +1079,17 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
                     )
                     w = loss_weight.unsqueeze(-1).expand_as(labels)[mask]
                     loss = (per_el * w).sum() / w.sum()
+
+                # === Occupancy-detection composite likelihood (uncomment with occupancy_cls) ===
+                # psi = torch.sigmoid(psi_logit)
+                # p_det = torch.sigmoid(p_detect_logit)
+                # if p_det.dim() == 1:
+                #     p_det = p_det[None, :, None]      # (1, S, 1) — species-only baseline
+                # else:
+                #     p_det = p_det.unsqueeze(-1)        # (B, S, 1) — effort-modulated
+                # p_obs = (psi * p_det).clamp(1e-6, 1 - 1e-6)  # P(x=1)
+                # y = labels[mask].float()
+                # loss = -(y * p_obs[mask].log() + (1 - y) * (1 - p_obs[mask]).log()).mean()
 
         return JSDMOutput(
             loss=loss, logits=logits,
