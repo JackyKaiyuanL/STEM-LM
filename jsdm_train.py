@@ -31,6 +31,7 @@ def train_epoch(model, loader, optimizer, scheduler, device, cluster_info, epoch
         output = model(
             input_ids=batch["input_ids"],
             source_ids=batch["source_ids"],
+            source_idx=batch["source_idx"],
             target_site_idx=batch["target_site_idx"],
             env_data=batch["env_data"],
             labels=batch["labels"],
@@ -80,6 +81,7 @@ def evaluate(model, loader, device, cluster_info):
         output = model(
             input_ids=batch["input_ids"],
             source_ids=batch["source_ids"],
+            source_idx=batch["source_idx"],
             target_site_idx=batch["target_site_idx"],
             env_data=batch["env_data"],
             labels=batch["labels"],
@@ -124,6 +126,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--output_dir", type=str, default="./jsdm_output")
     parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--spatial_scale_km", type=float, default=None)
+    parser.add_argument("--temporal_scale_days", type=float, default=None)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -142,6 +146,8 @@ def main():
         train_frac=args.train_frac,
         num_workers=args.num_workers,
         seed=args.seed,
+        spatial_scale_km=args.spatial_scale_km,
+        temporal_scale_days=args.temporal_scale_days,
     )
 
     # Config
@@ -214,6 +220,7 @@ def main():
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             output = model(
                 input_ids=batch["input_ids"], source_ids=batch["source_ids"],
+                source_idx=batch["source_idx"],
                 target_site_idx=batch["target_site_idx"], env_data=batch["env_data"],
                 labels=batch["labels"],
                 cluster_dict=cluster_info["cluster_dict"],

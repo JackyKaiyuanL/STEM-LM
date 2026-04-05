@@ -127,6 +127,28 @@ class FIREDistanceBias(nn.Module):
         return self.mlp(dist).squeeze(-1)
 
 
+def _haversine_pairwise(lat_deg: np.ndarray, lon_deg: np.ndarray) -> torch.Tensor:
+    lat = np.radians(lat_deg.astype(np.float64))
+    lon = np.radians(lon_deg.astype(np.float64))
+    lat1 = lat[:, None]
+    lat2 = lat[None, :]
+    dlat = lat1 - lat2
+    dlon = lon[:, None] - lon[None, :]
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    c = 2.0 * np.arcsin(np.sqrt(a))
+    return torch.tensor(6371.0 * c, dtype=torch.float32)
+
+
+def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
+    if value is None:
+        if fallback <= 0:
+            raise ValueError(f"Cannot auto-scale {name}: max pairwise distance is {fallback}")
+        return float(fallback)
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0, got {value}")
+    return float(value)
+
+
 # =============================================================================
 # Target Input (NO embedding needed)
 #
@@ -149,7 +171,7 @@ class TargetInput(nn.Module):
         """
         Args:
             input_ids: (B, S, T) float tensor
-                       0.0 = absent, 1.0 = present, nan or special → replaced with mask_value
+                       0.0 = absent, 1.0 = present, mask_value for masked species
         Returns:
             (B, S, T, 1) — each species state as a 1-dim "embedding"
         """
@@ -252,43 +274,47 @@ class STSourceModule(nn.Module):
     def forward(
         self,
         source_ids: torch.Tensor,
-        cluster_dict: Dict[int, Set[int]],
+        source_cluster_labels: torch.Tensor,
         in_cluster_spatial_dist: torch.Tensor,
         in_cluster_temporal_dist: torch.Tensor,
+        num_clusters: int,
     ) -> torch.Tensor:
         """
         Args:
             source_ids: (B, S, N) species states at S species for N source sites
-            cluster_dict: {cluster_id: set(site_indices)} like clade_dict
-            in_cluster_spatial_dist: (N,) dist from each source to its cluster center
-            in_cluster_temporal_dist: (N,) temporal dist to cluster center
+            source_cluster_labels: (B, N) cluster id for each sampled source site
+            in_cluster_spatial_dist: (B, N) dist from each source to its cluster center
+            in_cluster_temporal_dist: (B, N) temporal dist to cluster center
+            num_clusters: total number of spatial-temporal clusters
 
         Returns:
             cluster_pooled: (B, S, C_st, H)
         """
-        # Compute within-cluster distance bias (like in_clade_time_bias)
-        spatial_bias = self.fire_spatial(in_cluster_spatial_dist[None, None, :])
-        temporal_bias = self.fire_temporal(in_cluster_temporal_dist[None, None, :])
-        in_cluster_bias = spatial_bias + temporal_bias  # (1, 1, N)
+        # Compute within-cluster distance bias per sampled site
+        spatial_bias = self.fire_spatial(in_cluster_spatial_dist)  # (B, N)
+        temporal_bias = self.fire_temporal(in_cluster_temporal_dist)  # (B, N)
+        in_cluster_bias = spatial_bias + temporal_bias  # (B, N)
 
+        B, S, _ = source_ids.shape
+        out_dim = self.single_site_proj.out_features
         cluster_pooled = []
-        for cluster_id, site_indices in cluster_dict.items():
-            site_indices = sorted(list(site_indices))
-            if len(site_indices) > 1:
-                bias = in_cluster_bias[..., site_indices]  # (1, 1, N_c)
-                # Reshape for attention pool: (B, S, A, 1, N_c)
-                bias = bias[:, :, None, None, :]  # (1, 1, 1, 1, N_c)
-
-                cluster_pooled.append(
-                    self.attn_pool(
-                        source_ids[..., site_indices],  # (B, S, N_c)
+        for cluster_id in range(num_clusters):
+            pooled_per_batch = []
+            for b in range(B):
+                pos = (source_cluster_labels[b] == cluster_id).nonzero(as_tuple=True)[0]
+                if pos.numel() == 0:
+                    pooled = source_ids.new_zeros(S, out_dim)
+                elif pos.numel() == 1:
+                    single = source_ids[b, :, pos[0]].unsqueeze(-1).float()  # (S, 1)
+                    pooled = self.single_site_proj(single)
+                else:
+                    bias = in_cluster_bias[b, pos][None, None, None, None, :]  # (1,1,1,1,N_c)
+                    pooled = self.attn_pool(
+                        source_ids[b:b + 1, :, pos],
                         bias,
-                    )
-                )
-            else:
-                # Single site cluster: project 1-dim float → H (like single-species clade)
-                single = source_ids[..., site_indices[0]].unsqueeze(-1).float()  # (B, S, 1)
-                cluster_pooled.append(self.single_site_proj(single))
+                    ).squeeze(0)
+                pooled_per_batch.append(pooled)
+            cluster_pooled.append(torch.stack(pooled_per_batch, dim=0))
 
         cluster_pooled = torch.stack(cluster_pooled, dim=-2)  # (B, S, C_st, H)
         return cluster_pooled
@@ -486,7 +512,7 @@ class STCrossAttention(nn.Module):
             hidden_states: (B, S, T, H)
             source_embeddings: (B, S, C_st, H)
             attention_mask: (B, 1, 1, T, C_st) with -inf for own cluster
-            st_dist_bias: (B, 1, 1, T, C_st) FIRE distance bias
+            st_dist_bias: (B, S, 1, T, C_st) per-species FIRE distance bias
         """
         query_layer = self.transpose_for_scores(self.query(hidden_states))
         key_layer = self.transpose_for_scores(self.key(source_embeddings))
@@ -544,17 +570,29 @@ class STColAttention(nn.Module):
         self.output = STCrossOutput(config)
         self.fire_spatial = FIREDistanceBias(config.max_spatial_dist, config.fire_hidden_size)
         self.fire_temporal = FIREDistanceBias(config.max_temporal_dist, config.fire_hidden_size)
+        # Per-species log-scale for spatial and temporal FIRE biases.
+        # Both init to 0 → exp(0)=1, so initial behavior is identical to a shared bias.
+        # After training, these reveal which species respond more to space vs time.
+        self.species_spatial_log_scale = nn.Parameter(torch.zeros(config.num_species))
+        self.species_temporal_log_scale = nn.Parameter(torch.zeros(config.num_species))
 
     def forward(
         self, hidden_states, source_embeddings,
         attention_mask=None, st_dist=None, output_attentions=False,
     ):
-        # Compute FIRE distance bias (like evol_time_bias in GPNStarColAttention)
+        # Compute per-species FIRE distance bias
         st_dist_bias = None
         if st_dist is not None:
             spatial_bias = self.fire_spatial(st_dist[..., 0])   # (B, T, C_st)
             temporal_bias = self.fire_temporal(st_dist[..., 1])  # (B, T, C_st)
-            st_dist_bias = (spatial_bias + temporal_bias)[:, None, None, :, :]
+            s_scale = self.species_spatial_log_scale.exp()   # (S,)
+            t_scale = self.species_temporal_log_scale.exp()  # (S,)
+            # (B, T, C_st) → (B, S, T, C_st) weighted per species
+            st_dist_bias = (
+                spatial_bias[:, None, :, :] * s_scale[None, :, None, None]
+                + temporal_bias[:, None, :, :] * t_scale[None, :, None, None]
+            )
+            st_dist_bias = st_dist_bias[:, :, None, :, :]  # (B, S, 1, T, C_st)
 
         cross_outputs = self.cross_attn(
             hidden_states, source_embeddings, attention_mask, st_dist_bias, output_attentions,
@@ -825,19 +863,35 @@ class JSDMEncoderOutput(ModelOutput):
 # =============================================================================
 
 class STClusterInfo:
-    def __init__(self, spatial_coords, temporal_coords, threshold=5.0):
+    def __init__(
+        self,
+        spatial_coords,
+        temporal_coords,
+        threshold=5.0,
+        spatial_scale_km: Optional[float] = None,
+        temporal_scale_days: Optional[float] = None,
+    ):
         import networkx as nx
         from scipy.spatial.distance import cdist
 
         N = len(spatial_coords)
-        self.spatial_dist_pairwise = torch.tensor(
-            cdist(spatial_coords, spatial_coords), dtype=torch.float32
+        self.spatial_dist_pairwise = _haversine_pairwise(
+            spatial_coords[:, 0], spatial_coords[:, 1]
         )
         t2d = temporal_coords.reshape(-1, 1)
         self.temporal_dist_pairwise = torch.tensor(
             cdist(t2d, t2d), dtype=torch.float32
         )
-        combined = self.spatial_dist_pairwise + self.temporal_dist_pairwise
+        spatial_scale_km = _resolve_scale(
+            spatial_scale_km, float(self.spatial_dist_pairwise.max()), "spatial_scale_km"
+        )
+        temporal_scale_days = _resolve_scale(
+            temporal_scale_days, float(self.temporal_dist_pairwise.max()), "temporal_scale_days"
+        )
+        combined = torch.sqrt(
+            (self.spatial_dist_pairwise / spatial_scale_km) ** 2
+            + (self.temporal_dist_pairwise / temporal_scale_days) ** 2
+        )
 
         G = nx.Graph()
         G.add_nodes_from(range(N))
@@ -862,9 +916,11 @@ class STClusterInfo:
                 center_s = spatial_coords[sites_list].mean(axis=0)
                 center_t = temporal_coords[sites_list].mean()
                 for s in sites_list:
-                    self.in_cluster_spatial_dist[s] = float(
-                        np.sqrt(((spatial_coords[s] - center_s) ** 2).sum())
-                    )
+                    # haversine from site to cluster centroid (km), consistent with pairwise spatial_dist
+                    self.in_cluster_spatial_dist[s] = float(_haversine_pairwise(
+                        np.array([spatial_coords[s, 0], center_s[0]]),
+                        np.array([spatial_coords[s, 1], center_s[1]])
+                    )[0, 1].item())
                     self.in_cluster_temporal_dist[s] = float(
                         abs(temporal_coords[s] - center_t)
                     )
@@ -890,6 +946,7 @@ class JSDMModel(nn.Module):
         self,
         input_ids,              # (B, S, T)
         source_ids,             # (B, S, N)
+        source_idx,             # (B, N)
         target_site_idx,        # (B, T)
         env_data,               # (B, N, E)
         cluster_dict,
@@ -905,10 +962,18 @@ class JSDMModel(nn.Module):
         hidden_states = self.target_input(input_ids)  # (B, S, T, 1)
 
         # 2. Pool source sites into ST clusters
+        cl_labels = cluster_labels.to(hidden_states.device)
+        in_spatial = in_cluster_spatial_dist.to(hidden_states.device)
+        in_temporal = in_cluster_temporal_dist.to(hidden_states.device)
+        source_cluster_labels = cl_labels[source_idx]  # (B, N)
+        source_in_spatial = in_spatial[source_idx]     # (B, N)
+        source_in_temporal = in_temporal[source_idx]   # (B, N)
         st_source = self.st_source_module(
-            source_ids, cluster_dict,
-            in_cluster_spatial_dist.to(hidden_states.device),
-            in_cluster_temporal_dist.to(hidden_states.device),
+            source_ids,
+            source_cluster_labels,
+            source_in_spatial,
+            source_in_temporal,
+            num_clusters=len(cluster_dict),
         )  # (B, S, C_st, H)
 
         # 3. Ecological context
@@ -916,7 +981,6 @@ class JSDMModel(nn.Module):
 
         # 4. Target-to-cluster distances (like target-to-clade phylo dist)
         num_clusters = len(cluster_dict)
-        cl_labels = cluster_labels.to(hidden_states.device)
         sp_pw = spatial_dist_pairwise.to(hidden_states.device)
         tp_pw = temporal_dist_pairwise.to(hidden_states.device)
 
@@ -931,6 +995,15 @@ class JSDMModel(nn.Module):
         attn_mask = F.one_hot(target_clusters, num_classes=num_clusters).to(hidden_states.dtype)
         attn_mask = attn_mask * torch.finfo(hidden_states.dtype).min
         attn_mask = attn_mask[:, None, None, :, :]  # (B, 1, 1, T, C_st)
+
+        # Mask clusters with no sampled sources for this batch
+        present = torch.zeros(
+            source_cluster_labels.size(0), num_clusters,
+            device=hidden_states.device, dtype=hidden_states.dtype,
+        )
+        present.scatter_(1, source_cluster_labels, 1.0)
+        empty_mask = (present == 0)[:, None, None, None, :]
+        attn_mask = attn_mask + empty_mask * torch.finfo(hidden_states.dtype).min
 
         # 6. Encode
         return self.encoder(

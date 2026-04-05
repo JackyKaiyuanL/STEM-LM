@@ -36,6 +36,7 @@ def run_forward(model, batch, cluster_info, device, output_attentions=False):
     return model(
         input_ids=batch["input_ids"],
         source_ids=batch["source_ids"],
+        source_idx=batch["source_idx"],
         target_site_idx=batch["target_site_idx"],
         env_data=batch["env_data"],
         labels=batch["labels"],
@@ -88,6 +89,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--num_batches", type=int, default=50)
     parser.add_argument("--cluster_threshold", type=float, default=5.0)
+    parser.add_argument("--spatial_scale_km", type=float, default=None)
+    parser.add_argument("--temporal_scale_days", type=float, default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -96,9 +99,20 @@ def main():
     with open(os.path.join(args.model_dir, "species_names.json")) as f:
         species_names = json.load(f)
 
-    dataset = JSDMDataset(csv_path=args.csv_path, num_source_sites=config.num_source_sites)
+    dataset = JSDMDataset(
+        csv_path=args.csv_path,
+        num_source_sites=config.num_source_sites,
+        spatial_scale_km=args.spatial_scale_km,
+        temporal_scale_days=args.temporal_scale_days,
+    )
     cluster_info = build_st_clusters(
-        dataset.coords, dataset.times, threshold=args.cluster_threshold
+        dataset.coords,
+        dataset.times,
+        threshold=args.cluster_threshold,
+        spatial_scale_km=dataset.spatial_scale_km,
+        temporal_scale_days=dataset.temporal_scale_days,
+        spatial_dist=dataset.spatial_dists,
+        temporal_dist=dataset.temporal_dists,
     )
     collator = JSDMDataCollator(
         mlm_probability=config.mlm_probability,

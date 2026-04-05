@@ -28,6 +28,31 @@ from typing import Optional, List, Dict, Any
 import networkx as nx
 
 
+def haversine_pairwise(lat_deg: np.ndarray, lon_deg: np.ndarray) -> np.ndarray:
+    """
+    Compute pairwise haversine distances in kilometers.
+    """
+    lat = np.radians(lat_deg.astype(np.float64))
+    lon = np.radians(lon_deg.astype(np.float64))
+    lat1 = lat[:, None]
+    lat2 = lat[None, :]
+    dlat = lat1 - lat2
+    dlon = lon[:, None] - lon[None, :]
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    c = 2.0 * np.arcsin(np.sqrt(a))
+    return (6371.0 * c).astype(np.float32)
+
+
+def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
+    if value is None:
+        if fallback <= 0:
+            raise ValueError(f"Cannot auto-scale {name}: max pairwise distance is {fallback}")
+        return float(fallback)
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0, got {value}")
+    return float(value)
+
+
 class JSDMDataset(Dataset):
     def __init__(
         self,
@@ -37,10 +62,20 @@ class JSDMDataset(Dataset):
         lat_col: str = "latitude",
         lon_col: str = "longitude",
         env_cols: Optional[List[str]] = None,
+        spatial_scale_km: Optional[float] = None,
+        temporal_scale_days: Optional[float] = None,
     ):
         super().__init__()
         self.num_source_sites = num_source_sites
         df = pd.read_csv(csv_path)
+
+        if df.isna().any().any():
+            nan_cols = df.columns[df.isna().any()].tolist()
+            raise ValueError(
+                "NaNs found in columns: "
+                + ", ".join(nan_cols)
+                + ". Please impute or drop missing values before training."
+            )
 
         if df[time_col].dtype == "object" or pd.api.types.is_datetime64_any_dtype(df[time_col]):
             df[time_col] = pd.to_datetime(df[time_col])
@@ -69,6 +104,8 @@ class JSDMDataset(Dataset):
         self.num_env_vars = len(env_cols) if env_cols else 1
 
         self.coords = df[[lat_col, lon_col]].values.astype(np.float32)
+        self.lats = self.coords[:, 0]
+        self.lons = self.coords[:, 1]
         self.times = df[time_col].values.astype(np.float32)
         self.species_data = df[species_cols].values.astype(np.float32)
         self.env_data = (
@@ -79,10 +116,16 @@ class JSDMDataset(Dataset):
         N = len(df)
         print(f"Dataset: {N} observations, {self.num_species} species, {self.num_env_vars} env vars")
         print("Computing pairwise distances...")
-        self.spatial_dists = cdist(self.coords, self.coords).astype(np.float32)
+        self.spatial_dists = haversine_pairwise(self.lats, self.lons)
         self.temporal_dists = cdist(
             self.times.reshape(-1, 1), self.times.reshape(-1, 1)
         ).astype(np.float32)
+        self.spatial_scale_km = _resolve_scale(
+            spatial_scale_km, float(self.spatial_dists.max()), "spatial_scale_km"
+        )
+        self.temporal_scale_days = _resolve_scale(
+            temporal_scale_days, float(self.temporal_dists.max()), "temporal_scale_days"
+        )
         print("Done.")
 
     def __len__(self):
@@ -94,7 +137,9 @@ class JSDMDataset(Dataset):
 
         target_species = self.species_data[idx]  # (S,)
 
-        combined_dist = self.spatial_dists[idx] + self.temporal_dists[idx]
+        spatial = self.spatial_dists[idx] / self.spatial_scale_km
+        temporal = self.temporal_dists[idx] / self.temporal_scale_days
+        combined_dist = np.sqrt(spatial ** 2 + temporal ** 2)
         combined_dist[idx] = np.inf
         inv_dist = 1.0 / (combined_dist + 1e-6)
         probs = inv_dist / inv_dist.sum()
@@ -166,13 +211,36 @@ class JSDMDataCollator:
         return batch
 
 
-def build_st_clusters(spatial_coords, temporal_coords, threshold=5.0):
+def build_st_clusters(
+    spatial_coords,
+    temporal_coords,
+    threshold=5.0,
+    spatial_scale_km: Optional[float] = None,
+    temporal_scale_days: Optional[float] = None,
+    spatial_dist: Optional[np.ndarray] = None,
+    temporal_dist: Optional[np.ndarray] = None,
+):
     N = len(spatial_coords)
-    spatial_dist = cdist(spatial_coords, spatial_coords).astype(np.float32)
-    temporal_dist = cdist(
-        temporal_coords.reshape(-1, 1), temporal_coords.reshape(-1, 1)
-    ).astype(np.float32)
-    combined = spatial_dist + temporal_dist
+    if spatial_dist is None:
+        spatial_dist = haversine_pairwise(spatial_coords[:, 0], spatial_coords[:, 1])
+    else:
+        spatial_dist = spatial_dist.astype(np.float32)
+    if temporal_dist is None:
+        temporal_dist = cdist(
+            temporal_coords.reshape(-1, 1), temporal_coords.reshape(-1, 1)
+        ).astype(np.float32)
+    else:
+        temporal_dist = temporal_dist.astype(np.float32)
+
+    spatial_scale_km = _resolve_scale(
+        spatial_scale_km, float(spatial_dist.max()), "spatial_scale_km"
+    )
+    temporal_scale_days = _resolve_scale(
+        temporal_scale_days, float(temporal_dist.max()), "temporal_scale_days"
+    )
+    combined = np.sqrt(
+        (spatial_dist / spatial_scale_km) ** 2 + (temporal_dist / temporal_scale_days) ** 2
+    )
 
     G = nx.Graph()
     G.add_nodes_from(range(N))
@@ -197,7 +265,11 @@ def build_st_clusters(spatial_coords, temporal_coords, threshold=5.0):
             center_s = spatial_coords[sites_list].mean(axis=0)
             center_t = temporal_coords[sites_list].mean()
             for s in sites_list:
-                in_cluster_spatial[s] = float(np.sqrt(((spatial_coords[s] - center_s) ** 2).sum()))
+                # haversine from site to cluster centroid (km), consistent with pairwise spatial_dist
+                in_cluster_spatial[s] = float(haversine_pairwise(
+                    np.array([spatial_coords[s, 0], center_s[0]]),
+                    np.array([spatial_coords[s, 1], center_s[1]])
+                )[0, 1])
                 in_cluster_temporal[s] = float(abs(temporal_coords[s] - center_t))
 
     return {
@@ -210,19 +282,35 @@ def build_st_clusters(spatial_coords, temporal_coords, threshold=5.0):
         "max_spatial_dist": float(spatial_dist.max()),
         "max_temporal_dist": float(temporal_dist.max()),
         "num_clusters": len(cluster_dict),
+        "spatial_scale_km": spatial_scale_km,
+        "temporal_scale_days": temporal_scale_days,
     }
 
 
 def create_dataloaders(
     csv_path, batch_size=32, num_source_sites=64, mlm_probability=0.15,
     cluster_threshold=5.0, mask_value=-1.0, train_frac=0.8, num_workers=0,
-    seed=42, env_cols=None,
+    seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
 ):
     np.random.seed(seed)
-    dataset = JSDMDataset(csv_path=csv_path, num_source_sites=num_source_sites, env_cols=env_cols)
+    dataset = JSDMDataset(
+        csv_path=csv_path,
+        num_source_sites=num_source_sites,
+        env_cols=env_cols,
+        spatial_scale_km=spatial_scale_km,
+        temporal_scale_days=temporal_scale_days,
+    )
 
     print("Building spatial-temporal clusters...")
-    cluster_info = build_st_clusters(dataset.coords, dataset.times, threshold=cluster_threshold)
+    cluster_info = build_st_clusters(
+        dataset.coords,
+        dataset.times,
+        threshold=cluster_threshold,
+        spatial_scale_km=dataset.spatial_scale_km,
+        temporal_scale_days=dataset.temporal_scale_days,
+        spatial_dist=dataset.spatial_dists,
+        temporal_dist=dataset.temporal_dists,
+    )
     print(f"  {cluster_info['num_clusters']} clusters from {len(dataset)} sites")
 
     n = len(dataset)
