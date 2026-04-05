@@ -1080,7 +1080,44 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
                     w = loss_weight.unsqueeze(-1).expand_as(labels)[mask]
                     loss = (per_el * w).sum() / w.sum()
 
-                # === Occupancy-detection composite likelihood (uncomment with occupancy_cls) ===
+                # ── Loss option A: SPML positive-only ────────────────────────────────
+                # Treats observed zeros as unlabeled, not confirmed absent.
+                # Only confirmed presences (x=1) contribute to the loss.
+                # Use when data is presence-only or detection is very imperfect
+                # and you have no effort information to calibrate zeros.
+                # Note: for strict SPML, also change the collator to only mask
+                # positions where target_species == 1 (positive-only masking).
+                #
+                # pos_mask = mask & (labels == 1)
+                # if pos_mask.any():
+                #     loss = F.binary_cross_entropy_with_logits(
+                #         logits[pos_mask].float(), labels[pos_mask].float()
+                #     )
+
+                # ── Loss option B: SPML AN-loss (asymmetric downweighting) ───────────
+                # Keeps signal from both 0s and 1s but downweights zeros by `alpha`.
+                # alpha=1.0 → plain BCE (presence-absence assumption).
+                # alpha=0.0 → positive-only (same as option A).
+                # alpha≈0.1 is a reasonable default for citizen science data.
+                # Per-species or per-site alpha could replace the scalar if needed.
+                # Complementary to the occupancy model: use this when you don't have
+                # effort covariates but still want to soften the false-negative penalty.
+                #
+                # alpha = 0.1
+                # y = labels[mask].float()
+                # per_el = F.binary_cross_entropy_with_logits(
+                #     logits[mask].float(), y, reduction="none"
+                # )
+                # w = torch.where(y == 1, torch.ones_like(y), y.new_full((), alpha))
+                # loss = (per_el * w).mean()
+
+                # ── Loss option C: Occupancy-detection composite likelihood ───────────
+                # Explicitly models P(x=1) = ψ·p, separating true occupancy from
+                # detection probability. Handles per-species crypticity and uneven
+                # sampling effort. Requires occupancy_cls — uncomment that block too.
+                # Use when you have effort-proxy covariates in target_env and want
+                # interpretable per-species detectability estimates.
+                #
                 # psi = torch.sigmoid(psi_logit)
                 # p_det = torch.sigmoid(p_detect_logit)
                 # if p_det.dim() == 1:
