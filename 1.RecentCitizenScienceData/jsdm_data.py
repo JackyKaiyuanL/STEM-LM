@@ -105,7 +105,8 @@ def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
 class JSDMDataset(Dataset):
     def __init__(
         self,
-        csv_path: str,
+        csv_path: Optional[str] = None,
+        data: Optional[pd.DataFrame] = None,
         num_source_sites: int = 64,
         time_col: str = "time",
         lat_col: str = "latitude",
@@ -119,7 +120,12 @@ class JSDMDataset(Dataset):
     ):
         super().__init__()
         self.num_source_sites = num_source_sites
-        df = pd.read_csv(csv_path)
+        if data is not None:
+            df = data.copy()
+        else:
+            if csv_path is None:
+                raise ValueError("csv_path is required when data is not provided")
+            df = pd.read_csv(csv_path)
 
         if df.isna().any().any():
             nan_cols = df.columns[df.isna().any()].tolist()

@@ -37,11 +37,18 @@ class JSDMConfig:
 
     max_spatial_dist: float = 180.0
     max_temporal_dist: float = 365.0
-    max_doy_dist: float = 182.0       # half-year; max circular DOY distance
+    max_doy_dist: float = 182.0
 
     num_env_vars: int = 10
     spatial_scale_km: float = 1.0
     temporal_scale_days: float = 1.0
+    num_spatial_bins: int = 4
+    num_temporal_bins: int = 4
+    spatial_bin_min: float = 0.125
+    spatial_bin_max: float = 4.0
+    temporal_bin_min: float = 0.125
+    temporal_bin_max: float = 4.0
+    bin_sigma_init: float = 0.5
 
     hidden_size: int = 256
     num_attention_heads: int = 8
@@ -586,6 +593,35 @@ class JSDMModel(nn.Module):
         self.st_source_embedder = STSourceEmbedder(config)
         self.eco_source_module = EcoSourceModule(config)
         self.encoder           = JSDMEncoder(config)
+        self.num_spatial_bins = config.num_spatial_bins
+        self.num_temporal_bins = config.num_temporal_bins
+        self.num_scale_groups = self.num_spatial_bins * self.num_temporal_bins
+        self.register_buffer(
+            "spatial_bin_centers",
+            torch.logspace(
+                math.log10(config.spatial_bin_min),
+                math.log10(config.spatial_bin_max),
+                steps=self.num_spatial_bins,
+            ),
+        )
+        self.register_buffer(
+            "temporal_bin_centers",
+            torch.logspace(
+                math.log10(config.temporal_bin_min),
+                math.log10(config.temporal_bin_max),
+                steps=self.num_temporal_bins,
+            ),
+        )
+        sigma_init = torch.tensor(config.bin_sigma_init)
+        self.spatial_bin_log_sigma = nn.Parameter(sigma_init.log())
+        self.temporal_bin_log_sigma = nn.Parameter(sigma_init.log())
+        self.scale_gate = nn.Parameter(torch.zeros(self.num_scale_groups))
+
+    @staticmethod
+    def _soft_bin_weights(dist_norm, centers, log_sigma):
+        sigma = log_sigma.exp().clamp(min=1e-3)
+        diff = dist_norm.unsqueeze(-1) - centers
+        return torch.exp(-0.5 * (diff / sigma) ** 2)
 
     def forward(
         self,
@@ -641,20 +677,25 @@ class JSDMModel(nn.Module):
         if T != 1:
             raise ValueError("Multiscale pooling expects a single target time (T=1).")
 
-        spatial_edges = st_spatial.new_tensor([0.5, 1.5]) * self.config.spatial_scale_km
-        temporal_edges = st_temporal.new_tensor([0.5, 1.5]) * self.config.temporal_scale_days
-        sp_bin = torch.bucketize(st_spatial, spatial_edges)  # (B, 1, N)
-        tp_bin = torch.bucketize(st_temporal, temporal_edges)  # (B, 1, N)
-        num_temporal_bins = temporal_edges.numel() + 1
-        num_groups = (spatial_edges.numel() + 1) * num_temporal_bins
-        group_idx = sp_bin * num_temporal_bins + tp_bin  # (B, 1, N)
+        st_spatial_norm = st_spatial / self.config.spatial_scale_km
+        st_temporal_norm = st_temporal / self.config.temporal_scale_days
+        spatial_weights = self._soft_bin_weights(
+            st_spatial_norm, self.spatial_bin_centers, self.spatial_bin_log_sigma
+        )  # (B, 1, N, S)
+        temporal_weights = self._soft_bin_weights(
+            st_temporal_norm, self.temporal_bin_centers, self.temporal_bin_log_sigma
+        )  # (B, 1, N, T)
 
-        one_hot = F.one_hot(group_idx, num_classes=num_groups).float()  # (B, 1, N, G)
-        counts = one_hot.sum(dim=2)  # (B, 1, G)
-        weights = one_hot / counts.clamp(min=1).unsqueeze(2)
+        weights = spatial_weights.unsqueeze(-1) * temporal_weights.unsqueeze(-2)  # (B, 1, N, S, T)
+        weights = weights.reshape(B, T, -1, self.num_scale_groups)  # (B, 1, N, G)
+        valid = (~source_mask).float().unsqueeze(-1)  # (B, 1, N, 1)
+        weights = weights * valid
+        counts = weights.sum(dim=2)  # (B, 1, G)
+        weights = weights / counts.clamp(min=1e-6).unsqueeze(2)
 
         pooled = torch.einsum("btng,bsnh->bstgh", weights, st_source)  # (B, S, 1, G, H)
         pooled = pooled.squeeze(2)  # (B, S, G, H)
+        pooled = pooled * torch.sigmoid(self.scale_gate)[None, None, :, None]
         st_source = torch.cat([st_source, pooled], dim=2)  # (B, S, N+G, H)
 
         pooled_spatial = (weights * st_spatial.unsqueeze(-1)).sum(dim=2)   # (B, 1, G)
@@ -665,7 +706,7 @@ class JSDMModel(nn.Module):
         st_dist = torch.cat([st_dist, pooled_dist], dim=2)  # (B, 1, N+G, 2)
         st_doy_dist = torch.cat([st_doy_dist, pooled_doy], dim=2)
 
-        pooled_empty = counts == 0
+        pooled_empty = counts < 1e-6
         st_mask = torch.cat([source_mask, pooled_empty], dim=2)
         st_attention_mask = st_mask[:, None, None, :, :].to(hidden_states.dtype)
         st_attention_mask = st_attention_mask * torch.finfo(hidden_states.dtype).min
