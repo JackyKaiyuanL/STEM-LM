@@ -1,24 +1,8 @@
 """
-Data loading and preprocessing for ST-JSDM.
-
-Mirrors GPN-star's data pipeline with corrected axis mapping:
-
-    GPN-star                              →  ST-JSDM
-    ──────────────────────────────────────────────────────────
-    GenomeMSA: (L positions, N species)    →  CSV: (N_total rows, S species)
-    get_msa_batch → (B, L, N)             →  get_site_batch → (B, S, N)
-
-    tokenize_function:                     →  tokenize_function:
-      Sample 20 target species from clades    Target = 1 site (the row to predict)
-      input_ids = msa subsampled (B,L,T)      input_ids = target row (B, S, T=1)
-      source_ids = full msa (B,L,N)           source_ids = sampled sites (B, S, N)
-
-    DataCollator:                          →  DataCollator:
-      Mask 15% of L positions                 Mask 15% of S species
-      80% → mask token, 10% random, 10% keep  90% → mask_value, 10% keep
-      Mask source_ids in same clade           Mask source_ids in same ST cluster
+Data loading and preprocessing for ST-JSDM (citizen-science variant).
 """
 
+import math
 import numpy as np
 import pandas as pd
 import torch
@@ -29,18 +13,47 @@ import networkx as nx
 
 
 def haversine_pairwise(lat_deg: np.ndarray, lon_deg: np.ndarray) -> np.ndarray:
-    """
-    Compute pairwise haversine distances in kilometers.
-    """
     lat = np.radians(lat_deg.astype(np.float64))
     lon = np.radians(lon_deg.astype(np.float64))
-    lat1 = lat[:, None]
-    lat2 = lat[None, :]
-    dlat = lat1 - lat2
+    dlat = lat[:, None] - lat[None, :]
     dlon = lon[:, None] - lon[None, :]
-    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
-    c = 2.0 * np.arcsin(np.sqrt(a))
-    return (6371.0 * c).astype(np.float32)
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat[:, None]) * np.cos(lat[None, :]) * np.sin(dlon / 2.0) ** 2
+    return (6371.0 * 2.0 * np.arcsin(np.sqrt(a))).astype(np.float32)
+
+
+def haversine_to_point(
+    lat_deg: np.ndarray, lon_deg: np.ndarray, lat0_deg: float, lon0_deg: float
+) -> np.ndarray:
+    lat = np.radians(lat_deg.astype(np.float64))
+    lon = np.radians(lon_deg.astype(np.float64))
+    lat0 = math.radians(float(lat0_deg))
+    lon0 = math.radians(float(lon0_deg))
+    dlat = lat - lat0
+    dlon = lon - lon0
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat) * np.cos(lat0) * np.sin(dlon / 2.0) ** 2
+    return (6371.0 * 2.0 * np.arcsin(np.sqrt(a))).astype(np.float32)
+
+
+def _estimate_max_spatial_dist(lat_deg: np.ndarray, lon_deg: np.ndarray) -> float:
+    lat_min, lat_max = float(lat_deg.min()), float(lat_deg.max())
+    lon_min, lon_max = float(lon_deg.min()), float(lon_deg.max())
+    corners = np.array(
+        [
+            [lat_min, lon_min],
+            [lat_min, lon_max],
+            [lat_max, lon_min],
+            [lat_max, lon_max],
+        ],
+        dtype=np.float32,
+    )
+    corner_dists = haversine_pairwise(corners[:, 0], corners[:, 1])
+    return float(corner_dists.max())
+
+
+def circular_doy_pairwise(doy: np.ndarray) -> np.ndarray:
+    """Pairwise circular day-of-year distances in [0, 182]."""
+    diff = np.abs(doy[:, None] - doy[None, :])
+    return np.minimum(diff, 365 - diff).astype(np.float32)
 
 
 def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
@@ -61,9 +74,12 @@ class JSDMDataset(Dataset):
         time_col: str = "time",
         lat_col: str = "latitude",
         lon_col: str = "longitude",
+        doy_col: Optional[str] = "doy",
         env_cols: Optional[List[str]] = None,
         spatial_scale_km: Optional[float] = None,
         temporal_scale_days: Optional[float] = None,
+        time_window_days: Optional[float] = None,
+        sampling_strategy: str = "nearest",
     ):
         super().__init__()
         self.num_source_sites = num_source_sites
@@ -72,18 +88,28 @@ class JSDMDataset(Dataset):
         if df.isna().any().any():
             nan_cols = df.columns[df.isna().any()].tolist()
             raise ValueError(
-                "NaNs found in columns: "
-                + ", ".join(nan_cols)
+                "NaNs found in columns: " + ", ".join(nan_cols)
                 + ". Please impute or drop missing values before training."
             )
 
+        # Parse time and extract day-of-year.
+        # For datetime strings → elapsed days from first observation + DOY from calendar.
+        # For numeric time with a separate doy column → use that column.
+        # Otherwise → no seasonal structure (doy stays zero).
+        doy_coords = np.zeros(len(df), dtype=np.float32)
         if df[time_col].dtype == "object" or pd.api.types.is_datetime64_any_dtype(df[time_col]):
-            df[time_col] = pd.to_datetime(df[time_col])
-            df[time_col] = (df[time_col] - df[time_col].min()).dt.days.astype(float)
+            dt = pd.to_datetime(df[time_col])
+            doy_coords = (dt.dt.dayofyear - 1).values.astype(np.float32)  # 0-indexed, 0–364
+            df[time_col] = (dt - dt.min()).dt.days.astype(float)
         else:
             df[time_col] = df[time_col].astype(float)
+            if doy_col is not None and doy_col in df.columns:
+                doy_coords = df[doy_col].values.astype(np.float32)
 
         coord_cols = [time_col, lat_col, lon_col]
+        if doy_col and doy_col in df.columns:
+            coord_cols.append(doy_col)
+
         if env_cols is None:
             env_cols = []
             species_cols = []
@@ -107,6 +133,7 @@ class JSDMDataset(Dataset):
         self.lats = self.coords[:, 0]
         self.lons = self.coords[:, 1]
         self.times = df[time_col].values.astype(np.float32)
+        self.doys = doy_coords
         self.species_data = df[species_cols].values.astype(np.float32)
         self.env_data = (
             df[env_cols].values.astype(np.float32) if env_cols
@@ -115,18 +142,23 @@ class JSDMDataset(Dataset):
 
         N = len(df)
         print(f"Dataset: {N} observations, {self.num_species} species, {self.num_env_vars} env vars")
-        print("Computing pairwise distances...")
-        self.spatial_dists = haversine_pairwise(self.lats, self.lons)
-        self.temporal_dists = cdist(
-            self.times.reshape(-1, 1), self.times.reshape(-1, 1)
-        ).astype(np.float32)
+        has_doy = doy_coords.any()
+        print(f"Seasonal encoding: {'yes (DOY extracted)' if has_doy else 'no (time column is not a date)'}")
+
+        self.max_spatial_dist = _estimate_max_spatial_dist(self.lats, self.lons)
+        self.max_temporal_dist = float(self.times.max() - self.times.min())
+        self.max_doy_dist = 182.0
         self.spatial_scale_km = _resolve_scale(
-            spatial_scale_km, float(self.spatial_dists.max()), "spatial_scale_km"
+            spatial_scale_km, self.max_spatial_dist, "spatial_scale_km"
         )
         self.temporal_scale_days = _resolve_scale(
-            temporal_scale_days, float(self.temporal_dists.max()), "temporal_scale_days"
+            temporal_scale_days, self.max_temporal_dist, "temporal_scale_days"
         )
-        print("Done.")
+
+        self.time_window_days = time_window_days
+        self.sampling_strategy = sampling_strategy
+        self.time_sorted_idx = np.argsort(self.times)
+        self.time_sorted = self.times[self.time_sorted_idx]
 
     def __len__(self):
         return len(self.species_data)
@@ -135,34 +167,73 @@ class JSDMDataset(Dataset):
         N_total = len(self.species_data)
         N = self.num_source_sites
 
-        target_species = self.species_data[idx]  # (S,)
+        target_species = self.species_data[idx]
 
-        spatial = self.spatial_dists[idx] / self.spatial_scale_km
-        temporal = self.temporal_dists[idx] / self.temporal_scale_days
-        combined_dist = np.sqrt(spatial ** 2 + temporal ** 2)
-        combined_dist[idx] = np.inf
-        inv_dist = 1.0 / (combined_dist + 1e-6)
-        probs = inv_dist / inv_dist.sum()
-        source_idx = np.random.choice(N_total, size=N, replace=(N > N_total - 1), p=probs)
+        if self.time_window_days is not None and self.time_window_days > 0:
+            t0 = float(self.times[idx])
+            left = np.searchsorted(self.time_sorted, t0 - self.time_window_days, side="left")
+            right = np.searchsorted(self.time_sorted, t0 + self.time_window_days, side="right")
+            candidates = self.time_sorted_idx[left:right]
+        else:
+            candidates = np.arange(N_total, dtype=np.int64)
 
-        source_species = self.species_data[source_idx].T  # (S, N)
-        source_env = self.env_data[source_idx]             # (N, E)
+        candidates = candidates[candidates != idx]
+        if candidates.size == 0:
+            candidates = np.array([idx], dtype=np.int64)
+
+        cand_spatial = haversine_to_point(
+            self.lats[candidates], self.lons[candidates], self.lats[idx], self.lons[idx]
+        )
+        cand_temporal = np.abs(self.times[candidates] - self.times[idx]).astype(np.float32)
+
+        spatial_scaled = cand_spatial / self.spatial_scale_km
+        temporal_scaled = cand_temporal / self.temporal_scale_days
+        combined_dist = np.sqrt(spatial_scaled ** 2 + temporal_scaled ** 2)
+
+        if self.sampling_strategy == "nearest":
+            if candidates.size >= N:
+                topk = np.argpartition(combined_dist, N - 1)[:N]
+                source_idx = candidates[topk]
+            else:
+                extra = np.random.choice(
+                    candidates, size=N - candidates.size, replace=True
+                )
+                source_idx = np.concatenate([candidates, extra], axis=0)
+        elif self.sampling_strategy == "weighted":
+            inv_dist = 1.0 / (combined_dist + 1e-6)
+            probs = inv_dist / inv_dist.sum()
+            source_idx = np.random.choice(
+                candidates, size=N, replace=(N > candidates.size), p=probs
+            )
+        else:
+            raise ValueError(f"Unknown sampling_strategy: {self.sampling_strategy}")
+
+        source_spatial = haversine_to_point(
+            self.lats[source_idx], self.lons[source_idx], self.lats[idx], self.lons[idx]
+        )
+        source_temporal = np.abs(self.times[source_idx] - self.times[idx]).astype(np.float32)
+        source_doy = np.abs(self.doys[source_idx] - self.doys[idx]).astype(np.float32)
+        source_doy = np.minimum(source_doy, 365.0 - source_doy)
 
         return {
             "target_species": torch.tensor(target_species, dtype=torch.float32),
-            "source_species": torch.tensor(source_species, dtype=torch.float32),
-            "source_env": torch.tensor(source_env, dtype=torch.float32),
-            "target_env": torch.tensor(self.env_data[idx], dtype=torch.float32),  # (E,) — target site covariates/effort
-            "target_idx": torch.tensor(idx, dtype=torch.long),
-            "source_idx": torch.tensor(source_idx, dtype=torch.long),
+            "source_species": torch.tensor(self.species_data[source_idx].T, dtype=torch.float32),
+            "source_env":     torch.tensor(self.env_data[source_idx], dtype=torch.float32),
+            "target_env":     torch.tensor(self.env_data[idx], dtype=torch.float32),
+            "target_idx":     torch.tensor(idx, dtype=torch.long),
+            "source_idx":     torch.tensor(source_idx, dtype=torch.long),
+            "source_spatial_dist":  torch.tensor(source_spatial, dtype=torch.float32),
+            "source_temporal_dist": torch.tensor(source_temporal, dtype=torch.float32),
+            "source_doy_dist":      torch.tensor(source_doy, dtype=torch.float32),
+            "source_time":          torch.tensor(self.times[source_idx], dtype=torch.float32),
+            "target_time":          torch.tensor(self.times[idx], dtype=torch.float32),
         }
 
 
 class JSDMDataCollator:
-    def __init__(self, mlm_probability=0.15, mask_value=-1.0, cluster_labels=None):
+    def __init__(self, mlm_probability=0.15, mask_value=-1.0):
         self.mlm_probability = mlm_probability
         self.mask_value = mask_value
-        self.cluster_labels = cluster_labels
 
     def __call__(self, examples):
         batch = {
@@ -183,30 +254,20 @@ class JSDMDataCollator:
             if not masked_indices[b].any():
                 masked_indices[b, torch.randint(S, (1,))] = True
 
-        # Convert to discrete token ids for target embedding: 0=absent, 1=present, 2=mask
-        # Source ids remain float (masked with self.mask_value below)
-        target_ids = target_species.long()  # (B, S)
+        # Token ids: 0=absent, 1=present, 2=mask
+        target_ids = target_species.long()
         indices_replaced = torch.bernoulli(torch.full((B, S), 0.9)).bool() & masked_indices
-        target_ids[indices_replaced] = 2  # mask token; 10% of masked positions keep original token
+        target_ids[indices_replaced] = 2  # 10% of masked positions keep original
 
-        if self.cluster_labels is not None:
-            source_idx = batch["source_idx"]
-            target_idx = batch["target_idx"]
-            for b in range(B):
-                target_cluster = self.cluster_labels[target_idx[b]]
-                for n in range(N):
-                    if self.cluster_labels[source_idx[b, n]] == target_cluster:
-                        source_species[b, masked_indices[b], n] = self.mask_value
-        else:
-            for b in range(B):
-                source_species[b, masked_indices[b], :] = self.mask_value
+        for b in range(B):
+            source_species[b, masked_indices[b], :] = self.mask_value
 
         labels[~masked_indices] = -100
 
-        batch["input_ids"] = target_ids.unsqueeze(-1)  # (B, S, 1) long
-        batch["source_ids"] = source_species
-        batch["labels"] = labels.unsqueeze(-1)
-        batch["env_data"] = batch.pop("source_env")
+        batch["input_ids"]       = target_ids.unsqueeze(-1)   # (B, S, 1)
+        batch["source_ids"]      = source_species
+        batch["labels"]          = labels.unsqueeze(-1)
+        batch["env_data"]        = batch.pop("source_env")
         batch["target_site_idx"] = batch.pop("target_idx").unsqueeze(-1)
 
         del batch["target_species"]
@@ -218,11 +279,13 @@ class JSDMDataCollator:
 def build_st_clusters(
     spatial_coords,
     temporal_coords,
+    doy_coords,
     threshold=5.0,
     spatial_scale_km: Optional[float] = None,
     temporal_scale_days: Optional[float] = None,
     spatial_dist: Optional[np.ndarray] = None,
     temporal_dist: Optional[np.ndarray] = None,
+    doy_dist: Optional[np.ndarray] = None,
 ):
     N = len(spatial_coords)
     if spatial_dist is None:
@@ -235,6 +298,10 @@ def build_st_clusters(
         ).astype(np.float32)
     else:
         temporal_dist = temporal_dist.astype(np.float32)
+    if doy_dist is None:
+        doy_dist = circular_doy_pairwise(doy_coords)
+    else:
+        doy_dist = doy_dist.astype(np.float32)
 
     spatial_scale_km = _resolve_scale(
         spatial_scale_km, float(spatial_dist.max()), "spatial_scale_km"
@@ -243,7 +310,8 @@ def build_st_clusters(
         temporal_scale_days, float(temporal_dist.max()), "temporal_scale_days"
     )
     combined = np.sqrt(
-        (spatial_dist / spatial_scale_km) ** 2 + (temporal_dist / temporal_scale_days) ** 2
+        (spatial_dist / spatial_scale_km) ** 2
+        + (temporal_dist / temporal_scale_days) ** 2
     )
 
     G = nx.Graph()
@@ -261,40 +329,52 @@ def build_st_clusters(
         for s in sites:
             cluster_labels[s] = cid
 
-    in_cluster_spatial = torch.zeros(N)
+    in_cluster_spatial  = torch.zeros(N)
     in_cluster_temporal = torch.zeros(N)
+    in_cluster_doy      = torch.zeros(N)
     for cid, sites in cluster_dict.items():
         sites_list = list(sites)
         if len(sites_list) > 1:
             center_s = spatial_coords[sites_list].mean(axis=0)
             center_t = temporal_coords[sites_list].mean()
+            # Circular mean of DOY: use mean angle on unit circle
+            doy_rad   = doy_coords[sites_list] * (2 * np.pi / 365)
+            center_doy_rad = np.arctan2(np.sin(doy_rad).mean(), np.cos(doy_rad).mean())
+            center_doy = float(center_doy_rad * 365 / (2 * np.pi)) % 365
             for s in sites_list:
-                # haversine from site to cluster centroid (km), consistent with pairwise spatial_dist
                 in_cluster_spatial[s] = float(haversine_pairwise(
                     np.array([spatial_coords[s, 0], center_s[0]]),
                     np.array([spatial_coords[s, 1], center_s[1]])
                 )[0, 1])
                 in_cluster_temporal[s] = float(abs(temporal_coords[s] - center_t))
+                diff = abs(float(doy_coords[s]) - center_doy)
+                in_cluster_doy[s] = float(min(diff, 365 - diff))
 
     return {
-        "cluster_dict": cluster_dict,
-        "cluster_labels": cluster_labels,
-        "in_cluster_spatial_dist": in_cluster_spatial,
-        "in_cluster_temporal_dist": in_cluster_temporal,
-        "spatial_dist_pairwise": torch.tensor(spatial_dist),
-        "temporal_dist_pairwise": torch.tensor(temporal_dist),
-        "max_spatial_dist": float(spatial_dist.max()),
-        "max_temporal_dist": float(temporal_dist.max()),
-        "num_clusters": len(cluster_dict),
-        "spatial_scale_km": spatial_scale_km,
-        "temporal_scale_days": temporal_scale_days,
+        "cluster_dict":              cluster_dict,
+        "cluster_labels":            cluster_labels,
+        "in_cluster_spatial_dist":   in_cluster_spatial,
+        "in_cluster_temporal_dist":  in_cluster_temporal,
+        "in_cluster_doy_dist":       in_cluster_doy,
+        "spatial_dist_pairwise":     torch.tensor(spatial_dist),
+        "temporal_dist_pairwise":    torch.tensor(temporal_dist),
+        "doy_dist_pairwise":         torch.tensor(doy_dist),
+        "temporal_coords":           torch.tensor(temporal_coords, dtype=torch.float32),
+        "doy_coords":                torch.tensor(doy_coords, dtype=torch.float32),
+        "max_spatial_dist":          float(spatial_dist.max()),
+        "max_temporal_dist":         float(temporal_dist.max()),
+        "max_doy_dist":              float(doy_dist.max()),
+        "num_clusters":              len(cluster_dict),
+        "spatial_scale_km":          spatial_scale_km,
+        "temporal_scale_days":       temporal_scale_days,
     }
 
 
 def create_dataloaders(
     csv_path, batch_size=32, num_source_sites=64, mlm_probability=0.15,
-    cluster_threshold=5.0, mask_value=-1.0, train_frac=0.8, num_workers=0,
+    mask_value=-1.0, train_frac=0.8, num_workers=0,
     seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
+    time_window_days=None, sampling_strategy="nearest",
 ):
     np.random.seed(seed)
     dataset = JSDMDataset(
@@ -303,33 +383,25 @@ def create_dataloaders(
         env_cols=env_cols,
         spatial_scale_km=spatial_scale_km,
         temporal_scale_days=temporal_scale_days,
+        time_window_days=time_window_days,
+        sampling_strategy=sampling_strategy,
     )
-
-    print("Building spatial-temporal clusters...")
-    cluster_info = build_st_clusters(
-        dataset.coords,
-        dataset.times,
-        threshold=cluster_threshold,
-        spatial_scale_km=dataset.spatial_scale_km,
-        temporal_scale_days=dataset.temporal_scale_days,
-        spatial_dist=dataset.spatial_dists,
-        temporal_dist=dataset.temporal_dists,
-    )
-    print(f"  {cluster_info['num_clusters']} clusters from {len(dataset)} sites")
 
     n = len(dataset)
     indices = np.random.permutation(n)
     split = int(n * train_frac)
 
     train_dataset = torch.utils.data.Subset(dataset, indices[:split])
-    val_dataset = torch.utils.data.Subset(dataset, indices[split:])
+    val_dataset   = torch.utils.data.Subset(dataset, indices[split:])
 
-    collator = JSDMDataCollator(mlm_probability=mlm_probability, mask_value=mask_value,
-                                 cluster_labels=cluster_info["cluster_labels"])
+    collator = JSDMDataCollator(
+        mlm_probability=mlm_probability,
+        mask_value=mask_value,
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                               collate_fn=collator, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                             collate_fn=collator, num_workers=num_workers, pin_memory=True)
+                              collate_fn=collator, num_workers=num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
+                              collate_fn=collator, num_workers=num_workers, pin_memory=True)
 
-    return train_loader, val_loader, dataset, cluster_info
+    return train_loader, val_loader, dataset
