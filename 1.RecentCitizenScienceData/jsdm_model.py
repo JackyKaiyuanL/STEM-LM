@@ -40,6 +40,8 @@ class JSDMConfig:
     max_doy_dist: float = 182.0       # half-year; max circular DOY distance
 
     num_env_vars: int = 10
+    spatial_scale_km: float = 1.0
+    temporal_scale_days: float = 1.0
 
     hidden_size: int = 256
     num_attention_heads: int = 8
@@ -378,7 +380,7 @@ class EcoCrossAttention(nn.Module):
         x = x.view(x.size()[:-1] + (self.num_attention_heads, self.attention_head_size))
         return x.transpose(-2, -3)
 
-    def forward(self, hidden_states, eco_embeddings, output_attentions=False):
+    def forward(self, hidden_states, eco_embeddings, attention_mask=None, output_attentions=False):
         query_layer = self.transpose_for_scores(self.query(hidden_states))
         eco_exp     = eco_embeddings.unsqueeze(1).expand(-1, hidden_states.size(1), -1, -1)
         key_layer   = self.transpose_for_scores(self.key(eco_exp))
@@ -387,6 +389,8 @@ class EcoCrossAttention(nn.Module):
         if output_attentions:
             attn_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
             attn_scores = attn_scores / math.sqrt(self.attention_head_size)
+            if attention_mask is not None:
+                attn_scores = attn_scores + attention_mask
             attn_probs  = F.softmax(attn_scores, dim=-1)
             context     = torch.matmul(attn_probs, value_layer)
             context     = context.transpose(-2, -3).contiguous()
@@ -395,6 +399,7 @@ class EcoCrossAttention(nn.Module):
         else:
             context = F.scaled_dot_product_attention(
                 query_layer, key_layer, value_layer,
+                attn_mask=attention_mask,
                 dropout_p=self.attention_probs_dropout_prob if self.training else 0.0,
                 scale=1.0 / math.sqrt(self.attention_head_size),
             )
@@ -419,8 +424,8 @@ class EcoColAttention(nn.Module):
         self.cross_attn = EcoCrossAttention(config)
         self.output     = EcoCrossOutput(config)
 
-    def forward(self, hidden_states, eco_embeddings, output_attentions=False):
-        cross_outputs = self.cross_attn(hidden_states, eco_embeddings, output_attentions)
+    def forward(self, hidden_states, eco_embeddings, attention_mask=None, output_attentions=False):
+        cross_outputs = self.cross_attn(hidden_states, eco_embeddings, attention_mask, output_attentions)
         output = (self.output(cross_outputs[0]),)
         if output_attentions:
             output = output + (cross_outputs[1],)
@@ -442,7 +447,7 @@ class JSDMAttention(nn.Module):
         self.cross_norm   = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, hidden_states, st_source_embeddings, eco_embeddings,
-                st_attention_mask=None, st_dist=None, st_doy_dist=None,
+                st_attention_mask=None, eco_attention_mask=None, st_dist=None, st_doy_dist=None,
                 sinusoidal_pos=None, output_attentions=False):
         row_output = self.row_attention(
             hidden_states=self.row_norm(hidden_states).transpose(-2, -3),
@@ -455,7 +460,7 @@ class JSDMAttention(nn.Module):
         st_output  = self.st_col_attention(h_normed, st_source_embeddings,
                                             st_attention_mask, st_dist, st_doy_dist,
                                             output_attentions)
-        eco_output = self.eco_col_attention(h_normed, eco_embeddings, output_attentions)
+        eco_output = self.eco_col_attention(h_normed, eco_embeddings, eco_attention_mask, output_attentions)
 
         gate = torch.sigmoid(self.combine_gate)[None, :, None, None]
         h    = h + gate * st_output[0] + (1 - gate) * eco_output[0]
@@ -498,11 +503,11 @@ class JSDMLayer(nn.Module):
         self.ffn_norm  = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, hidden_states, st_source_embeddings, eco_embeddings,
-                st_attention_mask=None, st_dist=None, st_doy_dist=None,
+                st_attention_mask=None, eco_attention_mask=None, st_dist=None, st_doy_dist=None,
                 sinusoidal_pos=None, output_attentions=False):
         attn_outputs = self.attention(
             hidden_states, st_source_embeddings, eco_embeddings,
-            st_attention_mask, st_dist, st_doy_dist, sinusoidal_pos, output_attentions,
+            st_attention_mask, eco_attention_mask, st_dist, st_doy_dist, sinusoidal_pos, output_attentions,
         )
         h = attn_outputs[0]
         h = h + self.ffn(self.ffn_norm(h))
@@ -519,7 +524,7 @@ class JSDMEncoder(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, hidden_states, st_source_embeddings, eco_embeddings,
-                st_attention_mask=None, st_dist=None, st_doy_dist=None,
+                st_attention_mask=None, eco_attention_mask=None, st_dist=None, st_doy_dist=None,
                 output_attentions=False, output_hidden_states=False):
         all_hidden   = () if output_hidden_states else None
         all_sp_attn  = () if output_attentions else None
@@ -534,13 +539,13 @@ class JSDMEncoder(nn.Module):
             if self.gradient_checkpointing and self.training:
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     layer, hidden_states, st_source_embeddings, eco_embeddings,
-                    st_attention_mask, st_dist, st_doy_dist, sinusoidal_pos, output_attentions,
+                    st_attention_mask, eco_attention_mask, st_dist, st_doy_dist, sinusoidal_pos, output_attentions,
                     use_reentrant=False,
                 )
             else:
                 layer_outputs = layer(
                     hidden_states, st_source_embeddings, eco_embeddings,
-                    st_attention_mask, st_dist, st_doy_dist, sinusoidal_pos, output_attentions,
+                    st_attention_mask, eco_attention_mask, st_dist, st_doy_dist, sinusoidal_pos, output_attentions,
                 )
             hidden_states = layer_outputs[0]
             if output_attentions:
@@ -629,15 +634,49 @@ class JSDMModel(nn.Module):
 
         st_dist = torch.stack([st_spatial, st_temporal], dim=-1)  # (B, T, N, 2)
 
-        is_future = source_time[:, None, :] > target_time[..., None]  # (B, T, N)
-        same_site = source_idx[:, None, :].eq(target_site_idx)         # (B, T, N)
-        mask = is_future | same_site
-        attn_mask = mask[:, None, None, :, :].to(hidden_states.dtype)
-        attn_mask = attn_mask * torch.finfo(hidden_states.dtype).min
+        is_future = source_time[:, None, :] > target_time[..., None]   # (B, T, N)
+        same_site = source_idx[:, None, :].eq(target_site_idx)          # (B, T, N)
+        source_mask = is_future | same_site
+
+        if T != 1:
+            raise ValueError("Multiscale pooling expects a single target time (T=1).")
+
+        spatial_edges = st_spatial.new_tensor([0.5, 1.5]) * self.config.spatial_scale_km
+        temporal_edges = st_temporal.new_tensor([0.5, 1.5]) * self.config.temporal_scale_days
+        sp_bin = torch.bucketize(st_spatial, spatial_edges)  # (B, 1, N)
+        tp_bin = torch.bucketize(st_temporal, temporal_edges)  # (B, 1, N)
+        num_temporal_bins = temporal_edges.numel() + 1
+        num_groups = (spatial_edges.numel() + 1) * num_temporal_bins
+        group_idx = sp_bin * num_temporal_bins + tp_bin  # (B, 1, N)
+
+        one_hot = F.one_hot(group_idx, num_classes=num_groups).float()  # (B, 1, N, G)
+        counts = one_hot.sum(dim=2)  # (B, 1, G)
+        weights = one_hot / counts.clamp(min=1).unsqueeze(2)
+
+        pooled = torch.einsum("btng,bsnh->bstgh", weights, st_source)  # (B, S, 1, G, H)
+        pooled = pooled.squeeze(2)  # (B, S, G, H)
+        st_source = torch.cat([st_source, pooled], dim=2)  # (B, S, N+G, H)
+
+        pooled_spatial = (weights * st_spatial.unsqueeze(-1)).sum(dim=2)   # (B, 1, G)
+        pooled_temporal = (weights * st_temporal.unsqueeze(-1)).sum(dim=2) # (B, 1, G)
+        pooled_doy = (weights * st_doy_dist.unsqueeze(-1)).sum(dim=2)      # (B, 1, G)
+
+        pooled_dist = torch.stack([pooled_spatial, pooled_temporal], dim=-1)  # (B, 1, G, 2)
+        st_dist = torch.cat([st_dist, pooled_dist], dim=2)  # (B, 1, N+G, 2)
+        st_doy_dist = torch.cat([st_doy_dist, pooled_doy], dim=2)
+
+        pooled_empty = counts == 0
+        st_mask = torch.cat([source_mask, pooled_empty], dim=2)
+        st_attention_mask = st_mask[:, None, None, :, :].to(hidden_states.dtype)
+        st_attention_mask = st_attention_mask * torch.finfo(hidden_states.dtype).min
+
+        eco_attention_mask = source_mask[:, None, None, :, :].to(hidden_states.dtype)
+        eco_attention_mask = eco_attention_mask * torch.finfo(hidden_states.dtype).min
 
         return self.encoder(
             hidden_states, st_source, eco_emb,
-            st_attention_mask=attn_mask,
+            st_attention_mask=st_attention_mask,
+            eco_attention_mask=eco_attention_mask,
             st_dist=st_dist,
             st_doy_dist=st_doy_dist,
             output_attentions=output_attentions,
@@ -670,50 +709,16 @@ class JSDMPredictionHead(nn.Module):
     def forward(self, hidden_states):
         return self.decoder(self.layer_norm(self.act(self.dense(hidden_states)))).squeeze(-1)
 
-
-# =============================================================================
-# Occupancy-Detection Head (commented out)
-# Uncomment cls init and occupancy blocks in JSDMForMaskedSpeciesPrediction to activate.
-# P(x_s=1) = ψ_s · p_s, where p_s = σ(species_detect_logit[s] + effort_proj(target_env)[s])
-# =============================================================================
-#
-# class OccupancyDetectionHead(nn.Module):
-#     def __init__(self, config: JSDMConfig):
-#         super().__init__()
-#         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-#         self.act = nn.SiLU()
-#         self.layer_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
-#         self.occupancy_decoder = nn.Linear(config.hidden_size, 1)
-#         self.species_detect_logit = nn.Parameter(torch.full((config.num_species,), 2.2))
-#         self.effort_proj = nn.Linear(config.num_env_vars, config.num_species)
-#         nn.init.zeros_(self.effort_proj.weight)
-#         nn.init.zeros_(self.effort_proj.bias)
-#
-#     def forward(self, hidden_states, target_env=None):
-#         x = self.act(self.dense(hidden_states))
-#         x = self.layer_norm(x)
-#         psi_logit = self.occupancy_decoder(x).squeeze(-1)
-#         p_detect_logit = self.species_detect_logit
-#         if target_env is not None:
-#             p_detect_logit = p_detect_logit.unsqueeze(0) + self.effort_proj(target_env)
-#         return psi_logit, p_detect_logit
-
-
 class JSDMForMaskedSpeciesPrediction(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         self.config = config
         self.model  = JSDMModel(config)
         self.cls    = JSDMPredictionHead(config)
-        # self.occupancy_cls = OccupancyDetectionHead(config)
 
     def forward(self, labels=None, loss_weight=None, output_attentions=False, target_env=None, **kwargs):
         encoder_out = self.model(output_attentions=output_attentions, **kwargs)
         logits = self.cls(encoder_out.last_hidden_state)  # (B, S, T)
-
-        # === Occupancy-detection model (uncomment to replace simple BCE) ===
-        # psi_logit, p_detect_logit = self.occupancy_cls(encoder_out.last_hidden_state, target_env)
-        # logits = psi_logit
 
         loss = None
         if labels is not None:
@@ -729,31 +734,6 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
                     )
                     w    = loss_weight.unsqueeze(-1).expand_as(labels)[mask]
                     loss = (per_el * w).sum() / w.sum()
-
-                # ── Loss option A: SPML positive-only ─────────────────────────────────
-                # pos_mask = mask & (labels == 1)
-                # if pos_mask.any():
-                #     loss = F.binary_cross_entropy_with_logits(
-                #         logits[pos_mask].float(), labels[pos_mask].float()
-                #     )
-
-                # ── Loss option B: SPML AN-loss (asymmetric downweighting) ────────────
-                # alpha = 0.1
-                # y = labels[mask].float()
-                # per_el = F.binary_cross_entropy_with_logits(logits[mask].float(), y, reduction="none")
-                # w = torch.where(y == 1, torch.ones_like(y), y.new_full((), alpha))
-                # loss = (per_el * w).mean()
-
-                # ── Loss option C: Occupancy-detection composite likelihood ────────────
-                # psi = torch.sigmoid(psi_logit)
-                # p_det = torch.sigmoid(p_detect_logit)
-                # if p_det.dim() == 1:
-                #     p_det = p_det[None, :, None]
-                # else:
-                #     p_det = p_det.unsqueeze(-1)
-                # p_obs = (psi * p_det).clamp(1e-6, 1 - 1e-6)
-                # y = labels[mask].float()
-                # loss = -(y * p_obs[mask].log() + (1 - y) * (1 - p_obs[mask]).log()).mean()
 
         return JSDMOutput(
             loss=loss, logits=logits,

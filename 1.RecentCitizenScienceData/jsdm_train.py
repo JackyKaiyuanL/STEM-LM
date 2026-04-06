@@ -147,6 +147,8 @@ def main():
         max_spatial_dist        = dataset.max_spatial_dist  * 1.1,
         max_temporal_dist       = dataset.max_temporal_dist * 1.1,
         max_doy_dist            = max(dataset.max_doy_dist, 1.0),
+        spatial_scale_km        = dataset.spatial_scale_km,
+        temporal_scale_days     = dataset.temporal_scale_days,
         num_env_vars            = dataset.num_env_vars,
         hidden_size             = args.hidden_size,
         num_attention_heads     = args.num_attention_heads,

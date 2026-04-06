@@ -50,6 +50,42 @@ def _estimate_max_spatial_dist(lat_deg: np.ndarray, lon_deg: np.ndarray) -> floa
     return float(corner_dists.max())
 
 
+def _pairwise_quantile_spatial(
+    lat_deg: np.ndarray,
+    lon_deg: np.ndarray,
+    quantile: float = 0.95,
+    sample_size: int = 1024,
+) -> float:
+    n = len(lat_deg)
+    if n < 2:
+        return 1.0
+    take = min(n, sample_size)
+    idx = np.random.choice(n, size=take, replace=False)
+    dists = haversine_pairwise(lat_deg[idx], lon_deg[idx]).reshape(-1)
+    dists = dists[dists > 0]
+    if dists.size == 0:
+        return 1.0
+    return float(np.quantile(dists, quantile))
+
+
+def _pairwise_quantile_temporal(
+    times: np.ndarray,
+    quantile: float = 0.95,
+    sample_size: int = 1024,
+) -> float:
+    n = len(times)
+    if n < 2:
+        return 1.0
+    take = min(n, sample_size)
+    idx = np.random.choice(n, size=take, replace=False)
+    sample = times[idx]
+    dists = np.abs(sample[:, None] - sample[None, :]).reshape(-1)
+    dists = dists[dists > 0]
+    if dists.size == 0:
+        return 1.0
+    return float(np.quantile(dists, quantile))
+
+
 def circular_doy_pairwise(doy: np.ndarray) -> np.ndarray:
     """Pairwise circular day-of-year distances in [0, 182]."""
     diff = np.abs(doy[:, None] - doy[None, :])
@@ -139,6 +175,10 @@ class JSDMDataset(Dataset):
             df[env_cols].values.astype(np.float32) if env_cols
             else np.zeros((len(df), 1), dtype=np.float32)
         )
+        self.env_mean = self.env_data.mean(axis=0)
+        self.env_std = self.env_data.std(axis=0)
+        self.env_std = np.where(self.env_std > 0, self.env_std, 1.0)
+        self.env_norm = (self.env_data - self.env_mean) / self.env_std
 
         N = len(df)
         print(f"Dataset: {N} observations, {self.num_species} species, {self.num_env_vars} env vars")
@@ -148,11 +188,13 @@ class JSDMDataset(Dataset):
         self.max_spatial_dist = _estimate_max_spatial_dist(self.lats, self.lons)
         self.max_temporal_dist = float(self.times.max() - self.times.min())
         self.max_doy_dist = 182.0
+        spatial_scale_default = _pairwise_quantile_spatial(self.lats, self.lons)
+        temporal_scale_default = _pairwise_quantile_temporal(self.times)
         self.spatial_scale_km = _resolve_scale(
-            spatial_scale_km, self.max_spatial_dist, "spatial_scale_km"
+            spatial_scale_km, spatial_scale_default, "spatial_scale_km"
         )
         self.temporal_scale_days = _resolve_scale(
-            temporal_scale_days, self.max_temporal_dist, "temporal_scale_days"
+            temporal_scale_days, temporal_scale_default, "temporal_scale_days"
         )
 
         self.time_window_days = time_window_days
@@ -169,13 +211,13 @@ class JSDMDataset(Dataset):
 
         target_species = self.species_data[idx]
 
+        t0 = float(self.times[idx])
         if self.time_window_days is not None and self.time_window_days > 0:
-            t0 = float(self.times[idx])
             left = np.searchsorted(self.time_sorted, t0 - self.time_window_days, side="left")
-            right = np.searchsorted(self.time_sorted, t0 + self.time_window_days, side="right")
-            candidates = self.time_sorted_idx[left:right]
         else:
-            candidates = np.arange(N_total, dtype=np.int64)
+            left = 0
+        right = np.searchsorted(self.time_sorted, t0, side="left")
+        candidates = self.time_sorted_idx[left:right]
 
         candidates = candidates[candidates != idx]
         if candidates.size == 0:
@@ -184,11 +226,18 @@ class JSDMDataset(Dataset):
         cand_spatial = haversine_to_point(
             self.lats[candidates], self.lons[candidates], self.lats[idx], self.lons[idx]
         )
-        cand_temporal = np.abs(self.times[candidates] - self.times[idx]).astype(np.float32)
+        cand_temporal = (t0 - self.times[candidates]).astype(np.float32)
+        cand_doy = np.abs(self.doys[candidates] - self.doys[idx]).astype(np.float32)
+        cand_doy = np.minimum(cand_doy, 365.0 - cand_doy)
+        env_diff = self.env_norm[candidates] - self.env_norm[idx]
+        env_dist = np.linalg.norm(env_diff, axis=1) / math.sqrt(self.num_env_vars)
 
         spatial_scaled = cand_spatial / self.spatial_scale_km
         temporal_scaled = cand_temporal / self.temporal_scale_days
-        combined_dist = np.sqrt(spatial_scaled ** 2 + temporal_scaled ** 2)
+        doy_scaled = cand_doy / 182.0
+        combined_dist = np.sqrt(
+            spatial_scaled ** 2 + temporal_scaled ** 2 + env_dist ** 2 + doy_scaled ** 2
+        )
 
         if self.sampling_strategy == "nearest":
             if candidates.size >= N:
@@ -211,7 +260,7 @@ class JSDMDataset(Dataset):
         source_spatial = haversine_to_point(
             self.lats[source_idx], self.lons[source_idx], self.lats[idx], self.lons[idx]
         )
-        source_temporal = np.abs(self.times[source_idx] - self.times[idx]).astype(np.float32)
+        source_temporal = (t0 - self.times[source_idx]).astype(np.float32)
         source_doy = np.abs(self.doys[source_idx] - self.doys[idx]).astype(np.float32)
         source_doy = np.minimum(source_doy, 365.0 - source_doy)
 
