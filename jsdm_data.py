@@ -24,8 +24,8 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 from scipy.spatial.distance import cdist
+from sklearn.cluster import AgglomerativeClustering
 from typing import Optional, List, Dict, Any
-import networkx as nx
 
 
 def haversine_pairwise(lat_deg: np.ndarray, lon_deg: np.ndarray) -> np.ndarray:
@@ -243,20 +243,25 @@ def build_st_clusters(
         threshold = float(np.percentile(triu[triu > 0], cluster_percentile))
         print(f"  Auto cluster threshold: {threshold:.4f} ({cluster_percentile}th percentile of pairwise distances)")
 
-    G = nx.Graph()
-    G.add_nodes_from(range(N))
-    for i in range(N):
-        for j in range(i + 1, N):
-            if combined[i, j] <= threshold:
-                G.add_edge(i, j)
+    # Complete linkage: every pair within a cluster is <= threshold (no chaining).
+    # Connected components (previous approach) allowed transitivity to merge distant sites.
+    if threshold > 0:
+        agg = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=threshold,
+            metric="precomputed",
+            linkage="complete",
+        )
+        raw_labels = agg.fit_predict(combined.astype(np.float64))
+    else:
+        raw_labels = np.arange(N)  # each site its own cluster
 
-    cluster_dict = {
-        i: nodes for i, nodes in enumerate(list(nx.connected_components(G)))
-    }
-    cluster_labels = torch.zeros(N, dtype=torch.long)
-    for cid, sites in cluster_dict.items():
-        for s in sites:
-            cluster_labels[s] = cid
+    unique_ids = np.unique(raw_labels)
+    id_map = {old: new for new, old in enumerate(unique_ids)}
+    cluster_labels = torch.tensor([id_map[l] for l in raw_labels], dtype=torch.long)
+    cluster_dict = {}
+    for cid in range(len(unique_ids)):
+        cluster_dict[cid] = set(np.where(raw_labels == unique_ids[cid])[0].tolist())
 
     in_cluster_spatial = torch.zeros(N)
     in_cluster_temporal = torch.zeros(N)
