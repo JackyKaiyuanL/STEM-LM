@@ -160,7 +160,7 @@ def main():
         mask_value_init=args.mask_value,
         num_source_sites=args.num_source_sites,
         max_spatial_dist=cluster_info["max_spatial_dist"] * 1.1,
-        max_temporal_dist=cluster_info["max_temporal_dist"] * 1.1,
+        max_temporal_dist=max(cluster_info["max_temporal_dist"], cluster_info["temporal_scale_days"]) * 1.1,
         num_env_vars=dataset.num_env_vars,
         num_env_groups=args.num_env_groups,
         hidden_size=args.hidden_size,
