@@ -11,6 +11,7 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -21,12 +22,16 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 
-def train_epoch(model, loader, optimizer, scheduler, device, cluster_info, epoch, log_interval=50):
+def train_epoch(model, loader, optimizer, scheduler, device, cluster_info, epoch,
+                loss_weight=None, log_interval=50):
     model.train()
     total_loss, total_correct, total_masked, num_batches = 0, 0, 0, 0
 
     for batch_idx, batch in enumerate(loader):
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+        B = batch["input_ids"].shape[0]
+        w = loss_weight[None, :].expand(B, -1).to(device) if loss_weight is not None else None
 
         output = model(
             input_ids=batch["input_ids"],
@@ -35,6 +40,7 @@ def train_epoch(model, loader, optimizer, scheduler, device, cluster_info, epoch
             target_site_idx=batch["target_site_idx"],
             env_data=batch["env_data"],
             labels=batch["labels"],
+            loss_weight=w,
             cluster_dict=cluster_info["cluster_dict"],
             cluster_labels=cluster_info["cluster_labels"],
             in_cluster_spatial_dist=cluster_info["in_cluster_spatial_dist"],
@@ -74,7 +80,10 @@ def train_epoch(model, loader, optimizer, scheduler, device, cluster_info, epoch
 @torch.no_grad()
 def evaluate(model, loader, device, cluster_info):
     model.eval()
-    total_loss, total_correct, total_masked, num_batches = 0, 0, 0, 0
+    total_loss, num_batches = 0, 0
+    S = model.config.num_species
+    species_preds  = [[] for _ in range(S)]
+    species_labels = [[] for _ in range(S)]
 
     for batch in loader:
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -94,14 +103,31 @@ def evaluate(model, loader, device, cluster_info):
         )
         total_loss += output.loss.item()
         num_batches += 1
-        mask = batch["labels"] != -100
-        if mask.any():
-            preds = (output.logits[mask] > 0).long()
-            targets = batch["labels"][mask].long()
-            total_correct += (preds == targets).sum().item()
-            total_masked += mask.sum().item()
 
-    return total_loss / max(num_batches, 1), total_correct / max(total_masked, 1)
+        probs  = torch.sigmoid(output.logits).squeeze(-1).cpu().numpy()   # (B, S)
+        labels = batch["labels"].squeeze(-1).cpu().numpy()                 # (B, S)
+        mask   = labels != -100                                             # (B, S)
+        for s in range(S):
+            b_mask = mask[:, s]
+            if b_mask.any():
+                species_preds[s].extend(probs[b_mask, s].tolist())
+                species_labels[s].extend(labels[b_mask, s].tolist())
+
+    # Per-species AUC (skip species with only one class in val masked positions)
+    aucs = []
+    total_correct, total_masked = 0, 0
+    for s in range(S):
+        if len(species_labels[s]) > 0:
+            arr_p = np.array(species_preds[s])
+            arr_l = np.array(species_labels[s])
+            total_correct += ((arr_p > 0.5) == arr_l).sum()
+            total_masked  += len(arr_l)
+            if len(set(species_labels[s])) == 2:
+                aucs.append(roc_auc_score(arr_l, arr_p))
+    mean_auc = float(np.mean(aucs)) if aucs else float("nan")
+    acc = total_correct / max(total_masked, 1)
+
+    return total_loss / max(num_batches, 1), acc, mean_auc
 
 
 def main():
@@ -131,6 +157,8 @@ def main():
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--spatial_scale_km", type=float, default=None)
     parser.add_argument("--temporal_scale_days", type=float, default=None)
+    parser.add_argument("--class_weighting", action="store_true",
+                        help="Up-weight rare species using effective number weighting (beta=0.999)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -153,6 +181,18 @@ def main():
         spatial_scale_km=args.spatial_scale_km,
         temporal_scale_days=args.temporal_scale_days,
     )
+
+    # Per-species loss weighting (effective number, beta=0.999)
+    loss_weight = None
+    if args.class_weighting:
+        train_indices = train_loader.dataset.indices
+        n_s = dataset.species_data[train_indices].sum(axis=0).clip(min=1)  # (S,)
+        beta = 0.999
+        effective_n = (1 - beta ** n_s) / (1 - beta)
+        w = 1.0 / effective_n
+        w = w / w.mean()
+        loss_weight = torch.tensor(w, dtype=torch.float32)
+        logger.info(f"Class weighting: weight range [{w.min():.3f}, {w.max():.3f}]")
 
     # Config
     config = JSDMConfig(
@@ -192,14 +232,14 @@ def main():
     for epoch in range(1, args.num_epochs + 1):
         t0 = time.time()
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scheduler, device, cluster_info, epoch
+            model, train_loader, optimizer, scheduler, device, cluster_info, epoch, loss_weight
         )
-        val_loss, val_acc = evaluate(model, val_loader, device, cluster_info)
+        val_loss, val_acc, val_auc = evaluate(model, val_loader, device, cluster_info)
         elapsed = time.time() - t0
         logger.info(
             f"Epoch {epoch}/{args.num_epochs} | "
-            f"Train: loss={train_loss:.4f} acc={train_acc:.4f} | "
-            f"Val: loss={val_loss:.4f} acc={val_acc:.4f} | {elapsed:.1f}s"
+            f"Train loss={train_loss:.4f} acc={train_acc:.4f} | "
+            f"Val loss={val_loss:.4f} acc={val_acc:.4f} auc={val_auc:.4f} | {elapsed:.1f}s"
         )
         if val_loss < best_val_loss:
             best_val_loss = val_loss
