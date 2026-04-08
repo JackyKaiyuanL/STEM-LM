@@ -29,18 +29,20 @@ from typing import Optional, List, Dict, Any
 
 
 def haversine_pairwise(lat_deg: np.ndarray, lon_deg: np.ndarray) -> np.ndarray:
-    """
-    Compute pairwise haversine distances in kilometers.
-    """
+    """Pairwise haversine distances in kilometers. Use for real geographic coordinates."""
     lat = np.radians(lat_deg.astype(np.float64))
     lon = np.radians(lon_deg.astype(np.float64))
-    lat1 = lat[:, None]
-    lat2 = lat[None, :]
+    lat1 = lat[:, None]; lat2 = lat[None, :]
     dlat = lat1 - lat2
     dlon = lon[:, None] - lon[None, :]
     a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
-    c = 2.0 * np.arcsin(np.sqrt(a))
-    return (6371.0 * c).astype(np.float32)
+    return (6371.0 * 2.0 * np.arcsin(np.sqrt(a))).astype(np.float32)
+
+
+def euclidean_pairwise(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Pairwise Euclidean distances. Use for simulated or arbitrary 2D coordinates."""
+    coords = np.stack([x, y], axis=1).astype(np.float64)
+    return cdist(coords, coords).astype(np.float32)
 
 
 def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
@@ -64,6 +66,7 @@ class JSDMDataset(Dataset):
         env_cols: Optional[List[str]] = None,
         spatial_scale_km: Optional[float] = None,
         temporal_scale_days: Optional[float] = None,
+        euclidean_coords: bool = False,
     ):
         super().__init__()
         self.num_source_sites = num_source_sites
@@ -108,7 +111,10 @@ class JSDMDataset(Dataset):
         N = len(df)
         print(f"Dataset: {N} observations, {self.num_species} species, {self.num_env_vars} env vars")
         print("Computing pairwise distances...")
-        self.spatial_dists = haversine_pairwise(self.lats, self.lons)
+        if euclidean_coords:
+            self.spatial_dists = euclidean_pairwise(self.lats, self.lons)
+        else:
+            self.spatial_dists = haversine_pairwise(self.lats, self.lons)
         self.temporal_dists = cdist(
             self.times.reshape(-1, 1), self.times.reshape(-1, 1)
         ).astype(np.float32)
@@ -298,14 +304,15 @@ def create_dataloaders(
     cluster_threshold=None, cluster_percentile=5.0,
     mask_value=-1.0, train_frac=0.8, num_workers=0,
     seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
+    euclidean_coords=False,
 ):
-    np.random.seed(seed)
     dataset = JSDMDataset(
         csv_path=csv_path,
         num_source_sites=num_source_sites,
         env_cols=env_cols,
         spatial_scale_km=spatial_scale_km,
         temporal_scale_days=temporal_scale_days,
+        euclidean_coords=euclidean_coords,
     )
 
     print("Building spatial-temporal clusters...")
@@ -321,6 +328,8 @@ def create_dataloaders(
     )
     print(f"  {cluster_info['num_clusters']} clusters from {len(dataset)} sites")
 
+    # seed after clustering so the train/val split matches other baselines (seed → permutation directly)
+    np.random.seed(seed)
     n = len(dataset)
     indices = np.random.permutation(n)
     split = int(n * train_frac)

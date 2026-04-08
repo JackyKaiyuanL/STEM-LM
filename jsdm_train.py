@@ -3,6 +3,7 @@ Training script for ST-JSDM. Mirrors GPN-star's train.py.
 """
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -113,9 +114,9 @@ def evaluate(model, loader, device, cluster_info):
                 species_preds[s].extend(probs[b_mask, s].tolist())
                 species_labels[s].extend(labels[b_mask, s].tolist())
 
-    # Per-species AUC (skip species with only one class in val masked positions)
-    aucs = []
+    per_species_aucs = {}
     total_correct, total_masked = 0, 0
+    aucs = []
     for s in range(S):
         if len(species_labels[s]) > 0:
             arr_p = np.array(species_preds[s])
@@ -123,11 +124,13 @@ def evaluate(model, loader, device, cluster_info):
             total_correct += ((arr_p > 0.5) == arr_l).sum()
             total_masked  += len(arr_l)
             if len(set(species_labels[s])) == 2:
-                aucs.append(roc_auc_score(arr_l, arr_p))
+                auc_s = roc_auc_score(arr_l, arr_p)
+                aucs.append(auc_s)
+                per_species_aucs[s] = auc_s
     mean_auc = float(np.mean(aucs)) if aucs else float("nan")
     acc = total_correct / max(total_masked, 1)
 
-    return total_loss / max(num_batches, 1), acc, mean_auc
+    return total_loss / max(num_batches, 1), acc, mean_auc, per_species_aucs
 
 
 def main():
@@ -157,6 +160,9 @@ def main():
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--spatial_scale_km", type=float, default=None)
     parser.add_argument("--temporal_scale_days", type=float, default=None)
+    parser.add_argument("--euclidean_coords", action="store_true",
+                        help="Use Euclidean distance instead of haversine. "
+                             "For simulated or arbitrary 2D coordinates (not geographic degrees).")
     parser.add_argument("--class_weighting", action="store_true",
                         help="Up-weight rare species using effective number weighting (beta=0.999)")
     args = parser.parse_args()
@@ -180,6 +186,7 @@ def main():
         seed=args.seed,
         spatial_scale_km=args.spatial_scale_km,
         temporal_scale_days=args.temporal_scale_days,
+        euclidean_coords=args.euclidean_coords,
     )
 
     # Per-species loss weighting (effective number, beta=0.999)
@@ -228,19 +235,28 @@ def main():
     total_steps = len(train_loader) * args.num_epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
+    log_csv = os.path.join(args.output_dir, "training_log.csv")
+    with open(log_csv, "w", newline="") as f:
+        csv.writer(f).writerow(["epoch", "train_loss", "train_acc", "val_loss", "val_acc", "val_auc", "lr", "elapsed_s"])
+
     best_val_loss = float("inf")
     for epoch in range(1, args.num_epochs + 1):
         t0 = time.time()
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, scheduler, device, cluster_info, epoch, loss_weight
         )
-        val_loss, val_acc, val_auc = evaluate(model, val_loader, device, cluster_info)
+        val_loss, val_acc, val_auc, _ = evaluate(model, val_loader, device, cluster_info)
         elapsed = time.time() - t0
+        current_lr = scheduler.get_last_lr()[0]
         logger.info(
             f"Epoch {epoch}/{args.num_epochs} | "
             f"Train loss={train_loss:.4f} acc={train_acc:.4f} | "
             f"Val loss={val_loss:.4f} acc={val_acc:.4f} auc={val_auc:.4f} | {elapsed:.1f}s"
         )
+        with open(log_csv, "a", newline="") as f:
+            csv.writer(f).writerow([epoch, f"{train_loss:.6f}", f"{train_acc:.6f}",
+                                     f"{val_loss:.6f}", f"{val_acc:.6f}", f"{val_auc:.6f}",
+                                     f"{current_lr:.2e}", f"{elapsed:.1f}"])
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
@@ -252,6 +268,17 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss": val_loss,
             }, os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"))
+
+    # Per-species AUC on best model
+    logger.info("Evaluating best model for per-species AUC...")
+    model.load_state_dict(torch.load(os.path.join(args.output_dir, "best_model.pt"), map_location=device))
+    _, _, best_mean_auc, per_species_aucs = evaluate(model, val_loader, device, cluster_info)
+    logger.info(f"Best model val AUC (mean): {best_mean_auc:.4f}")
+    auc_rows = [(dataset.species_cols[s], per_species_aucs[s]) for s in sorted(per_species_aucs)]
+    import pandas as pd
+    pd.DataFrame(auc_rows, columns=["species", "auc"]).to_csv(
+        os.path.join(args.output_dir, "per_species_auc_jsdm.csv"), index=False)
+    logger.info(f"Per-species AUC saved to {args.output_dir}/per_species_auc_jsdm.csv")
 
     # Extract interaction matrix
     logger.info("Extracting species interaction matrix...")
