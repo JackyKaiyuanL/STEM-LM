@@ -92,6 +92,8 @@ def main():
     parser.add_argument("--cluster_percentile", type=float, default=5.0)
     parser.add_argument("--spatial_scale_km", type=float, default=None)
     parser.add_argument("--temporal_scale_days", type=float, default=None)
+    parser.add_argument("--euclidean_coords", action="store_true",
+                        help="Use Euclidean distance instead of haversine (for simulated data).")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -105,6 +107,7 @@ def main():
         num_source_sites=config.num_source_sites,
         spatial_scale_km=args.spatial_scale_km,
         temporal_scale_days=args.temporal_scale_days,
+        euclidean_coords=args.euclidean_coords,
     )
     cluster_info = build_st_clusters(
         dataset.coords,
