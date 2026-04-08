@@ -656,6 +656,9 @@ class JSDMAttention(nn.Module):
         # Per-species gate: each species learns its own ST vs ecological context balance.
         # init=0 → sigmoid(0)=0.5 for all species. Learns habitat-specialists vs range-generalists.
         self.combine_gate = nn.Parameter(torch.zeros(config.num_species))
+        # Isolation scale: learned scalar that down-weights ST context when target site is far from
+        # all source sites. init=0 → no adjustment at start; positive → isolated sites lean on eco.
+        self.isolation_scale = nn.Parameter(torch.tensor(0.0))
         # Pre-norm layers: applied before each sub-block; residual added here, not inside sub-modules
         self.row_norm  = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.cross_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -663,7 +666,7 @@ class JSDMAttention(nn.Module):
     def forward(
         self, hidden_states, st_source_embeddings, eco_embeddings,
         st_attention_mask=None, st_dist=None, sinusoidal_pos=None,
-        output_attentions=False,
+        isolation=None, output_attentions=False,
     ):
         # 1. Pre-norm → species self-attention → residual  (B,S,T,H) ↔ (B,T,S,H)
         row_output = self.row_attention(
@@ -678,7 +681,11 @@ class JSDMAttention(nn.Module):
         st_output  = self.st_col_attention(h_normed, st_source_embeddings, st_attention_mask, st_dist, output_attentions)
         eco_output = self.eco_col_attention(h_normed, eco_embeddings, output_attentions)
 
-        gate = torch.sigmoid(self.combine_gate)[None, :, None, None]  # (1, S, 1, 1)
+        gate_logit = self.combine_gate[None, :, None, None]  # (1, S, 1, 1)
+        if isolation is not None:
+            # isolation: (B, T) → (B, 1, T, 1); broadcasts over species and hidden dims
+            gate_logit = gate_logit - self.isolation_scale * isolation[:, None, :, None]
+        gate = torch.sigmoid(gate_logit)
         h = h + gate * st_output[0] + (1 - gate) * eco_output[0]
 
         out = (h,)
@@ -727,11 +734,11 @@ class JSDMLayer(nn.Module):
     def forward(
         self, hidden_states, st_source_embeddings, eco_embeddings,
         st_attention_mask=None, st_dist=None, sinusoidal_pos=None,
-        output_attentions=False,
+        isolation=None, output_attentions=False,
     ):
         attn_outputs = self.attention(
             hidden_states, st_source_embeddings, eco_embeddings,
-            st_attention_mask, st_dist, sinusoidal_pos, output_attentions,
+            st_attention_mask, st_dist, sinusoidal_pos, isolation, output_attentions,
         )
         h = attn_outputs[0]
         h = h + self.ffn(self.ffn_norm(h))  # pre-norm + residual
@@ -757,7 +764,7 @@ class JSDMEncoder(nn.Module):
 
     def forward(
         self, hidden_states, st_source_embeddings, eco_embeddings,
-        st_attention_mask=None, st_dist=None,
+        st_attention_mask=None, st_dist=None, isolation=None,
         output_attentions=False, output_hidden_states=False,
     ):
         all_hidden = () if output_hidden_states else None
@@ -775,13 +782,13 @@ class JSDMEncoder(nn.Module):
             if self.gradient_checkpointing and self.training:
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     layer, hidden_states, st_source_embeddings, eco_embeddings,
-                    st_attention_mask, st_dist, sinusoidal_pos, output_attentions,
+                    st_attention_mask, st_dist, sinusoidal_pos, isolation, output_attentions,
                     use_reentrant=False,
                 )
             else:
                 layer_outputs = layer(
                     hidden_states, st_source_embeddings, eco_embeddings,
-                    st_attention_mask, st_dist, sinusoidal_pos, output_attentions,
+                    st_attention_mask, st_dist, sinusoidal_pos, isolation, output_attentions,
                 )
             hidden_states = layer_outputs[0]
             if output_attentions:
@@ -942,6 +949,12 @@ class JSDMModel(nn.Module):
         target_tp_cl = self._cluster_means(target_tp, cl_labels, num_clusters)
         st_dist = torch.stack([target_sp_cl, target_tp_cl], dim=-1)  # (B, T, C_st, 2)
 
+        # Isolation: mean normalized ST distance from target to its source sites (B, T)
+        # High value → all sources are far → ST context is weak → gate will down-weight ST
+        sp_norm = target_sp / self.config.max_spatial_dist
+        tp_norm = target_tp / self.config.max_temporal_dist
+        isolation = torch.sqrt(sp_norm ** 2 + tp_norm ** 2).mean(dim=-1)  # (B, T)
+
         # 5. Own-cluster masking
         target_clusters = cl_labels[target_site_idx]  # (B, T)
         attn_mask = F.one_hot(target_clusters, num_classes=num_clusters).to(hidden_states.dtype)
@@ -960,7 +973,7 @@ class JSDMModel(nn.Module):
         # 6. Encode
         return self.encoder(
             hidden_states, st_source, eco_emb,
-            st_attention_mask=attn_mask, st_dist=st_dist,
+            st_attention_mask=attn_mask, st_dist=st_dist, isolation=isolation,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
