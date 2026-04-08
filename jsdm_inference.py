@@ -39,7 +39,6 @@ def run_forward(model, batch, cluster_info, device, output_attentions=False):
         source_idx=batch["source_idx"],
         target_site_idx=batch["target_site_idx"],
         env_data=batch["env_data"],
-        target_env=batch["target_env"],
         labels=batch["labels"],
         cluster_dict=cluster_info["cluster_dict"],
         cluster_labels=cluster_info["cluster_labels"],
@@ -89,7 +88,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--num_batches", type=int, default=50)
-    parser.add_argument("--cluster_threshold", type=float, default=5.0)
+    parser.add_argument("--cluster_threshold", type=float, default=None)
+    parser.add_argument("--cluster_percentile", type=float, default=5.0)
     parser.add_argument("--spatial_scale_km", type=float, default=None)
     parser.add_argument("--temporal_scale_days", type=float, default=None)
     args = parser.parse_args()
@@ -110,6 +110,7 @@ def main():
         dataset.coords,
         dataset.times,
         threshold=args.cluster_threshold,
+        cluster_percentile=args.cluster_percentile,
         spatial_scale_km=dataset.spatial_scale_km,
         temporal_scale_days=dataset.temporal_scale_days,
         spatial_dist=dataset.spatial_dists,

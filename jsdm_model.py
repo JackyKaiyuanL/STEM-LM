@@ -42,7 +42,7 @@ Training (mirrors GPN-star exactly):
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, List, Set
+from typing import Optional, Tuple, Dict, List
 
 import numpy as np
 import torch
@@ -1006,64 +1006,16 @@ class JSDMPredictionHead(nn.Module):
         return self.decoder(x).squeeze(-1)
 
 
-# =============================================================================
-# Occupancy-Detection Model (commented out)
-# Uncomment cls init line and occupancy blocks in forward() to activate.
-#
-# Handles imperfect species detection and uneven sampling effort.
-# Assumption: no false positives (x=1 ↔ z=1). Only false negatives possible.
-#
-# P(x_s=1) = ψ_s · p_s        P(x_s=0) = 1 − ψ_s · p_s
-#
-# p_s = σ(species_detect_logit[s] + effort_proj(target_env)[s])
-#   species_detect_logit: per-species crypticity baseline (always learned)
-#   effort_proj: maps site effort-proxy covariates → per-species correction
-#                (zero-init so it's inactive if no effort columns are in env_data)
-#
-# Identifiability: effort is a site-wide effect shared across all S species;
-# detectability is a species-wide effect across sites. The species self-attention
-# sees all S species at once, enabling separation without repeat visits.
-# =============================================================================
-#
-# class OccupancyDetectionHead(nn.Module):
-#     def __init__(self, config: JSDMConfig):
-#         super().__init__()
-#         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-#         self.act = nn.SiLU()
-#         self.layer_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
-#         self.occupancy_decoder = nn.Linear(config.hidden_size, 1)
-#         # Per-species detection baseline; init logit(0.9)≈+2.2 → high detection by default
-#         self.species_detect_logit = nn.Parameter(torch.full((config.num_species,), 2.2))
-#         # Effort modulation; zero-init → inactive until data provides signal
-#         self.effort_proj = nn.Linear(config.num_env_vars, config.num_species)
-#         nn.init.zeros_(self.effort_proj.weight)
-#         nn.init.zeros_(self.effort_proj.bias)
-#
-#     def forward(self, hidden_states, target_env=None):
-#         x = self.act(self.dense(hidden_states))
-#         x = self.layer_norm(x)
-#         psi_logit = self.occupancy_decoder(x).squeeze(-1)  # (B, S, T) — occupancy logit
-#         p_detect_logit = self.species_detect_logit          # (S,)
-#         if target_env is not None:
-#             p_detect_logit = p_detect_logit.unsqueeze(0) + self.effort_proj(target_env)  # (B, S)
-#         return psi_logit, p_detect_logit
-
-
 class JSDMForMaskedSpeciesPrediction(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         self.config = config
         self.model = JSDMModel(config)
         self.cls = JSDMPredictionHead(config)
-        # self.occupancy_cls = OccupancyDetectionHead(config)  # uncomment to use occupancy model
 
-    def forward(self, labels=None, loss_weight=None, output_attentions=False, target_env=None, **kwargs):
+    def forward(self, labels=None, loss_weight=None, output_attentions=False, **kwargs):
         encoder_out = self.model(output_attentions=output_attentions, **kwargs)
         logits = self.cls(encoder_out.last_hidden_state)  # (B, S, T)
-
-        # === Occupancy-detection model (uncomment to replace simple BCE) ===
-        # psi_logit, p_detect_logit = self.occupancy_cls(encoder_out.last_hidden_state, target_env)
-        # logits = psi_logit  # output occupancy ψ (true presence), not composite P(x=1)
 
         loss = None
         if labels is not None:
@@ -1079,54 +1031,6 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
                     )
                     w = loss_weight.unsqueeze(-1).expand_as(labels)[mask]
                     loss = (per_el * w).sum() / w.sum()
-
-                # ── Loss option A: SPML positive-only ────────────────────────────────
-                # Treats observed zeros as unlabeled, not confirmed absent.
-                # Only confirmed presences (x=1) contribute to the loss.
-                # Use when data is presence-only or detection is very imperfect
-                # and you have no effort information to calibrate zeros.
-                # Note: for strict SPML, also change the collator to only mask
-                # positions where target_species == 1 (positive-only masking).
-                #
-                # pos_mask = mask & (labels == 1)
-                # if pos_mask.any():
-                #     loss = F.binary_cross_entropy_with_logits(
-                #         logits[pos_mask].float(), labels[pos_mask].float()
-                #     )
-
-                # ── Loss option B: SPML AN-loss (asymmetric downweighting) ───────────
-                # Keeps signal from both 0s and 1s but downweights zeros by `alpha`.
-                # alpha=1.0 → plain BCE (presence-absence assumption).
-                # alpha=0.0 → positive-only (same as option A).
-                # alpha≈0.1 is a reasonable default for citizen science data.
-                # Per-species or per-site alpha could replace the scalar if needed.
-                # Complementary to the occupancy model: use this when you don't have
-                # effort covariates but still want to soften the false-negative penalty.
-                #
-                # alpha = 0.1
-                # y = labels[mask].float()
-                # per_el = F.binary_cross_entropy_with_logits(
-                #     logits[mask].float(), y, reduction="none"
-                # )
-                # w = torch.where(y == 1, torch.ones_like(y), y.new_full((), alpha))
-                # loss = (per_el * w).mean()
-
-                # ── Loss option C: Occupancy-detection composite likelihood ───────────
-                # Explicitly models P(x=1) = ψ·p, separating true occupancy from
-                # detection probability. Handles per-species crypticity and uneven
-                # sampling effort. Requires occupancy_cls — uncomment that block too.
-                # Use when you have effort-proxy covariates in target_env and want
-                # interpretable per-species detectability estimates.
-                #
-                # psi = torch.sigmoid(psi_logit)
-                # p_det = torch.sigmoid(p_detect_logit)
-                # if p_det.dim() == 1:
-                #     p_det = p_det[None, :, None]      # (1, S, 1) — species-only baseline
-                # else:
-                #     p_det = p_det.unsqueeze(-1)        # (B, S, 1) — effort-modulated
-                # p_obs = (psi * p_det).clamp(1e-6, 1 - 1e-6)  # P(x=1)
-                # y = labels[mask].float()
-                # loss = -(y * p_obs[mask].log() + (1 - y) * (1 - p_obs[mask]).log()).mean()
 
         return JSDMOutput(
             loss=loss, logits=logits,

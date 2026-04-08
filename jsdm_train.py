@@ -34,7 +34,6 @@ def train_epoch(model, loader, optimizer, scheduler, device, cluster_info, epoch
             source_idx=batch["source_idx"],
             target_site_idx=batch["target_site_idx"],
             env_data=batch["env_data"],
-            target_env=batch["target_env"],
             labels=batch["labels"],
             cluster_dict=cluster_info["cluster_dict"],
             cluster_labels=cluster_info["cluster_labels"],
@@ -85,7 +84,6 @@ def evaluate(model, loader, device, cluster_info):
             source_idx=batch["source_idx"],
             target_site_idx=batch["target_site_idx"],
             env_data=batch["env_data"],
-            target_env=batch["target_env"],
             labels=batch["labels"],
             cluster_dict=cluster_info["cluster_dict"],
             cluster_labels=cluster_info["cluster_labels"],
@@ -110,7 +108,10 @@ def main():
     parser = argparse.ArgumentParser(description="Train ST-JSDM")
     parser.add_argument("csv_path", type=str)
     parser.add_argument("--num_source_sites", type=int, default=64)
-    parser.add_argument("--cluster_threshold", type=float, default=5.0)
+    parser.add_argument("--cluster_threshold", type=float, default=None,
+                        help="Fixed ST cluster threshold. Default: auto (percentile-based)")
+    parser.add_argument("--cluster_percentile", type=float, default=5.0,
+                        help="Percentile of pairwise distances used when cluster_threshold is auto")
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--num_attention_heads", type=int, default=8)
     parser.add_argument("--num_hidden_layers", type=int, default=4)
@@ -144,6 +145,7 @@ def main():
         num_source_sites=args.num_source_sites,
         mlm_probability=args.mlm_probability,
         cluster_threshold=args.cluster_threshold,
+        cluster_percentile=args.cluster_percentile,
         mask_value=args.mask_value,
         train_frac=args.train_frac,
         num_workers=args.num_workers,
@@ -224,7 +226,6 @@ def main():
                 input_ids=batch["input_ids"], source_ids=batch["source_ids"],
                 source_idx=batch["source_idx"],
                 target_site_idx=batch["target_site_idx"], env_data=batch["env_data"],
-                target_env=batch["target_env"],
                 labels=batch["labels"],
                 cluster_dict=cluster_info["cluster_dict"],
                 cluster_labels=cluster_info["cluster_labels"],

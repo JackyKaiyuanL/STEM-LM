@@ -85,16 +85,8 @@ class JSDMDataset(Dataset):
 
         coord_cols = [time_col, lat_col, lon_col]
         if env_cols is None:
-            env_cols = []
-            species_cols = []
-            for c in df.columns:
-                if c in coord_cols:
-                    continue
-                vals = df[c].dropna().unique()
-                if set(vals).issubset({0, 1, 0.0, 1.0}):
-                    species_cols.append(c)
-                else:
-                    env_cols.append(c)
+            env_cols     = [c for c in df.columns if c not in coord_cols and c.startswith("env_")]
+            species_cols = [c for c in df.columns if c not in coord_cols and not c.startswith("env_")]
         else:
             species_cols = [c for c in df.columns if c not in coord_cols and c not in env_cols]
 
@@ -152,7 +144,6 @@ class JSDMDataset(Dataset):
             "target_species": torch.tensor(target_species, dtype=torch.float32),
             "source_species": torch.tensor(source_species, dtype=torch.float32),
             "source_env": torch.tensor(source_env, dtype=torch.float32),
-            "target_env": torch.tensor(self.env_data[idx], dtype=torch.float32),  # (E,) — target site covariates/effort
             "target_idx": torch.tensor(idx, dtype=torch.long),
             "source_idx": torch.tensor(source_idx, dtype=torch.long),
         }
@@ -218,11 +209,12 @@ class JSDMDataCollator:
 def build_st_clusters(
     spatial_coords,
     temporal_coords,
-    threshold=5.0,
+    threshold: Optional[float] = None,
     spatial_scale_km: Optional[float] = None,
     temporal_scale_days: Optional[float] = None,
     spatial_dist: Optional[np.ndarray] = None,
     temporal_dist: Optional[np.ndarray] = None,
+    cluster_percentile: float = 5.0,
 ):
     N = len(spatial_coords)
     if spatial_dist is None:
@@ -245,6 +237,11 @@ def build_st_clusters(
     combined = np.sqrt(
         (spatial_dist / spatial_scale_km) ** 2 + (temporal_dist / temporal_scale_days) ** 2
     )
+
+    if threshold is None:
+        triu = combined[np.triu_indices(N, k=1)]
+        threshold = float(np.percentile(triu[triu > 0], cluster_percentile))
+        print(f"  Auto cluster threshold: {threshold:.4f} ({cluster_percentile}th percentile of pairwise distances)")
 
     G = nx.Graph()
     G.add_nodes_from(range(N))
@@ -293,7 +290,8 @@ def build_st_clusters(
 
 def create_dataloaders(
     csv_path, batch_size=32, num_source_sites=64, mlm_probability=0.15,
-    cluster_threshold=5.0, mask_value=-1.0, train_frac=0.8, num_workers=0,
+    cluster_threshold=None, cluster_percentile=5.0,
+    mask_value=-1.0, train_frac=0.8, num_workers=0,
     seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
 ):
     np.random.seed(seed)
@@ -310,6 +308,7 @@ def create_dataloaders(
         dataset.coords,
         dataset.times,
         threshold=cluster_threshold,
+        cluster_percentile=cluster_percentile,
         spatial_scale_km=dataset.spatial_scale_km,
         temporal_scale_days=dataset.temporal_scale_days,
         spatial_dist=dataset.spatial_dists,
