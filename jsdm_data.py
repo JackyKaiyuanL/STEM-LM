@@ -24,7 +24,6 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 from scipy.spatial.distance import cdist
-from sklearn.cluster import AgglomerativeClustering
 from typing import Optional, List, Dict, Any
 
 
@@ -156,10 +155,10 @@ class JSDMDataset(Dataset):
 
 
 class JSDMDataCollator:
-    def __init__(self, mlm_probability=0.15, mask_value=-1.0, cluster_labels=None):
+    def __init__(self, mlm_probability=0.15, combined_dist=None, blind_threshold=None):
         self.mlm_probability = mlm_probability
-        self.mask_value = mask_value
-        self.cluster_labels = cluster_labels
+        self.combined_dist = combined_dist    # (N_total, N_total) numpy array or None
+        self.blind_threshold = blind_threshold  # scalar float or None
 
     def __call__(self, examples):
         batch = {
@@ -168,7 +167,7 @@ class JSDMDataCollator:
         }
 
         target_species = batch["target_species"]  # (B, S)
-        source_species = batch["source_species"]  # (B, S, N)
+        source_species = batch["source_species"]  # (B, S, N) float {0, 1}
         B, S = target_species.shape
         N = source_species.shape[-1]
 
@@ -180,28 +179,33 @@ class JSDMDataCollator:
             if not masked_indices[b].any():
                 masked_indices[b, torch.randint(S, (1,))] = True
 
-        # Convert to discrete token ids for target embedding: 0=absent, 1=present, 2=mask
-        # Source ids remain float (masked with self.mask_value below)
+        # Target token ids: 0=absent, 1=present, 2=mask
         target_ids = target_species.long()  # (B, S)
         indices_replaced = torch.bernoulli(torch.full((B, S), 0.9)).bool() & masked_indices
-        target_ids[indices_replaced] = 2  # mask token; 10% of masked positions keep original token
+        target_ids[indices_replaced] = 2  # 90% of masked → mask token; 10% keep original
 
-        if self.cluster_labels is not None:
-            source_idx = batch["source_idx"]
-            target_idx = batch["target_idx"]
-            for b in range(B):
-                target_cluster = self.cluster_labels[target_idx[b]]
-                for n in range(N):
-                    if self.cluster_labels[source_idx[b, n]] == target_cluster:
-                        source_species[b, masked_indices[b], n] = self.mask_value
+        # Source ids: convert float {0, 1} to long {0, 1}, then blind nearby sites to 2
+        source_ids = source_species.long()  # (B, S, N)
+        if self.combined_dist is not None and self.blind_threshold is not None:
+            source_idx = batch["source_idx"]   # (B, N)
+            target_idx = batch["target_idx"]   # (B,)
+            src_idx_np = source_idx.numpy()    # (B, N)
+            tgt_idx_np = target_idx.numpy()    # (B,)
+            blind_dists = torch.tensor(
+                self.combined_dist[tgt_idx_np[:, None], src_idx_np]  # (B, N)
+            )
+            is_blind = blind_dists <= self.blind_threshold  # (B, N)
+            # blind_mask[b, s, n] = True iff species s is masked AND source n is nearby
+            blind_mask = masked_indices[:, :, None] & is_blind[:, None, :]  # (B, S, N)
+            source_ids[blind_mask] = 2
         else:
-            for b in range(B):
-                source_species[b, masked_indices[b], :] = self.mask_value
+            # No proximity info: blind all source entries for masked species
+            source_ids[masked_indices[:, :, None].expand_as(source_ids)] = 2
 
         labels[~masked_indices] = -100
 
-        batch["input_ids"] = target_ids.unsqueeze(-1)  # (B, S, 1) long
-        batch["source_ids"] = source_species
+        batch["input_ids"] = target_ids.unsqueeze(-1)   # (B, S, 1) long
+        batch["source_ids"] = source_ids                 # (B, S, N) long
         batch["labels"] = labels.unsqueeze(-1)
         batch["env_data"] = batch.pop("source_env")
         batch["target_site_idx"] = batch.pop("target_idx").unsqueeze(-1)
@@ -212,88 +216,42 @@ class JSDMDataCollator:
         return batch
 
 
-def build_st_clusters(
-    spatial_coords,
-    temporal_coords,
-    threshold: Optional[float] = None,
-    spatial_scale_km: Optional[float] = None,
-    temporal_scale_days: Optional[float] = None,
-    spatial_dist: Optional[np.ndarray] = None,
-    temporal_dist: Optional[np.ndarray] = None,
-    cluster_percentile: float = 5.0,
-):
-    N = len(spatial_coords)
-    if spatial_dist is None:
-        spatial_dist = haversine_pairwise(spatial_coords[:, 0], spatial_coords[:, 1])
-    else:
-        spatial_dist = spatial_dist.astype(np.float32)
-    if temporal_dist is None:
-        temporal_dist = cdist(
-            temporal_coords.reshape(-1, 1), temporal_coords.reshape(-1, 1)
-        ).astype(np.float32)
-    else:
-        temporal_dist = temporal_dist.astype(np.float32)
+def compute_dist_info(
+    spatial_dist: np.ndarray,
+    temporal_dist: np.ndarray,
+    spatial_scale_km: float,
+    temporal_scale_days: float,
+    blind_percentile: float = 2.0,
+) -> dict:
+    """
+    Compute normalized pairwise distances and a proximity blind threshold.
 
-    spatial_scale_km = _resolve_scale(
-        spatial_scale_km, float(spatial_dist.max()), "spatial_scale_km"
-    )
-    temporal_scale_days = _resolve_scale(
-        temporal_scale_days, float(temporal_dist.max()), "temporal_scale_days"
-    )
+    The blind_threshold marks the closest blind_percentile% of site pairs as
+    "nearby". During training the collator sets source entries for these nearby
+    sites to the mask token so the model cannot trivially copy from them.
+
+    Returns a dict with keys consumed by JSDMDataCollator and JSDMModel.forward.
+    """
     combined = np.sqrt(
         (spatial_dist / spatial_scale_km) ** 2 + (temporal_dist / temporal_scale_days) ** 2
-    )
+    ).astype(np.float32)
 
-    if threshold is None:
-        triu = combined[np.triu_indices(N, k=1)]
-        threshold = float(np.percentile(triu[triu > 0], cluster_percentile))
-        print(f"  Auto cluster threshold: {threshold:.4f} ({cluster_percentile}th percentile of pairwise distances)")
-
-    # Complete linkage: every pair within a cluster is <= threshold (no chaining).
-    # Connected components (previous approach) allowed transitivity to merge distant sites.
-    if threshold > 0:
-        agg = AgglomerativeClustering(
-            n_clusters=None,
-            distance_threshold=threshold,
-            metric="precomputed",
-            linkage="complete",
-        )
-        raw_labels = agg.fit_predict(combined.astype(np.float64))
+    N = len(spatial_dist)
+    triu = combined[np.triu_indices(N, k=1)]
+    nonzero = triu[triu > 0]
+    if len(nonzero) > 0:
+        blind_threshold = float(np.percentile(nonzero, blind_percentile))
     else:
-        raw_labels = np.arange(N)  # each site its own cluster
-
-    unique_ids = np.unique(raw_labels)
-    id_map = {old: new for new, old in enumerate(unique_ids)}
-    cluster_labels = torch.tensor([id_map[l] for l in raw_labels], dtype=torch.long)
-    cluster_dict = {}
-    for cid in range(len(unique_ids)):
-        cluster_dict[cid] = set(np.where(raw_labels == unique_ids[cid])[0].tolist())
-
-    in_cluster_spatial = torch.zeros(N)
-    in_cluster_temporal = torch.zeros(N)
-    for cid, sites in cluster_dict.items():
-        sites_list = list(sites)
-        if len(sites_list) > 1:
-            center_s = spatial_coords[sites_list].mean(axis=0)
-            center_t = temporal_coords[sites_list].mean()
-            for s in sites_list:
-                # haversine from site to cluster centroid (km), consistent with pairwise spatial_dist
-                in_cluster_spatial[s] = float(haversine_pairwise(
-                    np.array([spatial_coords[s, 0], center_s[0]]),
-                    np.array([spatial_coords[s, 1], center_s[1]])
-                )[0, 1])
-                in_cluster_temporal[s] = float(abs(temporal_coords[s] - center_t))
+        blind_threshold = 0.0
+    print(f"  Blind threshold: {blind_threshold:.4f} ({blind_percentile}th percentile of pairwise distances)")
 
     return {
-        "cluster_dict": cluster_dict,
-        "cluster_labels": cluster_labels,
-        "in_cluster_spatial_dist": in_cluster_spatial,
-        "in_cluster_temporal_dist": in_cluster_temporal,
+        "combined_dist": combined,
+        "blind_threshold": blind_threshold,
         "spatial_dist_pairwise": torch.tensor(spatial_dist),
         "temporal_dist_pairwise": torch.tensor(temporal_dist),
         "max_spatial_dist": float(spatial_dist.max()),
         "max_temporal_dist": float(temporal_dist.max()),
-        "num_clusters": len(cluster_dict),
         "spatial_scale_km": spatial_scale_km,
         "temporal_scale_days": temporal_scale_days,
     }
@@ -301,8 +259,8 @@ def build_st_clusters(
 
 def create_dataloaders(
     csv_path, batch_size=32, num_source_sites=64, mlm_probability=0.15,
-    cluster_threshold=None, cluster_percentile=5.0,
-    mask_value=-1.0, train_frac=0.8, num_workers=0,
+    blind_percentile=2.0,
+    train_frac=0.8, num_workers=0,
     seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
     euclidean_coords=False,
 ):
@@ -315,20 +273,16 @@ def create_dataloaders(
         euclidean_coords=euclidean_coords,
     )
 
-    print("Building spatial-temporal clusters...")
-    cluster_info = build_st_clusters(
-        dataset.coords,
-        dataset.times,
-        threshold=cluster_threshold,
-        cluster_percentile=cluster_percentile,
-        spatial_scale_km=dataset.spatial_scale_km,
-        temporal_scale_days=dataset.temporal_scale_days,
+    print("Computing distance info...")
+    dist_info = compute_dist_info(
         spatial_dist=dataset.spatial_dists,
         temporal_dist=dataset.temporal_dists,
+        spatial_scale_km=dataset.spatial_scale_km,
+        temporal_scale_days=dataset.temporal_scale_days,
+        blind_percentile=blind_percentile,
     )
-    print(f"  {cluster_info['num_clusters']} clusters from {len(dataset)} sites")
 
-    # seed after clustering so the train/val split matches other baselines (seed → permutation directly)
+    # seed after distance computation so train/val split matches other baselines
     np.random.seed(seed)
     n = len(dataset)
     indices = np.random.permutation(n)
@@ -337,12 +291,15 @@ def create_dataloaders(
     train_dataset = torch.utils.data.Subset(dataset, indices[:split])
     val_dataset = torch.utils.data.Subset(dataset, indices[split:])
 
-    collator = JSDMDataCollator(mlm_probability=mlm_probability, mask_value=mask_value,
-                                 cluster_labels=cluster_info["cluster_labels"])
+    collator = JSDMDataCollator(
+        mlm_probability=mlm_probability,
+        combined_dist=dist_info["combined_dist"],
+        blind_threshold=dist_info["blind_threshold"],
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                                collate_fn=collator, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
                              collate_fn=collator, num_workers=num_workers, pin_memory=True)
 
-    return train_loader, val_loader, dataset, cluster_info
+    return train_loader, val_loader, dataset, dist_info

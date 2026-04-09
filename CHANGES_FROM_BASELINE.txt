@@ -10,333 +10,262 @@ jsdm_model.py
 
 1. TARGET INPUT: DISCRETE EMBEDDING INSTEAD OF FLOAT PASSTHROUGH
    --------------------------------------------------------------
-   Baseline: TargetInput had no embedding — species states were raw float
-     {0.0, 1.0, mask_value}, passed through as (B,S,T,1), with a learned
-     mask_value parameter and a separate input_proj (nn.Linear(1, H)) in
-     JSDMEncoder to expand to hidden_size.
+   Baseline: TargetInput had no embedding — species states were raw floats
+     {0.0, 1.0, mask_value}. forward() did input_ids.unsqueeze(-1) → (B,S,T,1).
+     There was a learned scalar mask_value parameter (init=-1.0). JSDMEncoder
+     had a separate input_proj = nn.Linear(1, hidden_size) to expand to H.
 
-   Current: TargetInput uses nn.Embedding(3, hidden_size). Tokens are
-     discrete integers: 0=absent, 1=present, 2=mask. Outputs (B,S,T,H)
-     directly — no separate input_proj needed. The learned mask_value
-     parameter is removed; masking is done by substituting token id 2.
-     In JSDMDataCollator, masked target positions are set to integer token 2.
-     input_ids tensor is now long instead of float.
+   Current: TargetInput uses nn.Embedding(3, hidden_size). Tokens are discrete
+     integers: 0=absent, 1=present, 2=mask. Outputs (B,S,T,H) directly.
+     No separate input_proj in JSDMEncoder. mask_value_init config field removed.
+     In JSDMDataCollator, masked positions get integer token 2 (not mask_value
+     float). input_ids and source_ids are long tensors, not float.
 
-   Justification: a linear projection from a 1-dim float places absent (0),
-     present (1), and mask on a collinear 1-D manifold in H-dimensional space.
-     This means the mask representation is forced to interpolate between absent
-     and present rather than being a freely learnable "unknown" state. A 3-token
-     embedding gives each state an unconstrained H-dim vector, which is the
-     standard approach in masked language models (BERT etc.) and allows the
-     model to represent uncertainty distinctly from either observed state.
+   Justification: a linear projection from 1-dim float places 0, 1, and mask
+     on a collinear 1-D manifold in H-dimensional space — the mask is forced to
+     interpolate between absent and present rather than being a freely learnable
+     "unknown" state. A 3-token embedding gives each state an unconstrained H-dim
+     vector, matching standard practice in masked language models (BERT, etc.).
 
    Location: class TargetInput, jsdm_model.py
              JSDMEncoder.__init__: input_proj removed
              JSDMDataCollator.__call__: target_ids = target_species.long(),
-               indices_replaced → token 2
+               indices_replaced → token 2; source_ids = source_species.long(),
+               blinding sets to 2 instead of mask_value float
 
 
-2. RMSNORM REPLACES LAYERNORM THROUGHOUT
-   ----------------------------------------
+2. RMSNORM REPLACES LAYERNORM; PRE-NORM ARCHITECTURE
+   ----------------------------------------------------
    Baseline: used nn.LayerNorm in all output modules (SpeciesSelfOutput,
-     STCrossOutput, EcoCrossOutput) and in FeedForward and JSDMPredictionHead.
+     STCrossOutput, EcoCrossOutput, FeedForward, JSDMPredictionHead).
+     Residual connections were computed inside each output module:
+       LayerNorm(dense(attn_out) + input_tensor)
+     This is a post-norm pattern: norm applied after the residual add.
 
    Current: all LayerNorm replaced with RMSNorm (no mean-centering):
-     output = (x / rms(x)) * weight
-   New class RMSNorm added. Output modules no longer hold a norm — they were
-   doing LayerNorm(hidden + residual) internally. Residuals are now applied
-   externally in JSDMAttention (pre-norm pattern), and output modules only
-   do linear + dropout.
+       output = (x / rms(x)) * weight
+     New class RMSNorm added. Residuals are now applied externally in
+     JSDMAttention (pre-norm pattern):
+       h = hidden_states + row_output[0]      # residual here
+       h_normed = self.cross_norm(h)           # norm before cross-attn input
+     Output modules only do linear + dropout (no norm, no residual inside).
+     JSDMLayer also uses pre-norm for FFN:
+       h = h + self.ffn(self.ffn_norm(h))
 
-   Justification: RMSNorm removes the mean-centering step of LayerNorm,
-     which is empirically redundant in transformer architectures (LLaMA,
-     PaLM, Mistral all use RMSNorm). It is faster and numerically equivalent
-     in practice. The shift to external residuals (see change 3) also makes
-     the norm placement explicit and easier to reason about.
+   Justification: pre-norm with RMSNorm is the standard in modern transformers
+     (LLaMA, Gemma, etc.). It stabilizes training (gradients don't vanish through
+     the norm in the residual path) and is cheaper than LayerNorm (no mean
+     subtraction). Post-norm requires careful initialization and lr warmup to
+     avoid early training instability.
 
    Location: class RMSNorm added, jsdm_model.py
-             SpeciesSelfOutput.forward: removed LayerNorm and residual add
-             STCrossOutput.forward: same
-             EcoCrossOutput.forward: same
-             FeedForward: LayerNorm → RMSNorm, residual moved out
-             JSDMPredictionHead: LayerNorm → RMSNorm, act: GELU → SiLU
+             SpeciesSelfOutput, STCrossOutput, EcoCrossOutput: residual + norm removed
+             JSDMAttention.forward: pre-norm + residual applied explicitly
+             FeedForward: GELU FFN with post-norm → SwiGLU FFN with pre-norm in JSDMLayer
+             JSDMPredictionHead: nn.LayerNorm → RMSNorm
 
 
-3. PRE-NORM PATTERN WITH EXTERNAL RESIDUALS
-   -------------------------------------------
-   Baseline: residuals were added inside sub-modules (output modules did
-     LayerNorm(hidden + input_tensor), post-norm). Forward signatures took
-     both hidden_states and input_tensor.
-
-   Current: all output modules only do linear + dropout. JSDMAttention
-     applies pre-norm before each sub-block and adds residuals itself:
-       h = hidden_states + row_output[0].transpose(-2,-3)   # row residual
-       h_normed = self.cross_norm(h)                        # shared pre-norm
-       h = h + gate * st_out + (1-gate) * eco_out           # cross residual
-     Two new RMSNorm params: self.row_norm, self.cross_norm in JSDMAttention.
-     FeedForward residual moved to JSDMLayer with its own ffn_norm.
-
-   Justification: pre-norm (normalize before the sub-block, add residual
-     after) is more stable than post-norm during early training because
-     gradients flow directly through the residual path without passing
-     through a normalization layer. Post-norm can cause vanishing gradients
-     at initialization. Pre-norm is standard in all modern LLMs and was
-     found empirically to require less careful LR warmup.
-
-   Location: JSDMAttention.__init__: row_norm, cross_norm added
-             JSDMAttention.forward: pre-norm and residuals
-             JSDMLayer.forward: h = h + self.ffn(self.ffn_norm(h))
-             JSDMLayer.__init__: self.ffn_norm = RMSNorm added
-
-
-4. SWIGLU FFN REPLACES GELU FFN
+3. SWIGLU FFN REPLACES GELU FFN
    --------------------------------
-   Baseline: FeedForward used dense1 (H→intermediate) + GELU + dense2
-     (intermediate→H) + LayerNorm + residual (post-norm, all internal).
+   Baseline: FeedForward used a standard GELU MLP:
+       dense1 (H → I) → GELU → dense2 (I → H) → LayerNorm(out + residual)
 
-   Current: SwiGLU — two parallel projections gate and up (H→intermediate),
-     combined as SiLU(gate(x)) * up(x), then projected down (intermediate→H).
-     No bias in any linear layer. Pre-norm and residual applied externally.
+   Current: SwiGLU FFN:
+       down(SiLU(gate(x)) * up(x))
+     gate: H→I, up: H→I, down: I→H. Pre-norm and residual are applied
+     externally in JSDMLayer (see change 2). No bias on any projection.
 
-   Justification: SwiGLU (Shazeer 2020) consistently outperforms GELU FFN
-     on language modeling benchmarks and has become the standard in modern
-     transformers (LLaMA, PaLM, Mistral). The gating mechanism allows the
-     network to selectively suppress or amplify features, providing a form
-     of input-dependent nonlinearity that GELU lacks. The no-bias convention
-     matches the LLaMA implementation and reduces parameters marginally.
+   Justification: SwiGLU is the standard FFN in modern LLMs (PaLM, LLaMA,
+     Gemma). The gated activation allows the network to learn input-dependent
+     scaling, giving more expressive capacity per parameter than GELU. The
+     two parallel projections slightly increase params for the same intermediate
+     size — in practice intermediate_size is set to ~2/3 of the GELU equivalent
+     to keep total params equal.
 
    Location: class FeedForward, jsdm_model.py
 
 
-5. PER-SPECIES COMBINE_GATE (WAS SCALAR, NOW PER-SPECIES)
-   ---------------------------------------------------------
-   Baseline: self.combine_gate = nn.Parameter(torch.tensor(0.5))
-     A single scalar controlling the global ST vs eco balance for all species.
+4. PER-SPECIES COMBINE GATE
+   ----------------------------
+   Baseline: JSDMAttention had a single shared scalar combine_gate
+     (nn.Parameter(torch.tensor(0.5))). All species used the same ST-vs-eco
+     mixing ratio.
 
-   Current: self.combine_gate = nn.Parameter(torch.zeros(config.num_species))
-     One gate logit per species. sigmoid(0)=0.5 at init. After training,
-     each species has its own ST vs eco preference.
-     Shape changes: gate broadcast is (1,S,1,1) instead of scalar.
+   Current: combine_gate shape (S,), init=0 → sigmoid=0.5. Each species
+     independently learns its ST-vs-eco balance. Range-restricted specialists
+     rely more on nearby ST context; range-generalists following broad
+     environmental gradients rely more on eco context. A shared scalar prevents
+     learning these differences.
 
-   Justification: different species have fundamentally different distributions.
-     Range-limited species (e.g. mountain endemics) are strongly governed by
-     spatial neighborhood — their presence at a site correlates highly with
-     nearby sites. Habitat specialists are more strongly governed by local
-     abiotic conditions (env). A single shared gate forces all species to use
-     the same ST vs eco balance, which is ecologically wrong. Per-species gates
-     allow the model to learn this distinction. After training, gate values
-     provide interpretable information about each species' ecological strategy.
-
-   Location: JSDMAttention.__init__ and forward, jsdm_model.py
+   Location: JSDMAttention.__init__: combine_gate shape (S,)
+             JSDMAttention.forward: gate = sigmoid(combine_gate[None,:,None,None])
 
 
-6. ISOLATION GATING (NEW)
-   -----------------------
-   Baseline: no isolation mechanism.
-
-   Current: isolation score computed in JSDMModel.forward as mean normalized
-     ST distance from target to its N source sites:
-       sp_norm = target_sp / config.max_spatial_dist   # (B,T,N)
-       tp_norm = target_tp / config.max_temporal_dist
-       isolation = sqrt(sp_norm^2 + tp_norm^2).mean(dim=-1)  # (B,T)
-   Modulates combine_gate in JSDMAttention:
-       gate_logit = combine_gate[None,:,None,None]
-                    - isolation_scale * isolation[:,None,:,None]
-       gate = sigmoid(gate_logit)
-   isolation_scale is a new learned scalar (init=0 → no effect at start).
-
-   Justification: FIRE distance biases handle which source site to attend to
-     within the context window, but provide no signal about the overall quality
-     of the context window itself. When all 64 source sites are far away (e.g.
-     a geographically isolated hotspot), FIRE biases become approximately
-     uniform — softmax over similar values — providing no useful differential
-     signal. The model cannot distinguish "I have good nearby context" from
-     "all my context is far and weakly correlated." Isolation gating provides
-     this signal explicitly: isolated sites down-weight the ST stream and rely
-     more on environmental variables, which is also ecologically justified
-     (isolated sites are more strongly governed by abiotic filtering than by
-     dispersal from neighbors or biotic interactions).
-
-   Propagated through: JSDMModel.forward → JSDMEncoder.forward →
-     JSDMLayer.forward → JSDMAttention.forward (all gained isolation=None).
-
-   Location: JSDMAttention.__init__: self.isolation_scale
-             JSDMAttention.forward: gate_logit adjustment
-             JSDMModel.forward: isolation computation
-             JSDMEncoder.forward, JSDMLayer.forward: isolation passed through
-
-
-7. PER-SPECIES FIRE LOG-SCALE PARAMETERS (NEW)
-   ----------------------------------------------
-   Baseline: STColAttention computed a single shared FIRE bias:
+5. PER-SPECIES FIRE LOG SCALES IN ST CROSS-ATTENTION
+   -----------------------------------------------------
+   Baseline: STColAttention summed spatial_bias + temporal_bias directly with
+     no per-species weighting:
        st_dist_bias = (spatial_bias + temporal_bias)[:, None, None, :, :]
-     Shape was (B, 1, 1, T, C_st) — same for all species.
+     Shape: (B, 1, 1, T, C_st) — identical for all species.
 
-   Current: two per-species learned log-scale parameters:
-       species_spatial_log_scale: (S,)   init=0 → exp(0)=1
-       species_temporal_log_scale: (S,)  init=0 → exp(0)=1
-     Combined as:
-       st_dist_bias = (spatial_bias[:,None,:,:] * s_scale[None,:,None,None]
-                      + temporal_bias[:,None,:,:] * t_scale[None,:,None,None])
-     Shape is now (B, S, 1, T, C_st) — per-species bias.
+   Current: per-species learnable log-scale parameters:
+       species_spatial_log_scale  (S,) init=0 → exp=1
+       species_temporal_log_scale (S,) init=0 → exp=1
+     Combined:
+       st_dist_bias = (spatial_bias * s_scale[s] + temporal_bias * t_scale[s])
+     Shape: (B, S, 1, T, N) — each species has its own distance sensitivity.
 
-   Justification: different species have different spatiotemporal range
-     structures. A migratory bird responds strongly to temporal distance
-     (seasonal movement) but weakly to spatial distance within season. A
-     sessile plant responds only to spatial distance. A shared FIRE bias
-     cannot represent this heterogeneity — it forces all species to use the
-     same spatial vs temporal decay function. Per-species log-scales allow the
-     model to learn species-specific spatiotemporal sensitivity. After training,
-     these parameters reveal which species are more spatially vs temporally
-     autocorrelated, which is ecologically interpretable.
+   Justification: species differ in their spatial and temporal ranges. A migratory
+     species has strong temporal distance structure (seasonal pattern). A sedentary
+     habitat specialist has strong spatial distance structure. These log-scales
+     allow the model to learn which dimension matters more for each species.
+     Both init to 0 (exp=1) so initial behavior is identical to the baseline.
 
    Location: STColAttention.__init__ and forward, jsdm_model.py
 
 
-8. VECTORIZED SOURCE MODULE REPLACES LOOP-BASED IMPLEMENTATION
-   --------------------------------------------------------------
-   Baseline: STSourceModule iterated over clusters in a Python for-loop,
-     calling STAttentionPool (a separate class) once per cluster. Single-site
-     clusters were handled separately via single_site_proj (nn.Linear(1,H)).
+6. SOURCE_IDX ADDED TO JSDMMODEL.FORWARD
+   ------------------------------------------
+   Baseline: JSDMModel.forward did not take source_idx as a parameter, even
+     though it was present in the collator output batch. Target-to-cluster
+     distances used all N pairwise rows of the cluster label array directly —
+     in practice this was broken since the gather logic required source_idx.
 
-   Current: fully vectorized using one_hot cluster membership masks and a
-     masked softmax over N. STAttentionPool class and single_site_proj removed.
-     Clusters with no sampled members produce zero embeddings automatically
-     via nan_to_num on empty-cluster softmax outputs.
+   Current: source_idx (B, N) added as an explicit parameter to
+     JSDMModel.forward. Used to gather target-to-source distances from the
+     full N_total×N_total pairwise matrices.
 
-   Justification: the loop-based approach executed O(C) sequential Python
-     operations per forward pass (one per cluster). With hundreds of clusters
-     this is a significant overhead on GPU where parallelism is critical.
-     The vectorized implementation runs in a fixed number of tensor operations
-     regardless of cluster count, making full use of GPU parallelism.
-     Single-site clusters no longer need special-casing since the masked
-     softmax over a single member is equivalent to selecting that member directly.
+   Justification: bug fix. Without source_idx, the model could not correctly
+     look up per-source-site distances for FIRE bias and isolation computation.
 
-   Signature change: forward now takes source_cluster_labels (B,N) and
-     num_clusters instead of cluster_dict.
-
-   Location: class STSourceModule, jsdm_model.py
-             STAttentionPool class removed entirely
+   Location: JSDMModel.forward signature and forward calls in jsdm_train.py
 
 
-9. EMPTY-CLUSTER MASKING IN ATTENTION (NEW)
-   -------------------------------------------
-   Baseline: no explicit handling of clusters that received no sampled source
-     sites in a given batch.
+7. CLUSTER POOLING REPLACED BY DIRECT N-SITE CROSS-ATTENTION
+   -------------------------------------------------------------
+   GPN-star context: in GPN-star, the col cross-attention never attends over
+     individual source sequences directly. Source species are first grouped into
+     phylogenetic clades (a given biological structure), then within-clade
+     attention pooling produces one embedding per clade, and the target attends
+     over C clade embeddings. The baseline mapped phylogenetic clades → computed
+     ST clusters (connected-components) and within-clade pooling →
+     STSourceModule (STAttentionPool + single_site_proj), producing (B,S,C_st,H).
 
-   Current: after computing the own-cluster attention mask, clusters with no
-     sampled sources in the batch are also masked out:
-       present.scatter_(1, source_cluster_labels, 1.0)
-       empty_mask = (present == 0)
-       attn_mask += empty_mask * finfo(dtype).min
+   Baseline: STSourceModule looped over cluster_dict and for each cluster either
+     did attention pooling (multi-site clusters via STAttentionPool) or a linear
+     projection (single-site clusters). Result: (B, S, C_st, H). Cross-attention
+     attended over C cluster slots.
 
-   Justification: with random source sampling, many clusters will receive
-     zero sampled sources in a given batch (especially with many clusters and
-     small num_source_sites). Attending to zero-padded empty cluster embeddings
-     would inject uninformative zero vectors into the cross-attention, adding
-     noise. Masking them out ensures the model only attends to clusters that
-     actually have evidence in the current batch.
+   Current: STSourceModule and the cluster pooling step are removed. This is a
+     deliberate departure from the GPN-star correspondence.
+     - STSourceModule (including STAttentionPool and single_site_proj) removed.
+     - Source sites embedded directly via the shared 3-token embedding:
+         source_emb = self.target_input.embedding(source_ids)  # (B, S, N, H)
+     - Target-to-source distances gathered directly from pairwise matrices.
+     - STColAttention and STCrossAttention now attend over N source sites instead
+       of C cluster slots (same code, dimension C → N).
+     - No attention mask (own-cluster mask removed; see change 13 for blinding).
 
-   Location: JSDMModel.forward, jsdm_model.py
+   Justification: in genomics, phylogenetic clades are a principled grouping —
+     all species within a clade share common ancestry and thus genuinely similar
+     genomic context. The spatial analog (nearby sites share similar ecology)
+     fails at habitat boundaries, elevation gradients, or land-use transitions,
+     where spatially adjacent sites can be ecologically very different. Pooling
+     across such boundaries introduces structured bias. Direct N-site cross-
+     attention with FIRE distance bias lets the model learn via QKᵀ which source
+     sites are actually informative, guided by distance as a soft prior rather
+     than hard cluster membership.
 
-
-10. HAVERSINE DISTANCE REPLACES EUCLIDEAN IN SPATIAL METRIC
-    ----------------------------------------------------------
-    Baseline: spatial distances computed as Euclidean cdist over lat/lon
-      coordinates in degrees. Combined distance was additive and unscaled:
-      combined = spatial_dist + temporal_dist.
-
-    Current: haversine great-circle distance in kilometers. Combined distance
-      is normalized and L2-combined:
-        combined = sqrt((spatial/scale_km)^2 + (temporal/scale_days)^2)
-      In-cluster centroid distances also use haversine. STClusterInfo updated
-      to use _haversine_pairwise and normalized combined distance.
-
-    Justification: Euclidean distance on lat/lon degrees is geometrically
-      incorrect — 1 degree of longitude at 60°N latitude is half the physical
-      distance of 1 degree at the equator. This distorts the spatial structure
-      of clusters and source sampling, particularly for datasets spanning large
-      latitudinal ranges. Haversine gives true great-circle distances in km,
-      which are meaningful and consistent regardless of geographic location.
-      The additive combined distance was also dimensionally inconsistent
-      (km + days has no physical meaning); normalized L2 combination places
-      both dimensions on equal footing at their respective scales.
-
-    Location: haversine_pairwise() added, jsdm_data.py
-              _haversine_pairwise() added, jsdm_model.py
-              JSDMDataset.__init__, build_st_clusters(), STClusterInfo.__init__
+   Location: jsdm_model.py: STSourceModule, STAttentionPool, STClusterInfo removed
+             JSDMModel.__init__: st_source_module removed
+             JSDMModel.forward: direct source embedding + gather logic
+             jsdm_data.py, jsdm_train.py, jsdm_inference.py: see sections below
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 jsdm_data.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-11. COLUMN DETECTION: NAME-BASED INSTEAD OF VALUE-BASED
-    -------------------------------------------------------
-    Baseline: env vs species columns detected by checking whether unique
-      values ⊆ {0, 1, 0.0, 1.0}. Binary env variables would be
-      misclassified as species columns.
+8. COLUMN DETECTION: 0/1 HEURISTIC → env_ PREFIX CONVENTION
+   -----------------------------------------------------------
+   Baseline: JSDMDataset auto-detected species vs. env columns by inspecting
+     unique values: if all unique non-NaN values are in {0, 1, 0.0, 1.0} →
+     species column; otherwise → env column.
 
-    Current: name-based detection — env cols start with "env_", all others
-      (excluding coordinates) are species. User can also pass env_cols
-      explicitly to override.
+   Current: convention-based detection using column name prefix:
+     - env columns: names starting with "env_"
+     - species columns: all other non-coord columns
 
-    Justification: value-based detection is fragile. Binary environmental
-      variables (e.g. land cover class, presence of water body) have values
-      in {0,1} and would be silently misclassified as species, corrupting
-      both the species prediction target and the environmental context.
-      Name-based detection via the "env_" prefix convention is unambiguous
-      and does not depend on the data distribution.
+   Justification: the set-based heuristic fails for species with >2 abundance
+     levels or env variables that happen to only take values 0 and 1 (e.g.
+     binary habitat indicators). The prefix convention is explicit, predictable,
+     and works regardless of the data values. It requires the user to name their
+     env columns with the env_ prefix, which is already the convention in the
+     example datasets (SatButterfly, Simulation).
 
-    Location: JSDMDataset.__init__, jsdm_data.py lines ~86-91
-
-
-12. NORMALIZED COMBINED DISTANCE FOR SOURCE SAMPLING
-    ----------------------------------------------------
-    Baseline: source sampling used combined_dist = spatial_dist + temporal_dist
-      (raw, unscaled additive sum of degrees and days).
-
-    Current: normalized L2 combination:
-      spatial_norm  = spatial_dist[idx] / spatial_scale_km
-      temporal_norm = temporal_dist[idx] / temporal_scale_days
-      combined_dist = sqrt(spatial_norm^2 + temporal_norm^2)
-    Probability ∝ 1 / (combined_dist + 1e-6).
-
-    Justification: raw additive combination of spatial and temporal distances
-      is dimensionally inconsistent (km/degrees + days has no meaning) and
-      heavily dominated by whichever dimension has larger absolute values.
-      For a dataset spanning 5000 km and 10 years (~3650 days), the temporal
-      term dominates if both are added raw. Normalizing each by its respective
-      scale places both on equal footing and makes the combined distance
-      dimensionless and bounded in [0, √2]. The L2 combination is the natural
-      Euclidean norm in the normalized 2D space.
-
-    Location: JSDMDataset.__getitem__, jsdm_data.py
+   Location: JSDMDataset.__init__, jsdm_data.py
 
 
-13. SPATIAL AND TEMPORAL SCALE PARAMETERS
+9. HAVERSINE SPATIAL DISTANCES REPLACE EUCLIDEAN
+   --------------------------------------------------
+   Baseline: spatial distances computed as Euclidean cdist on raw lat/lon
+     coordinate arrays — treating degrees as flat-space units.
+
+   Current: haversine_pairwise() computes great-circle distances in km. For
+     simulated datasets with non-geographic coordinates, euclidean_pairwise()
+     is available via the --euclidean_coords flag (see change 13).
+
+   Justification: Euclidean distance on lat/lon degrees is geometrically
+     incorrect. 1 degree of longitude at 60°N is ~55 km, vs. ~111 km at the
+     equator. The FIRE bias and source sampling weights computed from these
+     distances would be distorted. Haversine gives the correct great-circle
+     distance in km, consistent with geographic interpretation.
+
+   Location: haversine_pairwise() added, JSDMDataset.__init__, jsdm_data.py
+
+
+10. NORMALIZED L2 COMBINED DISTANCE REPLACES RAW ADDITIVE
+    --------------------------------------------------------
+    Baseline: combined_dist = spatial_dist + temporal_dist (raw additive).
+      Used both for source sampling weights and for cluster threshold.
+
+    Current: combined_dist = sqrt((sp/sp_scale)^2 + (tp/tp_scale)^2)
+      where sp_scale and tp_scale are the max pairwise distances (or user-
+      specified). This normalized L2 is in [0, √2] regardless of units.
+
+    Justification: raw addition is dimensionally inconsistent (km + days).
+      On a dataset spanning 5000 km and 10 years (~3650 days), the temporal
+      term dominates by ~3650/5000 = 0.73× if spatial is in km, or completely
+      dominates if spatial is in degrees (~180). The normalized L2 places both
+      dimensions on equal footing. The cluster threshold=5.0 in the baseline
+      was also meaningless after haversine (km scale) — normalization makes
+      the threshold scale-invariant.
+
+    Location: JSDMDataset.__getitem__, build_st_clusters / compute_dist_info
+
+
+11. SPATIAL AND TEMPORAL SCALE PARAMETERS
     ------------------------------------------
     Baseline: no scale normalization. JSDMDataset had no spatial_scale_km or
       temporal_scale_days parameters. build_st_clusters had no scale params.
 
     Current: _resolve_scale() helper added. Both JSDMDataset and
-      build_st_clusters accept optional spatial_scale_km / temporal_scale_days.
-      If not provided, auto-set to max(pairwise_dist). Returned in cluster_info
+      compute_dist_info accept optional spatial_scale_km / temporal_scale_days.
+      If not provided, auto-set to max(pairwise_dist). Returned in dist_info
       dict and used to set config.max_spatial_dist / max_temporal_dist.
 
-    Justification: required by changes 10 and 12 (normalization). Also allows
-      users to fix the scale explicitly for datasets where auto-detection is
-      problematic — e.g. SatButterfly where temporal_scale_days would otherwise
-      be 0 (all times identical), causing division by zero throughout the
-      pipeline. Explicit scale also ensures train/inference use the same
-      normalization even if the inference dataset has a different geographic
-      extent.
+    Justification: required by change 10 (normalization). Also allows users to
+      fix the scale explicitly for datasets where auto-detection is problematic —
+      e.g. SatButterfly where temporal_scale_days would otherwise be 0 (all
+      times identical), causing division by zero throughout the pipeline.
+      Explicit scale also ensures train/inference use the same normalization
+      even if the inference dataset has a different geographic extent.
 
-    Location: _resolve_scale(), jsdm_data.py
-              JSDMDataset.__init__, build_st_clusters, create_dataloaders
+    Location: _resolve_scale() added, JSDMDataset.__init__, compute_dist_info,
+              create_dataloaders, jsdm_data.py
 
 
-14. NAN CHECK ON DATA LOAD
+12. NAN CHECK ON DATA LOAD
     --------------------------
     Baseline: no NaN validation. NaNs in input data would propagate silently
       through the model and produce NaN loss with no diagnostic information.
@@ -346,228 +275,289 @@ jsdm_data.py
 
     Justification: NaNs in species or env columns cause silent training failure
       (NaN loss, NaN gradients) that is difficult to diagnose. An early
-      explicit check with a clear error message forces the user to fix the
-      data before training begins, rather than wasting a training run.
+      explicit check forces the user to fix the data before wasting a training run.
 
     Location: JSDMDataset.__init__, jsdm_data.py
 
 
-15. COMPLETE LINKAGE CLUSTERING REPLACES CONNECTED COMPONENTS
-    -------------------------------------------------------------
-    Baseline: build_st_clusters used networkx connected components on a graph
-      where any two sites within threshold distance are connected.
-      Hard-coded default threshold=5.0, which was meaningless after the
-      normalization change (combined distances are in [0, √2]).
+13. CLUSTERING REPLACED BY PROXIMITY BLIND THRESHOLD
+    ------------------------------------------------------
+    GPN-star context: in GPN-star, the DataCollator blinds source entries that
+      belong to the same clade as the target species during masking — the target
+      cannot simply copy from its own clade's sequences. The baseline mapped this
+      to own-cluster masking: when a species in the target row is masked, all
+      source entries from sites in the same ST cluster as the target are set to
+      mask_value. This prevents trivial copying from nearby identical observations.
 
-    Current: sklearn AgglomerativeClustering with complete linkage and
-      precomputed distance matrix. Every pair within a cluster satisfies
-      combined_dist ≤ threshold. No chaining.
-      Threshold default changed to None → auto-selected as the k-th percentile
-      (cluster_percentile, default 5.0) of all pairwise combined distances.
-      For threshold=0: all singletons.
+    Baseline: build_st_clusters() computed the cluster structure via networkx
+      connected-components with a fixed threshold=5.0 on raw (unnormalized)
+      additive distance. JSDMDataCollator received cluster_labels (N,) and for
+      each masked position set source_species[b, masked, n] = mask_value for
+      any source n in the same cluster as the target.
 
-    Justification: connected components suffers from chaining — if A is near B
-      and B is near C, all three end up in one cluster even if A and C are far
-      apart. On the SatButterfly dataset (7,608 US hotspots, all times=0), this
-      merged all sites into one giant cluster: the target's own cluster covered
-      everything, the own-cluster attention mask set all logits to -inf,
-      softmax produced NaN, and loss was NaN throughout training. Complete
-      linkage guarantees a diameter bound on each cluster (all within-cluster
-      pairs ≤ threshold), preventing this failure mode.
-      The percentile-based auto-threshold makes the threshold data-adaptive:
-      it always selects a value that creates a meaningful number of clusters
-      regardless of the dataset's geographic extent.
+    Problem with own-cluster masking: it requires a cluster assignment. With the
+      raw additive distance and threshold=5.0, the threshold was arbitrary and
+      scale-dependent. On SatButterfly (all times=0, geographic degrees as
+      spatial), connected-components merged the entire dataset into one cluster
+      — own-cluster masking then blocked ALL sources, softmax produced NaN, and
+      training failed with NaN loss from the first step.
 
-    Location: build_st_clusters(), jsdm_data.py
-              import: networkx removed, sklearn.cluster.AgglomerativeClustering added
+    Current: build_st_clusters() replaced by compute_dist_info(). No cluster
+      assignment. Returns:
+        - combined_dist: (N×N) normalized float32 array (same normalization as
+          source sampling, see change 10)
+        - blind_threshold: the bottom blind_percentile% (default 2%) of all
+          non-zero pairwise combined distances — a percentile-based cutoff that
+          adapts to the dataset's spatial-temporal density
+        - pairwise distance tensors and scale values
+      JSDMDataCollator uses combined_dist + blind_threshold to blind source
+      entries: for each masked species, any source site with
+      combined_dist[target, source] ≤ blind_threshold gets token 2 (masked).
+      Blinding is vectorized via numpy advanced indexing + torch broadcast mask.
+      networkx and sklearn imports removed.
+
+    Justification: the blinding serves the same anti-leakage purpose as own-
+      cluster masking (preventing trivial copying from very nearby observations)
+      but without requiring a discrete cluster assignment. The blind_threshold
+      targets only the closest blind_percentile% of site pairs — the absolute
+      nearest neighbors that would trivially copy the target — rather than
+      everything within an arbitrary cluster radius. This is more principled:
+      "blind the truly nearest sites" vs. "blind everyone in the same cluster."
+      It also degrades gracefully — as the threshold approaches 0, blinding
+      disappears; there is no catastrophic failure mode like the NaN case above.
+
+    Location: compute_dist_info() replaces build_st_clusters(), jsdm_data.py
+              JSDMDataCollator: cluster_labels/mask_value → combined_dist/blind_threshold
+              create_dataloaders: cluster_threshold/mask_value → blind_percentile
 
 
-16. PRECOMPUTED DISTANCES REUSED ACROSS DATASET AND CLUSTERING
+14. PRECOMPUTED DISTANCES REUSED ACROSS DATASET AND CLUSTERING
     -------------------------------------------------------------
     Baseline: JSDMDataset computed its own distance matrices; build_st_clusters
       recomputed them independently from scratch.
 
     Current: JSDMDataset computes spatial_dists and temporal_dists once at
-      init. create_dataloaders passes them to build_st_clusters via explicit
+      init. create_dataloaders passes them to compute_dist_info via explicit
       spatial_dist and temporal_dist arguments.
 
-    Justification: pairwise distance computation is O(N^2) and for large
-      datasets (N=7608, N=43K) takes significant time and memory. Computing
-      them twice is wasteful. Reusing the precomputed matrices avoids this
-      and also guarantees that dataset and clustering use exactly the same
-      distance values (no floating point discrepancy from recomputation).
+    Justification: pairwise distance computation is O(N^2). Computing them
+      twice is wasteful and also risks floating point discrepancy between the
+      dataset and clustering stages.
 
     Location: create_dataloaders(), jsdm_data.py
-              build_st_clusters() signature: spatial_dist, temporal_dist params added
+
+
+15. SEED PLACEMENT MOVED AFTER DISTANCE COMPUTATION
+    ------------------------------------------------------
+    Baseline: np.random.seed(seed) called before JSDMDataset init and
+      build_st_clusters, meaning random state was consumed by any numpy random
+      calls inside those functions before np.random.permutation(n) for the
+      train/val split. The resulting val indices did not match baseline methods.
+
+    Current: np.random.seed(seed) moved to immediately before
+      np.random.permutation(n), after all distance computation. The first
+      random call after the seed is now the split permutation, matching
+      logistic_baseline.py exactly.
+
+    Justification: fairness of comparison. Both models now evaluate on the
+      same held-out val sites.
+
+    Location: create_dataloaders(), jsdm_data.py
+
+
+16. EUCLIDEAN DISTANCE OPTION (--euclidean_coords)
+    ---------------------------------------------------
+    Baseline: spatial distances always cdist (Euclidean on raw lat/lon).
+
+    Current: haversine is the default. --euclidean_coords flag added to
+      jsdm_train.py and jsdm_inference.py. When set, JSDMDataset uses
+      euclidean_pairwise() (cdist on 2D coords) instead of haversine_pairwise().
+
+    Justification: simulated datasets (e.g. Callahan et al. 2025) use arbitrary
+      2D spatial coordinates in unspecified units, not geographic degrees.
+      Haversine on such coordinates produces geometrically meaningless distances.
+
+    Location: euclidean_pairwise() added, JSDMDataset.__init__ and
+              create_dataloaders gained euclidean_coords param;
+              jsdm_train.py, jsdm_inference.py: --euclidean_coords flag
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 jsdm_train.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-17. PER-SPECIES LOSS WEIGHTING (--class_weighting FLAG)
-    -------------------------------------------------------
-    Baseline: uniform BCE loss across all masked positions.
-
-    Current: optional effective number weighting (Cui et al. 2019):
-      n_s  = presences for species s in training split
-      w_s  = (1 - β) / (1 - β^n_s),   β = 0.999
-      w_s  normalized so mean(w_s) = 1
-    Computed from training split only (train_loader.dataset.indices).
-    Per-batch: w expanded from (S,) to (B,S) and passed as loss_weight.
-    Enabled via --class_weighting flag.
-
-    Justification: species presence/absence data is severely imbalanced —
-      rare species may be present at <1% of sites while common species are
-      present at >30%. Under uniform loss, the gradient for a rare species
-      (present at 50 out of 7608 sites) is ~500× smaller than for a common
-      one. The model learns to predict common species well while effectively
-      ignoring rare ones, which are often the most ecologically interesting.
-      Effective number weighting (vs raw inverse frequency) is used because
-      it compresses the weight range — for SatButterfly's prevalence range,
-      raw inverse frequency gives up to 47× weight ratio, which can destabilize
-      training for the rarest species. Effective number with β=0.999 gives ~21×,
-      which is aggressive enough to help rare species while remaining stable.
-      Weights are computed from training split only to avoid leaking val
-      distribution into training loss.
-
-    Location: main(): loss_weight computation
-              train_epoch(): loss_weight parameter, expansion to (B,S)
-
-
-18. SOURCE_IDX ADDED TO MODEL FORWARD CALLS
-    -------------------------------------------
-    Baseline: source_idx was missing from the model() calls in train_epoch
-      and evaluate, despite being required by JSDMModel.forward to index
-      into the pairwise distance matrices.
+17. SOURCE_IDX ADDED TO TRAIN/EVAL FORWARD CALLS
+    --------------------------------------------------
+    Baseline: source_idx was missing from model() calls in train_epoch and
+      evaluate, despite being in the batch and required by JSDMModel.forward.
 
     Current: source_idx=batch["source_idx"] added to all model() forward
       calls in train_epoch and evaluate.
 
-    Justification: bug fix. Without source_idx, the model could not look up
-      per-source-site distances for FIRE bias computation and isolation
-      gating.
+    Justification: bug fix. Without source_idx the model could not gather
+      per-source-site distances (see model change 6).
 
     Location: train_epoch() and evaluate(), jsdm_train.py
 
 
-19. PER-SPECIES AUC IN VALIDATION
-    ----------------------------------
-    Baseline: evaluate() reported only loss and accuracy.
+18. EVALUATE() EXTENDED: PER-SPECIES AUC
+    ------------------------------------------
+    Baseline: evaluate() returned (loss, acc). Accuracy computed as overall
+      fraction of correctly classified masked positions across all species.
 
     Current: evaluate() additionally computes mean per-species AUC-ROC.
       Predictions and labels accumulated per species across all val batches.
-      roc_auc_score called per species; species with only one class in val
-      masked positions that epoch are excluded from the mean.
-      Returns (loss, acc, mean_auc). Logged each epoch.
+      roc_auc_score called per species; species with only one class in their
+      val masked positions are excluded. Returns (loss, acc, mean_auc,
+      per_species_aucs). Logged each epoch.
 
-    Justification: accuracy is uninformative for imbalanced P/A data — a
-      model that always predicts absent achieves ~90-94% accuracy on
-      SatButterfly trivially. AUC-ROC measures whether the model correctly
-      ranks presence sites above absence sites and is insensitive to the
-      decision threshold, making it the standard evaluation metric for SDMs.
-      Per-species AUC is more informative than macro-averaged AUC because it
-      reveals whether rare species (which matter most ecologically) are
-      actually being learned rather than ignored.
+    Justification: accuracy is uninformative for imbalanced P/A data — a model
+      that always predicts absent achieves ~90-94% accuracy on SatButterfly
+      trivially. AUC-ROC measures whether the model correctly ranks presence
+      sites above absence sites and is insensitive to the decision threshold,
+      making it the standard evaluation metric for SDMs.
 
     Location: evaluate(), jsdm_train.py
 
 
-21. DISK LOGGING OF EPOCH METRICS
+19. PER-SPECIES LOSS WEIGHTING (--class_weighting FLAG)
+    -------------------------------------------------------
+    Baseline: uniform BCE loss across all masked positions.
+
+    Current: optional effective number weighting (Cui et al. 2019):
+        n_s  = presences for species s in training split
+        w_s  = (1 - β) / (1 - β^n_s),   β = 0.999
+        w_s  normalized so mean(w_s) = 1
+      Computed from training split only. Enabled via --class_weighting flag.
+
+    Justification: species presence/absence data is severely imbalanced. Under
+      uniform loss, the gradient for a rare species (present at <1% of sites)
+      is proportionally tiny and the model effectively ignores it. Effective
+      number weighting (vs. raw inverse frequency) compresses the weight range
+      and avoids destabilizing training for the rarest species.
+
+    Location: main(): loss_weight computation; train_epoch(): loss_weight param
+
+
+20. DISK LOGGING OF EPOCH METRICS
     -----------------------------------
     Baseline: epoch metrics only printed to stdout via logging.
 
-    Current: at the start of training a CSV file training_log.csv is created
-      in output_dir with header:
+    Current: training_log.csv written to output_dir each run, with columns:
         epoch, train_loss, train_acc, val_loss, val_acc, val_auc, lr, elapsed_s
-      After each epoch the row is appended. File persists after training ends.
-
-    Justification: stdout logs are lost if the session ends or the terminal
-      scrolls. A persistent CSV allows post-hoc analysis of training dynamics,
-      comparison across runs, and figure generation without re-running training.
+      Appended after each epoch. Persists after training ends.
 
     Location: main(), jsdm_train.py
 
 
-22. PER-SPECIES AUC SAVED FOR BEST MODEL
+21. PER-SPECIES AUC SAVED FOR BEST MODEL
     -----------------------------------------
     Baseline: no per-species AUC output file.
 
-    Current: after training completes, the best_model.pt checkpoint is reloaded
-      and evaluate() is called on the full val set. Per-species AUC values
-      (from masked positions) are saved to output_dir/per_species_auc_jsdm.csv
-      with columns species, auc. evaluate() now returns a 4-tuple
-      (loss, acc, mean_auc, per_species_aucs) where per_species_aucs is a
-      {species_index: auc} dict; training loop discards it with _.
+    Current: after training completes, best_model.pt is reloaded and
+      evaluate() called on the full val set. Per-species AUC values saved to
+      output_dir/per_species_auc_jsdm.csv with columns species, auc.
 
-    Justification: per-species AUC on the best model (not last epoch) is needed
-      for fair comparison with baseline methods (e.g. logistic regression
-      per-species AUC). Training-time AUC is computed with 15% MLM masking; the
-      final eval uses the same masking applied to the best checkpoint.
+    Justification: per-species AUC on the best model is needed for fair
+      comparison with baselines (e.g. logistic regression per-species AUC).
 
     Location: main(), jsdm_train.py
-              evaluate(), jsdm_train.py: return signature extended
 
 
-23. TRAIN/VAL SPLIT SEED MOVED AFTER CLUSTERING
-    ------------------------------------------------
-    Baseline: np.random.seed(seed) called before both JSDMDataset init and
-      build_st_clusters, meaning random state was consumed by clustering before
-      np.random.permutation(n) for the split. The resulting val indices did not
-      match those of baseline methods (e.g. logistic regression) using the same
-      seed.
-
-    Current: np.random.seed(seed) moved to immediately before
-      np.random.permutation(n), after all clustering code. The first random
-      call after the seed is now the split permutation, matching
-      logistic_baseline.py exactly.
-
-    Justification: fairness of comparison. Both models now evaluate on the
-      same held-out val sites, making AUC comparisons directly comparable.
-
-    Location: create_dataloaders(), jsdm_data.py
-
-
-24. EUCLIDEAN DISTANCE OPTION (--euclidean_coords)
-    ---------------------------------------------------
-    Baseline: spatial distances always computed as haversine great-circle
-      distances in km, assuming lat/lon are geographic degrees.
-
-    Current: --euclidean_coords flag added to jsdm_train.py and
-      jsdm_inference.py. When set, JSDMDataset uses euclidean_pairwise()
-      (cdist on 2D coords) instead of haversine_pairwise(). Default is
-      haversine (unchanged for geographic data).
-
-    Justification: simulated datasets (e.g. Callahan et al. 2025) use
-      arbitrary 2D spatial coordinates in unspecified units, not geographic
-      degrees. Haversine on such coordinates produces geometrically incorrect
-      distances. Euclidean distance is the correct metric for these cases.
-      The flag propagates through create_dataloaders() → JSDMDataset and
-      is also supported in jsdm_inference.py.
-
-    Location: jsdm_data.py: euclidean_pairwise() added, JSDMDataset.__init__
-              and create_dataloaders() gained euclidean_coords param
-              jsdm_train.py, jsdm_inference.py: --euclidean_coords flag
-
-
-20. MAX_TEMPORAL_DIST ZERO-DIVISION FIX
+22. MAX_TEMPORAL_DIST ZERO-DIVISION FIX
     ----------------------------------------
     Baseline: config.max_temporal_dist = cluster_info["max_temporal_dist"] * 1.1
-      where max_temporal_dist = max(pairwise temporal distances). For datasets
-      where all observation times are identical (e.g. SatButterfly where time=0
-      for all rows), this is 0. Division by zero then occurs in FIRE temporal
-      normalization and isolation computation, producing NaN loss.
+      For datasets where all times are identical (e.g. SatButterfly, time=0
+      for all rows), this is 0. Division by zero in FIRE temporal normalization
+      and isolation computation → NaN loss.
 
     Current:
-      max_temporal_dist = max(cluster_info["max_temporal_dist"],
-                              cluster_info["temporal_scale_days"]) * 1.1
+        max_temporal_dist = max(dist_info["max_temporal_dist"],
+                                dist_info["temporal_scale_days"]) * 1.1
       temporal_scale_days is guaranteed > 0 by _resolve_scale — users of
       constant-time datasets must pass --temporal_scale_days explicitly.
 
-    Justification: bug fix for datasets without temporal variation. The
-      temporal FIRE bias and isolation normalization both divide by
-      max_temporal_dist. Using temporal_scale_days as a fallback ensures
-      a positive denominator while keeping the normalization semantically
-      correct (distances are normalized to the user-specified temporal scale).
-
     Location: main(), jsdm_train.py config construction
+
+
+23. ADDITIONAL CLI ARGUMENTS
+    -----------------------------
+    Baseline args: --cluster_threshold (float, 5.0), --mask_value (float, -1.0)
+
+    Current replacements / additions:
+      --blind_percentile (float, 2.0) — replaces cluster_threshold + mask_value
+      --spatial_scale_km (float, None) — explicit spatial scale
+      --temporal_scale_days (float, None) — explicit temporal scale
+      --euclidean_coords (flag) — use Euclidean instead of haversine
+      --class_weighting (flag) — enable per-species loss weighting
+
+    Location: main(), jsdm_train.py; and mirrored in jsdm_inference.py
+
+
+24. LEARNED SPECIES IDENTITY EMBEDDING
+    ----------------------------------------
+    Baseline: TargetInput had no species identity information beyond the
+      state token. Two absent species at the same site produced identical
+      embeddings — the model had no signal distinguishing species A (absent)
+      from species B (absent). Cross-attention, FFN, and the prediction head
+      all processed them identically.
+
+    Current: TargetInput adds nn.Embedding(num_species, hidden_size) —
+      a distinct H-dim learned vector per species. Added to both the target
+      state embedding and the source site embeddings in JSDMModel.forward:
+        source_emb = embedding(source_ids) + species_emb[None, :, None, :]
+      Species indices are computed as torch.arange(S) over the column order,
+      which is fixed and consistent across train/val/inference.
+
+    Justification: species are a fixed named set, not an exchangeable sequence.
+      Without a species identity signal, the model is forced to learn
+      species-specific behavior entirely from co-occurrence patterns in the
+      attention weights — which only work when species are present. For rare
+      species that are almost always absent, the model cannot distinguish them
+      at all. The identity embedding flows through V (values), cross-attention,
+      and FFN paths (not just Q/K), giving every species a distinct inductive
+      bias from the start of training. This is analogous to word embeddings in
+      NLP: "dog" and "cat" are different tokens even when their context is
+      similar.
+
+    Location: TargetInput.__init__: species_embedding = nn.Embedding(S, H)
+              TargetInput.forward: state_emb + species_emb added
+              JSDMModel.forward: source_emb uses species_embedding
+
+
+25. ROPE REMOVED FROM SPECIES SELF-ATTENTION
+    ---------------------------------------------
+    Baseline: JSDMEncoder used RoFormerSinusoidalPositionalEmbedding (from
+      transformers) to compute sinusoidal_pos over the species axis. These
+      were passed through every layer and applied in SpeciesSelfAttention.forward
+      via _apply_rotary() to Q and K — injecting a rotary position bias along
+      the species dimension. The baseline also kept self.rotary_value = False
+      as an unused flag.
+
+    Current: all RoPE-related code removed:
+      - RoFormerSinusoidalPositionalEmbedding import removed
+      - JSDMEncoder.embed_positions removed
+      - sinusoidal_pos removed from JSDMEncoder.forward, JSDMLayer.forward,
+        JSDMAttention.forward, SpeciesRowAttention.forward
+      - SpeciesSelfAttention._apply_rotary() static method removed
+      - self.rotary_value = False removed
+      Species self-attention now uses standard dot-product attention with no
+      positional encoding on the species axis.
+
+    Justification: RoPE encodes relative position bias — it tells the model
+      that species at adjacent column indices are more related than those far
+      apart. This is appropriate for sequences with a natural linear order
+      (tokens in a sentence, base pairs in a genome). Species column order is
+      arbitrary (alphabetical, or however the CSV was written). Injecting a
+      false prior that species 1 and species 2 are more similar than species
+      1 and species 50 is incorrect and potentially harmful. The learned
+      species identity embedding (change 24) replaces positional encoding
+      with a semantically meaningful signal: not "where in the sequence are
+      you" but "which species are you."
+
+    Location: JSDMEncoder.__init__: embed_positions removed, RoFormer import removed
+              JSDMEncoder.forward: sinusoidal_pos computation and passing removed
+              JSDMLayer.forward, JSDMAttention.forward, SpeciesRowAttention.forward:
+                sinusoidal_pos param removed
+              SpeciesSelfAttention.__init__: rotary_value removed
+              SpeciesSelfAttention._apply_rotary: method removed

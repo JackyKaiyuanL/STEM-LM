@@ -16,7 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from jsdm_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
-from jsdm_data import JSDMDataset, JSDMDataCollator, build_st_clusters
+from jsdm_data import JSDMDataset, JSDMDataCollator, compute_dist_info
 
 
 def load_model(model_dir, device):
@@ -31,7 +31,7 @@ def load_model(model_dir, device):
     return model, config
 
 
-def run_forward(model, batch, cluster_info, device, output_attentions=False):
+def run_forward(model, batch, dist_info, device, output_attentions=False):
     batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
     return model(
         input_ids=batch["input_ids"],
@@ -40,34 +40,30 @@ def run_forward(model, batch, cluster_info, device, output_attentions=False):
         target_site_idx=batch["target_site_idx"],
         env_data=batch["env_data"],
         labels=batch["labels"],
-        cluster_dict=cluster_info["cluster_dict"],
-        cluster_labels=cluster_info["cluster_labels"],
-        in_cluster_spatial_dist=cluster_info["in_cluster_spatial_dist"],
-        in_cluster_temporal_dist=cluster_info["in_cluster_temporal_dist"],
-        spatial_dist_pairwise=cluster_info["spatial_dist_pairwise"],
-        temporal_dist_pairwise=cluster_info["temporal_dist_pairwise"],
+        spatial_dist_pairwise=dist_info["spatial_dist_pairwise"],
+        temporal_dist_pairwise=dist_info["temporal_dist_pairwise"],
         output_attentions=output_attentions,
     )
 
 
 @torch.no_grad()
-def predict_masked(model, loader, cluster_info, device, species_names):
+def predict_masked(model, loader, dist_info, device, species_names):
     all_preds = []
     for batch in loader:
-        output = run_forward(model, batch, cluster_info, device)
+        output = run_forward(model, batch, dist_info, device)
         probs = torch.sigmoid(output.logits).squeeze(-1).cpu().numpy()
         all_preds.append(probs)
     return pd.DataFrame(np.concatenate(all_preds, axis=0), columns=species_names)
 
 
 @torch.no_grad()
-def extract_interactions(model, loader, cluster_info, device, species_names, num_batches=50):
+def extract_interactions(model, loader, dist_info, device, species_names, num_batches=50):
     per_layer = {i: [] for i in range(model.config.num_hidden_layers)}
 
     for i, batch in enumerate(loader):
         if i >= num_batches:
             break
-        output = run_forward(model, batch, cluster_info, device, output_attentions=True)
+        output = run_forward(model, batch, dist_info, device, output_attentions=True)
         for layer_idx in range(model.config.num_hidden_layers):
             mat = extract_interaction_matrix(output, layer_idx=layer_idx)
             per_layer[layer_idx].append(mat.cpu())
@@ -88,8 +84,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--num_batches", type=int, default=50)
-    parser.add_argument("--cluster_threshold", type=float, default=None)
-    parser.add_argument("--cluster_percentile", type=float, default=5.0)
+    parser.add_argument("--blind_percentile", type=float, default=2.0)
     parser.add_argument("--spatial_scale_km", type=float, default=None)
     parser.add_argument("--temporal_scale_days", type=float, default=None)
     parser.add_argument("--euclidean_coords", action="store_true",
@@ -109,20 +104,17 @@ def main():
         temporal_scale_days=args.temporal_scale_days,
         euclidean_coords=args.euclidean_coords,
     )
-    cluster_info = build_st_clusters(
-        dataset.coords,
-        dataset.times,
-        threshold=args.cluster_threshold,
-        cluster_percentile=args.cluster_percentile,
-        spatial_scale_km=dataset.spatial_scale_km,
-        temporal_scale_days=dataset.temporal_scale_days,
+    dist_info = compute_dist_info(
         spatial_dist=dataset.spatial_dists,
         temporal_dist=dataset.temporal_dists,
+        spatial_scale_km=dataset.spatial_scale_km,
+        temporal_scale_days=dataset.temporal_scale_days,
+        blind_percentile=args.blind_percentile,
     )
     collator = JSDMDataCollator(
         mlm_probability=config.mlm_probability,
-        mask_value=config.mask_value_init,
-        cluster_labels=cluster_info["cluster_labels"],
+        combined_dist=dist_info["combined_dist"],
+        blind_threshold=dist_info["blind_threshold"],
     )
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False,
@@ -130,13 +122,13 @@ def main():
     )
 
     if args.command == "predict":
-        result = predict_masked(model, loader, cluster_info, device, species_names)
+        result = predict_masked(model, loader, dist_info, device, species_names)
         result.to_parquet(args.output_path, index=False)
         print(f"Predictions saved to {args.output_path}")
 
     elif args.command == "interactions":
         interaction_dfs = extract_interactions(
-            model, loader, cluster_info, device, species_names, args.num_batches
+            model, loader, dist_info, device, species_names, args.num_batches
         )
         last = max(interaction_dfs.keys())
         interaction_dfs[last].to_parquet(args.output_path)

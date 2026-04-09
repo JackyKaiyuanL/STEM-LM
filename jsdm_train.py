@@ -23,7 +23,7 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 
-def train_epoch(model, loader, optimizer, scheduler, device, cluster_info, epoch,
+def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
                 loss_weight=None, log_interval=50):
     model.train()
     total_loss, total_correct, total_masked, num_batches = 0, 0, 0, 0
@@ -42,12 +42,8 @@ def train_epoch(model, loader, optimizer, scheduler, device, cluster_info, epoch
             env_data=batch["env_data"],
             labels=batch["labels"],
             loss_weight=w,
-            cluster_dict=cluster_info["cluster_dict"],
-            cluster_labels=cluster_info["cluster_labels"],
-            in_cluster_spatial_dist=cluster_info["in_cluster_spatial_dist"],
-            in_cluster_temporal_dist=cluster_info["in_cluster_temporal_dist"],
-            spatial_dist_pairwise=cluster_info["spatial_dist_pairwise"],
-            temporal_dist_pairwise=cluster_info["temporal_dist_pairwise"],
+            spatial_dist_pairwise=dist_info["spatial_dist_pairwise"],
+            temporal_dist_pairwise=dist_info["temporal_dist_pairwise"],
         )
 
         loss = output.loss
@@ -79,7 +75,7 @@ def train_epoch(model, loader, optimizer, scheduler, device, cluster_info, epoch
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, cluster_info):
+def evaluate(model, loader, device, dist_info):
     model.eval()
     total_loss, num_batches = 0, 0
     S = model.config.num_species
@@ -95,12 +91,8 @@ def evaluate(model, loader, device, cluster_info):
             target_site_idx=batch["target_site_idx"],
             env_data=batch["env_data"],
             labels=batch["labels"],
-            cluster_dict=cluster_info["cluster_dict"],
-            cluster_labels=cluster_info["cluster_labels"],
-            in_cluster_spatial_dist=cluster_info["in_cluster_spatial_dist"],
-            in_cluster_temporal_dist=cluster_info["in_cluster_temporal_dist"],
-            spatial_dist_pairwise=cluster_info["spatial_dist_pairwise"],
-            temporal_dist_pairwise=cluster_info["temporal_dist_pairwise"],
+            spatial_dist_pairwise=dist_info["spatial_dist_pairwise"],
+            temporal_dist_pairwise=dist_info["temporal_dist_pairwise"],
         )
         total_loss += output.loss.item()
         num_batches += 1
@@ -137,10 +129,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train ST-JSDM")
     parser.add_argument("csv_path", type=str)
     parser.add_argument("--num_source_sites", type=int, default=64)
-    parser.add_argument("--cluster_threshold", type=float, default=None,
-                        help="Fixed ST cluster threshold. Default: auto (percentile-based)")
-    parser.add_argument("--cluster_percentile", type=float, default=5.0,
-                        help="Percentile of pairwise distances used when cluster_threshold is auto")
+    parser.add_argument("--blind_percentile", type=float, default=2.0,
+                        help="Percentile of pairwise distances used as proximity blind threshold")
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--num_attention_heads", type=int, default=8)
     parser.add_argument("--num_hidden_layers", type=int, default=4)
@@ -152,7 +142,6 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--mlm_probability", type=float, default=0.15)
-    parser.add_argument("--mask_value", type=float, default=-1.0)
     parser.add_argument("--train_frac", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -173,14 +162,12 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Data
-    train_loader, val_loader, dataset, cluster_info = create_dataloaders(
+    train_loader, val_loader, dataset, dist_info = create_dataloaders(
         csv_path=args.csv_path,
         batch_size=args.batch_size,
         num_source_sites=args.num_source_sites,
         mlm_probability=args.mlm_probability,
-        cluster_threshold=args.cluster_threshold,
-        cluster_percentile=args.cluster_percentile,
-        mask_value=args.mask_value,
+        blind_percentile=args.blind_percentile,
         train_frac=args.train_frac,
         num_workers=args.num_workers,
         seed=args.seed,
@@ -204,10 +191,9 @@ def main():
     # Config
     config = JSDMConfig(
         num_species=dataset.num_species,
-        mask_value_init=args.mask_value,
         num_source_sites=args.num_source_sites,
-        max_spatial_dist=cluster_info["max_spatial_dist"] * 1.1,
-        max_temporal_dist=max(cluster_info["max_temporal_dist"], cluster_info["temporal_scale_days"]) * 1.1,
+        max_spatial_dist=dist_info["max_spatial_dist"] * 1.1,
+        max_temporal_dist=max(dist_info["max_temporal_dist"], dist_info["temporal_scale_days"]) * 1.1,
         num_env_vars=dataset.num_env_vars,
         num_env_groups=args.num_env_groups,
         hidden_size=args.hidden_size,
@@ -225,8 +211,7 @@ def main():
     # Model
     model = JSDMForMaskedSpeciesPrediction(config).to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Model: {num_params:,} parameters, {config.num_species} species, "
-                f"{cluster_info['num_clusters']} ST clusters")
+    logger.info(f"Model: {num_params:,} parameters, {config.num_species} species")
 
     if args.gradient_checkpointing:
         model.model.encoder.gradient_checkpointing = True
@@ -243,9 +228,9 @@ def main():
     for epoch in range(1, args.num_epochs + 1):
         t0 = time.time()
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scheduler, device, cluster_info, epoch, loss_weight
+            model, train_loader, optimizer, scheduler, device, dist_info, epoch, loss_weight
         )
-        val_loss, val_acc, val_auc, _ = evaluate(model, val_loader, device, cluster_info)
+        val_loss, val_acc, val_auc, _ = evaluate(model, val_loader, device, dist_info)
         elapsed = time.time() - t0
         current_lr = scheduler.get_last_lr()[0]
         logger.info(
@@ -272,7 +257,7 @@ def main():
     # Per-species AUC on best model
     logger.info("Evaluating best model for per-species AUC...")
     model.load_state_dict(torch.load(os.path.join(args.output_dir, "best_model.pt"), map_location=device))
-    _, _, best_mean_auc, per_species_aucs = evaluate(model, val_loader, device, cluster_info)
+    _, _, best_mean_auc, per_species_aucs = evaluate(model, val_loader, device, dist_info)
     logger.info(f"Best model val AUC (mean): {best_mean_auc:.4f}")
     auc_rows = [(dataset.species_cols[s], per_species_aucs[s]) for s in sorted(per_species_aucs)]
     import pandas as pd
@@ -294,12 +279,8 @@ def main():
                 source_idx=batch["source_idx"],
                 target_site_idx=batch["target_site_idx"], env_data=batch["env_data"],
                 labels=batch["labels"],
-                cluster_dict=cluster_info["cluster_dict"],
-                cluster_labels=cluster_info["cluster_labels"],
-                in_cluster_spatial_dist=cluster_info["in_cluster_spatial_dist"],
-                in_cluster_temporal_dist=cluster_info["in_cluster_temporal_dist"],
-                spatial_dist_pairwise=cluster_info["spatial_dist_pairwise"],
-                temporal_dist_pairwise=cluster_info["temporal_dist_pairwise"],
+                spatial_dist_pairwise=dist_info["spatial_dist_pairwise"],
+                temporal_dist_pairwise=dist_info["temporal_dist_pairwise"],
                 output_attentions=True,
             )
             interactions.append(extract_interaction_matrix(output).cpu())
