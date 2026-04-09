@@ -143,6 +143,10 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--mlm_probability", type=float, default=0.15)
     parser.add_argument("--train_frac", type=float, default=0.8)
+    parser.add_argument("--test_frac", type=float, default=0.1,
+                        help="Fraction of data held out as test set for final AUC. "
+                             "Val = 1 - train_frac - test_frac. Set to 0 to disable "
+                             "(final AUC reported on val, same as early-stopping set).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--output_dir", type=str, default="./jsdm_output")
@@ -154,6 +158,10 @@ def main():
                              "For simulated or arbitrary 2D coordinates (not geographic degrees).")
     parser.add_argument("--class_weighting", action="store_true",
                         help="Up-weight rare species using effective number weighting (beta=0.999)")
+    parser.add_argument("--env_cols", nargs="+", default=None,
+                        help="Explicit list of env column names. If not set, columns with 'env_' "
+                             "prefix are used. Useful for datasets with non-prefixed env columns "
+                             "(e.g. annualtemp, annualprec).")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -162,15 +170,17 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Data
-    train_loader, val_loader, dataset, dist_info = create_dataloaders(
+    train_loader, val_loader, test_loader, dataset, dist_info = create_dataloaders(
         csv_path=args.csv_path,
         batch_size=args.batch_size,
         num_source_sites=args.num_source_sites,
         mlm_probability=args.mlm_probability,
         blind_percentile=args.blind_percentile,
         train_frac=args.train_frac,
+        test_frac=args.test_frac,
         num_workers=args.num_workers,
         seed=args.seed,
+        env_cols=args.env_cols,
         spatial_scale_km=args.spatial_scale_km,
         temporal_scale_days=args.temporal_scale_days,
         euclidean_coords=args.euclidean_coords,
@@ -254,11 +264,15 @@ def main():
                 "val_loss": val_loss,
             }, os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"))
 
-    # Per-species AUC on best model
+    # Per-species AUC on best model — use held-out test set if available,
+    # otherwise fall back to val (note: val was used for early stopping,
+    # so AUC on val is optimistic).
     logger.info("Evaluating best model for per-species AUC...")
     model.load_state_dict(torch.load(os.path.join(args.output_dir, "best_model.pt"), map_location=device))
-    _, _, best_mean_auc, per_species_aucs = evaluate(model, val_loader, device, dist_info)
-    logger.info(f"Best model val AUC (mean): {best_mean_auc:.4f}")
+    eval_loader = test_loader if test_loader is not None else val_loader
+    eval_split  = "test" if test_loader is not None else "val (no test set)"
+    _, _, best_mean_auc, per_species_aucs = evaluate(model, eval_loader, device, dist_info)
+    logger.info(f"Best model {eval_split} AUC (mean): {best_mean_auc:.4f}")
     auc_rows = [(dataset.species_cols[s], per_species_aucs[s]) for s in sorted(per_species_aucs)]
     import pandas as pd
     pd.DataFrame(auc_rows, columns=["species", "auc"]).to_csv(

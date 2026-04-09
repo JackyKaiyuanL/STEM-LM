@@ -260,7 +260,7 @@ def compute_dist_info(
 def create_dataloaders(
     csv_path, batch_size=32, num_source_sites=64, mlm_probability=0.15,
     blind_percentile=2.0,
-    train_frac=0.8, num_workers=0,
+    train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
     euclidean_coords=False,
 ):
@@ -286,10 +286,12 @@ def create_dataloaders(
     np.random.seed(seed)
     n = len(dataset)
     indices = np.random.permutation(n)
-    split = int(n * train_frac)
-
-    train_dataset = torch.utils.data.Subset(dataset, indices[:split])
-    val_dataset = torch.utils.data.Subset(dataset, indices[split:])
+    n_train = int(n * train_frac)
+    n_test  = int(n * test_frac)
+    # val gets the remainder: indices[n_train : n - n_test]
+    train_dataset = torch.utils.data.Subset(dataset, indices[:n_train])
+    val_dataset   = torch.utils.data.Subset(dataset, indices[n_train:n - n_test if n_test > 0 else n])
+    test_dataset  = torch.utils.data.Subset(dataset, indices[n - n_test:]) if n_test > 0 else None
 
     collator = JSDMDataCollator(
         mlm_probability=mlm_probability,
@@ -299,7 +301,12 @@ def create_dataloaders(
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                                collate_fn=collator, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                             collate_fn=collator, num_workers=num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                               collate_fn=collator, num_workers=num_workers, pin_memory=True)
+    test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                               collate_fn=collator, num_workers=num_workers, pin_memory=True) if test_dataset else None
 
-    return train_loader, val_loader, dataset, dist_info
+    n_val = len(val_dataset)
+    print(f"Split: {n_train} train / {n_val} val / {n_test} test")
+
+    return train_loader, val_loader, test_loader, dataset, dist_info
