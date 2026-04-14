@@ -47,7 +47,10 @@ def euclidean_pairwise(x: np.ndarray, y: np.ndarray) -> np.ndarray:
 def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
     if value is None:
         if fallback <= 0:
-            raise ValueError(f"Cannot auto-scale {name}: max pairwise distance is {fallback}")
+            # Static dataset: all distances are zero, scale is irrelevant.
+            # Return 1.0 so downstream divisions are safe (0/1 = 0).
+            print(f"  Note: {name} auto-set to 1.0 (all pairwise distances are 0 — static dataset)")
+            return 1.0
         return float(fallback)
     if value <= 0:
         raise ValueError(f"{name} must be > 0, got {value}")
@@ -66,6 +69,7 @@ class JSDMDataset(Dataset):
         spatial_scale_km: Optional[float] = None,
         temporal_scale_days: Optional[float] = None,
         euclidean_coords: bool = False,
+        no_time: bool = False,
     ):
         super().__init__()
         self.num_source_sites = num_source_sites
@@ -79,13 +83,20 @@ class JSDMDataset(Dataset):
                 + ". Please impute or drop missing values before training."
             )
 
-        if df[time_col].dtype == "object" or pd.api.types.is_datetime64_any_dtype(df[time_col]):
-            df[time_col] = pd.to_datetime(df[time_col])
-            df[time_col] = (df[time_col] - df[time_col].min()).dt.days.astype(float)
-        else:
-            df[time_col] = df[time_col].astype(float)
+        # Time is optional: disabled explicitly via no_time=True, or absent from CSV
+        has_time = (not no_time) and (time_col in df.columns)
+        if not has_time:
+            reason = "--no_time" if no_time else f"column '{time_col}' not found"
+            print(f"  Time ignored ({reason}) — purely spatial model")
 
-        coord_cols = [time_col, lat_col, lon_col]
+        if has_time:
+            if df[time_col].dtype == "object" or pd.api.types.is_datetime64_any_dtype(df[time_col]):
+                df[time_col] = pd.to_datetime(df[time_col])
+                df[time_col] = (df[time_col] - df[time_col].min()).dt.days.astype(float)
+            else:
+                df[time_col] = df[time_col].astype(float)
+
+        coord_cols = ([time_col] if has_time else []) + [lat_col, lon_col]
         if env_cols is None:
             env_cols     = [c for c in df.columns if c not in coord_cols and c.startswith("env_")]
             species_cols = [c for c in df.columns if c not in coord_cols and not c.startswith("env_")]
@@ -100,29 +111,33 @@ class JSDMDataset(Dataset):
         self.coords = df[[lat_col, lon_col]].values.astype(np.float32)
         self.lats = self.coords[:, 0]
         self.lons = self.coords[:, 1]
-        self.times = df[time_col].values.astype(np.float32)
+        N = len(df)
+        self.times = df[time_col].values.astype(np.float32) if has_time else np.zeros(N, dtype=np.float32)
         self.species_data = df[species_cols].values.astype(np.float32)
         self.env_data = (
             df[env_cols].values.astype(np.float32) if env_cols
-            else np.zeros((len(df), 1), dtype=np.float32)
+            else np.zeros((N, 1), dtype=np.float32)
         )
 
-        N = len(df)
         print(f"Dataset: {N} observations, {self.num_species} species, {self.num_env_vars} env vars")
         print("Computing pairwise distances...")
         if euclidean_coords:
             self.spatial_dists = euclidean_pairwise(self.lats, self.lons)
         else:
             self.spatial_dists = haversine_pairwise(self.lats, self.lons)
-        self.temporal_dists = cdist(
-            self.times.reshape(-1, 1), self.times.reshape(-1, 1)
-        ).astype(np.float32)
+        if has_time:
+            self.temporal_dists = cdist(
+                self.times.reshape(-1, 1), self.times.reshape(-1, 1)
+            ).astype(np.float32)
+        else:
+            self.temporal_dists = np.zeros((N, N), dtype=np.float32)
         self.spatial_scale_km = _resolve_scale(
             spatial_scale_km, float(self.spatial_dists.max()), "spatial_scale_km"
         )
-        self.temporal_scale_days = _resolve_scale(
+        self.temporal_scale_days = 1.0 if not has_time else _resolve_scale(
             temporal_scale_days, float(self.temporal_dists.max()), "temporal_scale_days"
         )
+        self.source_pool = None  # None = all rows; set to train indices for h3/blocked splits
         print("Done.")
 
     def __len__(self):
@@ -139,8 +154,15 @@ class JSDMDataset(Dataset):
         combined_dist = np.sqrt(spatial ** 2 + temporal ** 2)
         combined_dist[idx] = np.inf
         inv_dist = 1.0 / (combined_dist + 1e-6)
-        probs = inv_dist / inv_dist.sum()
-        source_idx = np.random.choice(N_total, size=N, replace=(N > N_total - 1), p=probs)
+
+        if self.source_pool is not None:
+            pool = self.source_pool
+            p = inv_dist[pool]
+            p = p / p.sum()
+            source_idx = pool[np.random.choice(len(pool), size=N, replace=(N > len(pool) - 1), p=p)]
+        else:
+            probs = inv_dist / inv_dist.sum()
+            source_idx = np.random.choice(N_total, size=N, replace=(N > N_total - 1), p=probs)
 
         source_species = self.species_data[source_idx].T  # (S, N)
         source_env = self.env_data[source_idx]             # (N, E)
@@ -257,12 +279,78 @@ def compute_dist_info(
     }
 
 
+def grid_block_split(x, y, n_cells=20, train_frac=0.8, test_frac=0.1, seed=42):
+    """
+    Split by a regular n_cells x n_cells grid on arbitrary 2D (x, y) coordinates.
+    For Euclidean/simulated datasets where H3 is meaningless.
+    Each cell assigned entirely to one split.
+    """
+    x, y = np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
+    xi = np.floor((x - x.min()) / (x.ptp() + 1e-9) * n_cells).clip(0, n_cells - 1).astype(int)
+    yi = np.floor((y - y.min()) / (y.ptp() + 1e-9) * n_cells).clip(0, n_cells - 1).astype(int)
+    cell_ids = xi * n_cells + yi
+    unique_cells = np.unique(cell_ids)
+
+    rng = np.random.RandomState(seed)
+    perm = rng.permutation(len(unique_cells))
+    unique_cells = unique_cells[perm]
+
+    n = len(unique_cells)
+    n_test = max(1, round(n * test_frac))
+    n_val  = max(1, round(n * (1 - train_frac - test_frac)))
+    test_cells = set(unique_cells[:n_test])
+    val_cells  = set(unique_cells[n_test : n_test + n_val])
+
+    train_idx = np.where(~np.isin(cell_ids, list(test_cells | val_cells)))[0]
+    val_idx   = np.where( np.isin(cell_ids, list(val_cells)))[0]
+    test_idx  = np.where( np.isin(cell_ids, list(test_cells)))[0]
+
+    n_cells_train = n - n_test - n_val
+    print(f"  Grid {n_cells}×{n_cells} | {n} cells → {n_cells_train} train / {n_val} val / {n_test} test cells")
+    return train_idx, val_idx, test_idx
+
+
+def h3_block_split(lats, lons, resolution=4, train_frac=0.8, test_frac=0.1, seed=42):
+    """
+    Split observation indices into train/val/test by H3 spatial blocks.
+    Each H3 cell at the given resolution is assigned entirely to one split.
+    Returns (train_indices, val_indices, test_indices) as numpy arrays.
+    """
+    try:
+        import h3 as h3lib
+    except ImportError:
+        raise ImportError(
+            "h3 package required for --fold h3. Install with: pip install h3"
+        )
+    cells = np.array([h3lib.latlng_to_cell(float(lat), float(lon), resolution)
+                      for lat, lon in zip(lats, lons)])
+    unique_cells = np.unique(cells)
+    rng = np.random.RandomState(seed)
+    perm = rng.permutation(len(unique_cells))
+    unique_cells = unique_cells[perm]
+
+    n = len(unique_cells)
+    n_test = max(1, round(n * test_frac))
+    n_val  = max(1, round(n * (1 - train_frac - test_frac)))
+    test_cells  = set(unique_cells[:n_test])
+    val_cells   = set(unique_cells[n_test : n_test + n_val])
+
+    train_idx = np.where(~np.isin(cells, list(test_cells | val_cells)))[0]
+    val_idx   = np.where( np.isin(cells, list(val_cells)))[0]
+    test_idx  = np.where( np.isin(cells, list(test_cells)))[0]
+
+    n_cells_train = n - n_test - n_val
+    print(f"  H3 res={resolution} | {n} cells → {n_cells_train} train / {n_val} val / {n_test} test cells")
+    return train_idx, val_idx, test_idx
+
+
 def create_dataloaders(
     csv_path, batch_size=32, num_source_sites=64, mlm_probability=0.15,
     blind_percentile=2.0,
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
-    euclidean_coords=False,
+    euclidean_coords=False, no_time=False,
+    fold_method="random", h3_resolution=2, grid_cells=20,
 ):
     dataset = JSDMDataset(
         csv_path=csv_path,
@@ -271,6 +359,7 @@ def create_dataloaders(
         spatial_scale_km=spatial_scale_km,
         temporal_scale_days=temporal_scale_days,
         euclidean_coords=euclidean_coords,
+        no_time=no_time,
     )
 
     print("Computing distance info...")
@@ -282,16 +371,39 @@ def create_dataloaders(
         blind_percentile=blind_percentile,
     )
 
-    # seed after distance computation so train/val split matches other baselines
-    np.random.seed(seed)
-    n = len(dataset)
-    indices = np.random.permutation(n)
-    n_train = int(n * train_frac)
-    n_test  = int(n * test_frac)
-    # val gets the remainder: indices[n_train : n - n_test]
-    train_dataset = torch.utils.data.Subset(dataset, indices[:n_train])
-    val_dataset   = torch.utils.data.Subset(dataset, indices[n_train:n - n_test if n_test > 0 else n])
-    test_dataset  = torch.utils.data.Subset(dataset, indices[n - n_test:]) if n_test > 0 else None
+    # Split into train / val / test
+    if fold_method == "h3":
+        if euclidean_coords:
+            raise ValueError("--fold h3 requires real lat/lon coordinates. Use --fold grid for euclidean datasets.")
+        train_indices, val_indices, test_indices = h3_block_split(
+            dataset.lats, dataset.lons,
+            resolution=h3_resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
+        )
+    elif fold_method == "grid":
+        if not euclidean_coords:
+            raise ValueError("--fold grid is for euclidean/simulated datasets. Use --fold h3 for real lat/lon.")
+        train_indices, val_indices, test_indices = grid_block_split(
+            dataset.lats, dataset.lons,
+            n_cells=grid_cells, train_frac=train_frac, test_frac=test_frac, seed=seed,
+        )
+    else:  # random (default)
+        np.random.seed(seed)
+        n = len(dataset)
+        indices = np.random.permutation(n)
+        n_train = int(n * train_frac)
+        n_test  = int(n * test_frac)
+        train_indices = indices[:n_train]
+        val_indices   = indices[n_train : n - n_test if n_test > 0 else n]
+        test_indices  = indices[n - n_test:] if n_test > 0 else np.array([], dtype=int)
+
+    # Restrict source pool to training rows for blocked splits so val/test
+    # targets cannot use held-out species observations as context.
+    if fold_method != "random":
+        dataset.source_pool = train_indices
+
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    val_dataset   = torch.utils.data.Subset(dataset, val_indices)
+    test_dataset  = torch.utils.data.Subset(dataset, test_indices) if len(test_indices) > 0 else None
 
     collator = JSDMDataCollator(
         mlm_probability=mlm_probability,
@@ -306,7 +418,9 @@ def create_dataloaders(
     test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
                                collate_fn=collator, num_workers=num_workers, pin_memory=True) if test_dataset else None
 
-    n_val = len(val_dataset)
-    print(f"Split: {n_train} train / {n_val} val / {n_test} test")
+    n_train = len(train_indices)
+    n_val   = len(val_indices)
+    n_test  = len(test_indices)
+    print(f"Split ({fold_method}): {n_train} train / {n_val} val / {n_test} test")
 
     return train_loader, val_loader, test_loader, dataset, dist_info

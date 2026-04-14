@@ -87,6 +87,8 @@ def main():
     parser.add_argument("--blind_percentile", type=float, default=2.0)
     parser.add_argument("--spatial_scale_km", type=float, default=None)
     parser.add_argument("--temporal_scale_days", type=float, default=None)
+    parser.add_argument("--no_time", action="store_true",
+                        help="Ignore time column. Auto-set if model was trained without time.")
     parser.add_argument("--euclidean_coords", action="store_true",
                         help="Use Euclidean distance instead of haversine (for simulated data).")
     args = parser.parse_args()
@@ -97,12 +99,14 @@ def main():
     with open(os.path.join(args.model_dir, "species_names.json")) as f:
         species_names = json.load(f)
 
+    no_time = args.no_time or (not config.use_temporal)
     dataset = JSDMDataset(
         csv_path=args.csv_path,
         num_source_sites=config.num_source_sites,
         spatial_scale_km=args.spatial_scale_km,
         temporal_scale_days=args.temporal_scale_days,
         euclidean_coords=args.euclidean_coords,
+        no_time=no_time,
     )
     dist_info = compute_dist_info(
         spatial_dist=dataset.spatial_dists,
