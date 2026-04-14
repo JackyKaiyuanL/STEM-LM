@@ -47,6 +47,7 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
         )
 
         loss = output.loss
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -115,7 +116,7 @@ def evaluate(model, loader, device, dist_info):
             arr_l = np.array(species_labels[s])
             total_correct += ((arr_p > 0.5) == arr_l).sum()
             total_masked  += len(arr_l)
-            if len(set(species_labels[s])) == 2:
+            if len(set(species_labels[s])) == 2 and not np.isnan(arr_p).any():
                 auc_s = roc_auc_score(arr_l, arr_p)
                 aucs.append(auc_s)
                 per_species_aucs[s] = auc_s
@@ -153,15 +154,30 @@ def main():
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--spatial_scale_km", type=float, default=None)
     parser.add_argument("--temporal_scale_days", type=float, default=None)
+    parser.add_argument("--no_time", action="store_true",
+                        help="Disable temporal FIRE bias. Set automatically when all "
+                             "time values in the CSV are identical (static datasets).")
     parser.add_argument("--euclidean_coords", action="store_true",
                         help="Use Euclidean distance instead of haversine. "
                              "For simulated or arbitrary 2D coordinates (not geographic degrees).")
     parser.add_argument("--class_weighting", action="store_true",
-                        help="Up-weight rare species using effective number weighting (beta=0.999)")
+                        help="Up-weight rare species using effective number weighting")
+    parser.add_argument("--class_weighting_beta", type=float, default=0.999,
+                        help="Beta for effective number class weighting (default 0.999). "
+                             "Lower values (e.g. 0.99) reduce the weight on rare species.")
     parser.add_argument("--env_cols", nargs="+", default=None,
                         help="Explicit list of env column names. If not set, columns with 'env_' "
                              "prefix are used. Useful for datasets with non-prefixed env columns "
                              "(e.g. annualtemp, annualprec).")
+    parser.add_argument("--fold", choices=["random", "h3", "grid"], default="random",
+                        help="Train/val/test split strategy. 'random': shuffled rows (default). "
+                             "'h3': spatial blocks via H3 hexagonal grid (real lat/lon only). "
+                             "'grid': spatial blocks via regular 2D grid (euclidean_coords only).")
+    parser.add_argument("--h3_resolution", type=int, default=2,
+                        help="H3 resolution for --fold h3 (default 2, ~183km edge). "
+                             "Larger number = finer cells (res 1=483km, 2=183km, 3=69km, 4=26km).")
+    parser.add_argument("--grid_cells", type=int, default=20,
+                        help="Grid side length for --fold grid (default 20 → 20×20 cells).")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -184,6 +200,10 @@ def main():
         spatial_scale_km=args.spatial_scale_km,
         temporal_scale_days=args.temporal_scale_days,
         euclidean_coords=args.euclidean_coords,
+        no_time=args.no_time,
+        fold_method=args.fold,
+        h3_resolution=args.h3_resolution,
+        grid_cells=args.grid_cells,
     )
 
     # Per-species loss weighting (effective number, beta=0.999)
@@ -191,19 +211,25 @@ def main():
     if args.class_weighting:
         train_indices = train_loader.dataset.indices
         n_s = dataset.species_data[train_indices].sum(axis=0).clip(min=1)  # (S,)
-        beta = 0.999
+        beta = args.class_weighting_beta
         effective_n = (1 - beta ** n_s) / (1 - beta)
         w = 1.0 / effective_n
         w = w / w.mean()
         loss_weight = torch.tensor(w, dtype=torch.float32)
         logger.info(f"Class weighting: weight range [{w.min():.3f}, {w.max():.3f}]")
 
+    # use_temporal mirrors what the dataset actually did with time
+    use_temporal = dist_info["max_temporal_dist"] > 0
+    if not use_temporal:
+        logger.info("Temporal FIRE bias disabled (no temporal variation in data)")
+
     # Config
     config = JSDMConfig(
         num_species=dataset.num_species,
         num_source_sites=args.num_source_sites,
         max_spatial_dist=dist_info["max_spatial_dist"] * 1.1,
-        max_temporal_dist=max(dist_info["max_temporal_dist"], dist_info["temporal_scale_days"]) * 1.1,
+        max_temporal_dist=dist_info["max_temporal_dist"] * 1.1,
+        use_temporal=use_temporal,
         num_env_vars=dataset.num_env_vars,
         num_env_groups=args.num_env_groups,
         hidden_size=args.hidden_size,

@@ -48,6 +48,7 @@ class JSDMConfig:
     # Distance normalization (set from data at training time)
     max_spatial_dist: float = 180.0
     max_temporal_dist: float = 365.0
+    use_temporal: bool = True          # False for static datasets where all times are equal
 
     # Ecological variables
     num_env_vars: int = 10          # number of environmental covariates
@@ -82,7 +83,7 @@ class FIREDistanceBias(nn.Module):
 
     def __init__(self, max_dist: float, fire_hidden_size: int = 32):
         super().__init__()
-        self.c = nn.Parameter(torch.tensor(100.0))
+        self.log_c = nn.Parameter(torch.tensor(0.0))   # softplus(0)+1e-4 ≈ 0.693+1e-4
         self.mlp = nn.Sequential(
             nn.Linear(1, fire_hidden_size, bias=False),
             nn.SiLU(),
@@ -98,9 +99,10 @@ class FIREDistanceBias(nn.Module):
             bias: (...) learned bias values
         """
         dist = dist.unsqueeze(-1).float()
-        c = self.c.clamp(min=0)
-        dist = torch.log(c * dist + 1) / torch.log(c * self.max_dist + 1)
-        return self.mlp(dist).squeeze(-1)
+        c = F.softplus(self.log_c) + 1e-4
+        denom = torch.log1p(c * self.max_dist)
+        x = torch.log1p(c * dist) / denom
+        return self.mlp(x).squeeze(-1)
 
 
 
@@ -165,6 +167,7 @@ class EcoSourceModule(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         self.num_env_groups = config.num_env_groups
+        self.env_norm = nn.LayerNorm(config.num_env_vars)  # normalize raw env values before projection
         self.proj = nn.Linear(config.num_env_vars, config.hidden_size)
         self.group_query = nn.Parameter(
             torch.randn(config.num_env_groups, config.hidden_size) * 0.02
@@ -182,7 +185,7 @@ class EcoSourceModule(nn.Module):
             eco_embeddings: (B, C_eco, H)
         """
         B = env_data.size(0)
-        site_emb = self.proj(env_data)  # (B, N, H)
+        site_emb = self.proj(self.env_norm(env_data))  # (B, N, H)
         k = self.key_proj(site_emb)
         v = self.value_proj(site_emb)
         q = self.group_query.unsqueeze(0).expand(B, -1, -1)  # (B, C_eco, H)
@@ -374,13 +377,13 @@ class STColAttention(nn.Module):
         super().__init__()
         self.cross_attn = STCrossAttention(config)
         self.output = STCrossOutput(config)
+        self.use_temporal = config.use_temporal
         self.fire_spatial = FIREDistanceBias(config.max_spatial_dist, config.fire_hidden_size)
-        self.fire_temporal = FIREDistanceBias(config.max_temporal_dist, config.fire_hidden_size)
-        # Per-species log-scale for spatial and temporal FIRE biases.
-        # Both init to 0 → exp(0)=1, so initial behavior is identical to a shared bias.
-        # After training, these reveal which species respond more to space vs time.
+        if self.use_temporal:
+            self.fire_temporal = FIREDistanceBias(config.max_temporal_dist, config.fire_hidden_size)
         self.species_spatial_log_scale = nn.Parameter(torch.zeros(config.num_species))
-        self.species_temporal_log_scale = nn.Parameter(torch.zeros(config.num_species))
+        if self.use_temporal:
+            self.species_temporal_log_scale = nn.Parameter(torch.zeros(config.num_species))
 
     def forward(
         self, hidden_states, source_embeddings,
@@ -389,15 +392,13 @@ class STColAttention(nn.Module):
         # Compute per-species FIRE distance bias
         st_dist_bias = None
         if st_dist is not None:
-            spatial_bias = self.fire_spatial(st_dist[..., 0])   # (B, T, C_st)
-            temporal_bias = self.fire_temporal(st_dist[..., 1])  # (B, T, C_st)
-            s_scale = self.species_spatial_log_scale.exp()   # (S,)
-            t_scale = self.species_temporal_log_scale.exp()  # (S,)
-            # (B, T, C_st) → (B, S, T, C_st) weighted per species
-            st_dist_bias = (
-                spatial_bias[:, None, :, :] * s_scale[None, :, None, None]
-                + temporal_bias[:, None, :, :] * t_scale[None, :, None, None]
-            )
+            spatial_bias = self.fire_spatial(st_dist[..., 0])          # (B, T, C_st)
+            s_scale = F.softplus(self.species_spatial_log_scale) + 1e-4
+            st_dist_bias = spatial_bias[:, None, :, :] * s_scale[None, :, None, None]
+            if self.use_temporal:
+                temporal_bias = self.fire_temporal(st_dist[..., 1])  # (B, T, C_st)
+                t_scale = F.softplus(self.species_temporal_log_scale) + 1e-4
+                st_dist_bias = st_dist_bias + temporal_bias[:, None, :, :] * t_scale[None, :, None, None]
             st_dist_bias = st_dist_bias[:, :, None, :, :]  # (B, S, 1, T, C_st)
 
         cross_outputs = self.cross_attn(
@@ -697,12 +698,13 @@ class JSDMModel(nn.Module):
         st_dist = torch.stack([target_to_source_sp, target_to_source_tp], dim=-1)  # (B, T, N, 2)
 
         # 5. Encode — no attention mask needed (blinding handled in collator)
-        return self.encoder(
+        encoder_out = self.encoder(
             hidden_states, source_emb, eco_emb,
             st_attention_mask=None, st_dist=st_dist,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
+        return encoder_out
 
 
 # =============================================================================
