@@ -183,11 +183,13 @@ class JSDMDataset(Dataset):
 
         source_species = self.species_data[source_idx].T  # (S, N)
         source_env = self.env_data[source_idx]             # (N, E)
+        target_env = self.env_data[idx]                    # (E,)
 
         return {
             "target_species": torch.tensor(target_species, dtype=torch.float32),
             "source_species": torch.tensor(source_species, dtype=torch.float32),
             "source_env": torch.tensor(source_env, dtype=torch.float32),
+            "target_env": torch.tensor(target_env, dtype=torch.float32),
             "target_idx": torch.tensor(idx, dtype=torch.long),
             "source_idx": torch.tensor(source_idx, dtype=torch.long),
         }
@@ -247,6 +249,7 @@ class JSDMDataCollator:
         batch["source_ids"] = source_ids                 # (B, S, N) long
         batch["labels"] = labels.unsqueeze(-1)
         batch["env_data"] = batch.pop("source_env")
+        batch["target_env"] = batch["target_env"]        # (B, E) — target site's own env vars
         batch["target_site_idx"] = batch.pop("target_idx").unsqueeze(-1)
 
         del batch["target_species"]

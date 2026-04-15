@@ -228,20 +228,24 @@ class SpeciesSelfAttention(nn.Module):
         x = x.view(*new_x_shape)
         return x.transpose(-2, -3)
 
-    def forward(self, hidden_states, output_attentions=False):
+    def forward(self, hidden_states, species_emb, output_attentions=False):
         """
         Args:
             hidden_states: (B, T, S, H) transposed before calling
+            species_emb:   (1, 1, S, H) identity-only embeddings — no token state.
+                           K and V are projected from this so self-attention cannot
+                           read off presence/absence state from key/value tokens.
+                           Q remains from hidden_states (full state + identity).
         """
         query_layer = self.transpose_for_scores(
             self.query(hidden_states[:, :1, ...])
         )  # (B, 1, A, S, D)
         key_layer = self.transpose_for_scores(
-            self.key(hidden_states[:, :1, ...])
-        )  # (B, 1, A, S, D)
+            self.key(species_emb)
+        )  # (1, 1, A, S, D) — broadcasts over batch
         value_layer = self.transpose_for_scores(
-            self.value(hidden_states)
-        )  # (B, T, A, S, D)
+            self.value(species_emb)
+        )  # (1, 1, A, S, D) — broadcasts over batch and T
 
         if output_attentions:
             attn_scores = torch.matmul(
@@ -283,8 +287,8 @@ class SpeciesRowAttention(nn.Module):
         self.self_attn = SpeciesSelfAttention(config)
         self.output = SpeciesSelfOutput(config)
 
-    def forward(self, hidden_states, output_attentions=False):
-        self_outputs = self.self_attn(hidden_states, output_attentions)
+    def forward(self, hidden_states, species_emb, output_attentions=False):
+        self_outputs = self.self_attn(hidden_states, species_emb, output_attentions)
         output = (self.output(self_outputs[0]),)  # project+dropout only; residual in JSDMAttention
         if output_attentions:
             output = output + (self_outputs[1],)
@@ -512,12 +516,16 @@ class JSDMAttention(nn.Module):
 
     def forward(
         self, hidden_states, st_source_embeddings, eco_embeddings,
+        species_emb,
         st_attention_mask=None, st_dist=None,
         output_attentions=False,
     ):
         # 1. Pre-norm → species self-attention → residual  (B,S,T,H) ↔ (B,T,S,H)
+        # hidden_states transposed to (B,T,S,H) for row attention.
+        # species_emb already in (1,1,S,H) = (B,T,S,H) broadcast format — no transpose needed.
         row_output = self.row_attention(
             hidden_states=self.row_norm(hidden_states).transpose(-2, -3),
+            species_emb=species_emb,
             output_attentions=output_attentions,
         )
         h = hidden_states + row_output[0].transpose(-2, -3)
@@ -575,11 +583,13 @@ class JSDMLayer(nn.Module):
 
     def forward(
         self, hidden_states, st_source_embeddings, eco_embeddings,
+        species_emb,
         st_attention_mask=None, st_dist=None,
         output_attentions=False,
     ):
         attn_outputs = self.attention(
             hidden_states, st_source_embeddings, eco_embeddings,
+            species_emb,
             st_attention_mask, st_dist, output_attentions,
         )
         h = attn_outputs[0]
@@ -599,6 +609,7 @@ class JSDMEncoder(nn.Module):
 
     def forward(
         self, hidden_states, st_source_embeddings, eco_embeddings,
+        species_emb,
         st_attention_mask=None, st_dist=None,
         output_attentions=False, output_hidden_states=False,
     ):
@@ -613,12 +624,13 @@ class JSDMEncoder(nn.Module):
             if self.gradient_checkpointing and self.training:
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     layer, hidden_states, st_source_embeddings, eco_embeddings,
-                    st_attention_mask, st_dist, output_attentions,
+                    species_emb, st_attention_mask, st_dist, output_attentions,
                     use_reentrant=False,
                 )
             else:
                 layer_outputs = layer(
                     hidden_states, st_source_embeddings, eco_embeddings,
+                    species_emb,
                     st_attention_mask, st_dist, output_attentions,
                 )
             hidden_states = layer_outputs[0]
@@ -657,6 +669,7 @@ class JSDMModel(nn.Module):
         super().__init__()
         self.config = config
         self.target_input = TargetInput(config)
+        self.target_env_proj = nn.Linear(config.num_env_vars, config.hidden_size)
         self.eco_source_module = EcoSourceModule(config)
         self.encoder = JSDMEncoder(config)
 
@@ -666,7 +679,8 @@ class JSDMModel(nn.Module):
         source_ids,             # (B, S, N) long — 0=absent, 1=present, 2=blinded
         source_idx,             # (B, N) long — indices into full distance matrices
         target_site_idx,        # (B, T) long
-        env_data,               # (B, N, E)
+        env_data,               # (B, N, E) — source site env vars
+        target_env,             # (B, E)   — target site's own env vars
         spatial_dist_pairwise,  # (N_total, N_total) float
         temporal_dist_pairwise, # (N_total, N_total) float
         output_attentions=False,
@@ -674,12 +688,18 @@ class JSDMModel(nn.Module):
     ):
         # 1. Target input: token ids → (B, S, T, H)
         hidden_states = self.target_input(input_ids)
+        # Add target site env conditioning: project (B, E) → (B, H), broadcast to (B, S, T, H)
+        target_env_emb = self.target_env_proj(target_env)           # (B, H)
+        hidden_states = hidden_states + target_env_emb[:, None, None, :]
 
         # 2. Source site embedding: state token + species identity (same as target)
         #    source_ids (B, S, N) long → (B, S, N, H)
         species_idx = torch.arange(source_ids.size(1), device=source_ids.device)
         species_emb = self.target_input.species_embedding(species_idx)  # (S, H)
         source_emb = self.target_input.embedding(source_ids) + species_emb[None, :, None, :]
+        # Identity-only embedding for self-attention K/V: (1, 1, S, H) in (B, T, S, H) broadcast format.
+        # Self-attention K and V use this so they cannot read off token state from keys/values.
+        species_emb_sa = species_emb[None, None, :, :]  # (1, 1, S, H)
 
         # 3. Ecological context
         eco_emb = self.eco_source_module(env_data)  # (B, C_eco, H)
@@ -700,6 +720,7 @@ class JSDMModel(nn.Module):
         # 5. Encode — no attention mask needed (blinding handled in collator)
         encoder_out = self.encoder(
             hidden_states, source_emb, eco_emb,
+            species_emb_sa,
             st_attention_mask=None, st_dist=st_dist,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,

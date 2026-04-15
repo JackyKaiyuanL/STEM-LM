@@ -561,3 +561,231 @@ jsdm_train.py
                 sinusoidal_pos param removed
               SpeciesSelfAttention.__init__: rotary_value removed
               SpeciesSelfAttention._apply_rotary: method removed
+
+
+26. H3 / GRID SPATIAL BLOCK CROSS-VALIDATION
+    ---------------------------------------------
+    Baseline: train/val split was a random row shuffle (np.random.permutation).
+      Val sites shared spatial proximity with training sites, making val AUC
+      optimistic — the model could exploit local co-occurrence patterns copied
+      from nearby training observations.
+
+    Current: three split strategies selectable via --fold {random, h3, grid}:
+
+      h3 (default for real lat/lon datasets):
+        Each observation assigned to an H3 hexagonal cell at a given resolution
+        (--h3_resolution, default 2, ~183 km cell edge). H3 cells assigned
+        wholesale to train/val/test (80/10/10 by default). No observation from
+        a val or test cell is ever in the training split.
+
+      grid (for simulated / Euclidean datasets):
+        Same logic but on a regular n_cells×n_cells grid over the 2D bounding
+        box. Required for datasets with arbitrary coordinates (haversine invalid).
+
+      random: original behavior retained for backward compatibility / ablation.
+
+    Source pool restriction: for h3 and grid splits, JSDMDataset.source_pool
+      is set to the training row indices after splitting. Source sites for
+      val/test targets are drawn only from training observations, so the model
+      cannot read held-out community state when predicting held-out sites.
+      For random splits, source_pool=None (all rows available as sources), since
+      geographic separation is not enforced.
+
+    Justification: spatial autocorrelation means nearby sites share community
+      composition. Without spatial blocking, val performance measures how well
+      the model interpolates nearby observations — not how well it generalizes
+      to new regions. H3 blocking at resolution 2 (~183 km) is aggressive enough
+      to prevent local interpolation but still allows large-scale ecological
+      patterns to inform predictions.
+
+    New functions: h3_block_split(), grid_block_split() in jsdm_data.py
+    create_dataloaders(): fold_method, h3_resolution, grid_cells, test_frac params
+    jsdm_train.py: --fold, --h3_resolution, --grid_cells, --test_frac flags
+    jsdm_inference.py: --fold, --h3_resolution, --train_frac, --test_frac,
+                       --grid_cells flags (for source pool reconstruction)
+
+
+27. STATIC DATASET SUPPORT (--no_time)
+    ----------------------------------------
+    Baseline: JSDMDataset always expected a time column and computed temporal
+      distances. For datasets without temporal variation (eButterfly NA_static,
+      SatButterfly), all times are identical → temporal_scale_days = 0 →
+      division by zero in normalization and FIRE temporal bias.
+
+    Current: time handling is optional:
+      - --no_time flag disables time entirely; JSDMDataset.times set to zeros
+        and temporal_dists set to an (N×N) zero matrix.
+      - If the time column is absent from the CSV, no_time is also auto-set.
+      - JSDMConfig.use_temporal = False when no_time; STColAttention skips
+        the temporal FIRE branch entirely (no fire_temporal, no t_scale params).
+      - config.max_temporal_dist set to temporal_scale_days (guaranteed > 0 by
+        _resolve_scale) so no division by zero anywhere downstream.
+
+    Justification: several real datasets (eBird static snapshots, SatButterfly)
+      represent presence/absence at a fixed time point and have no temporal
+      structure. Forcing temporal computation on these datasets produces numerical
+      failures and wastes parameters on a meaningless dimension.
+
+    Location: JSDMDataset.__init__: no_time param, has_time flag
+              _resolve_scale(): returns 1.0 if fallback ≤ 0 with a warning
+              JSDMConfig: use_temporal field added
+              STColAttention: use_temporal guard on fire_temporal branch
+              jsdm_train.py, jsdm_inference.py: --no_time flag
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+jsdm_inference.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+28. INFERENCE PIPELINE: SUBPARSER STRUCTURE AND FOLD-AWARE SOURCE POOL
+    -----------------------------------------------------------------------
+    Baseline: single flat argparser with command as a positional arg. No source
+      pool restriction at inference time. cluster_info used for forward pass.
+
+    Current: subparsers (predict, interactions). predict subcommand accepts
+      --fold / --h3_resolution / --train_frac / --test_frac / --grid_cells so
+      the inference source pool exactly matches what the model saw during
+      training. All cluster_info references replaced by dist_info throughout.
+      Progress reported every 50 batches.
+
+    Location: jsdm_inference.py — add_common_args(), subparser setup,
+              build_dataset_and_loader(), predict_masked(), extract_interactions()
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Diagnostic: self-attention state shortcut (lab/attn_shortcut_diag.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+29. DIAGNOSTIC: SELF-ATTENTION IS USING TOKEN STATE AS A CO-OCCURRENCE SHORTCUT
+    -------------------------------------------------------------------------------
+    Empirical finding from lab/attn_shortcut_diag.py, run on the eButterfly
+    NA_static trained model (3 layers, 179 species, 19597 sites), 30 batches
+    of 32 sites (960 forward passes):
+
+    Experiment 1 — attention from masked Q species to K species by state:
+      Layer 0:  absent K = 0.00360,  present K = 0.10384  → 28.82× ratio  p≈0
+      Layer 1:  absent K = 0.00376,  present K = 0.14203  → 37.75× ratio  p≈0
+      Layer 2:  absent K = 0.00430,  present K = 0.05045  → 11.75× ratio  p≈0
+
+    Experiment 2 — attention entropy: real tokens vs all-masked tokens:
+      Real tokens:       entropy mean = 4.819
+      All-masked tokens: entropy mean = 5.049
+      Δ = -0.230 nats  (p ≈ 0, paired t-test)
+      Cosine similarity of attention rows (real vs all-masked): 0.745 ± 0.157
+
+    Interpretation: when presented with real tokens, masked Q species attend
+    to present (state=1) K species at 12–38× the rate of absent species,
+    across all layers. Attention entropy drops significantly when state is
+    available — the model actively uses token state to route attention. The
+    cosine similarity of 0.74 means 26% of the attention direction changes
+    when all state information is removed, confirming that species identity
+    alone does not explain the attention pattern.
+
+    Context: the 100% masking experiment showed the model produces ~0.03 max
+    predicted probability when all target tokens are masked (i.e., no unmasked
+    species context). Together, these results confirm that the model learned to
+    exploit token state in self-attention K/V as a direct co-occurrence shortcut,
+    and does not rely meaningfully on env/spatial signals for its predictions.
+
+    The shortcut pathway: in SpeciesSelfAttention, K and V are projected from
+    the full hidden state (state_emb + species_emb). Since state_emb carries a
+    distinct H-dim vector for each of {0, 1, 2}, the K projection separates
+    present from absent tokens, and masked Q species can rank K tokens by
+    co-occurrence simply by attending more to present K tokens. The model
+    discovers this within the first few training epochs — it is a shorter
+    gradient path than learning through cross-attention to source sites.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Fix: identity-only K/V in species self-attention (APPLIED; retraining required)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+30. IDENTITY-ONLY K/V IN SPECIES SELF-ATTENTION
+    -----------------------------------------------
+    Motivation: the shortcut (change 29) prevents the model from learning to use
+    env/spatial/community context from cross-attention to source sites. The
+    species cross-attention to source sites can in principle represent all three
+    types of co-occurrence:
+      1. Co-occurrence due to shared ecological covariates — source sites carry
+         env data through EcoSourceModule; sites with similar env host similar
+         species communities.
+      2. Co-occurrence due to spatiotemporal proximity — FIRE distance bias
+         down-weights distant source sites; nearby source communities are more
+         similar by spatial autocorrelation.
+      3. Direct biotic interactions (competition/facilitation) — residual
+         co-occurrence structure not explained by env or spatial proximity is
+         present in source community compositions and learnable by cross-attention.
+
+    The shortcut is architecturally redundant: all three signals are available
+    in the cross-attention pathway. The reason it dominates is that it provides
+    a shorter, lower-variance gradient path during training.
+
+    Q/K/V asymmetry — why Q stays full, K and V become identity-only:
+      Q from the full hidden state lets the masked species express "I am masked,
+      and given everything I have accumulated from prior cross-attention, here is
+      what I am looking for." This is legitimate context-dependent routing.
+      K from identity only means "what the model finds when it attends to species
+      j is only 'this is species j'" — no state read-off. V from identity only
+      means "what the model reads back is a learned species-role embedding," not
+      a state signal. Self-attention becomes a learned structural affinity matrix
+      modulated by the query: it can capture "species i should attend to its
+      interaction partners" without enabling direct state lookup.
+
+    Multi-hop closure — why this is acceptable:
+      In the current architecture, layer L self-attention reads V from species j's
+      hidden state, which includes j's layer L-1 cross-attention output. This
+      looks like legitimate multi-hop ("i learns what j learned from sources"), but
+      j's hidden state in layer 1 already carries state_emb, so the multi-hop in
+      layer 2+ is co-occurrence data laundered through one extra hop — the same
+      shortcut, just delayed. With static V, this pathway closes. Information still
+      flows between species through the FFN residual stream (i's hidden state
+      includes weighted sums of other species' static embeddings from all layers),
+      which is a less-corrupted pathway.
+
+    Species_emb prevalence encoding — why it is fine:
+      species_emb is a global property of each species (shared across all sites
+      and training examples). Over training, species_emb[j] may encode j's
+      unconditional prevalence (common vs rare). That is a legitimate ecological
+      prior. The harmful shortcut requires site-specific state: "j is present at
+      this site right now." That information is not in species_emb — it lives in
+      state_emb, which is excluded from K and V by this fix.
+
+    Implementation:
+      species_emb (S, H) computed once in JSDMModel.forward and expanded to
+      (1, 1, S, H); threaded through encoder → layer → attention → row_attention
+      → SpeciesSelfAttention. In SpeciesSelfAttention.forward:
+
+        # Before (K uses full hidden state including token state):
+        key_layer   = self.key(hidden_states[:, :1, ...])   # (B, 1, S, H) — state + identity
+        value_layer = self.value(hidden_states)              # (B, T, S, H) — state + identity
+
+        # After (K and V from species identity only):
+        key_layer   = self.key(species_emb)                 # (1, 1, S, H) broadcast → (B, 1, A, S, D)
+        value_layer = self.value(species_emb)               # (1, 1, S, H) broadcast → (B, T, A, S, D)
+
+      species_emb passed as (1, 1, S, H); PyTorch broadcasting handles batch dim
+      in both matmul and scaled_dot_product_attention. Q unchanged.
+      species_emb shared with TargetInput.species_embedding — no new parameter table.
+
+    Note: requires retraining from scratch. Existing model has learned its
+    cross-attention pathway under the assumption that self-attention provides
+    co-occurrence directly. The cross-attention pathways must develop during
+    training under the modified architecture.
+
+    Location: SpeciesSelfAttention.forward: species_emb param added, K/V changed
+              SpeciesRowAttention.forward: species_emb passed through
+              JSDMAttention.forward: species_emb passed through
+              JSDMLayer.forward: species_emb passed through
+              JSDMEncoder.forward: species_emb passed through
+              JSDMModel.forward: species_emb expanded to (1,1,S,H) and passed in
+
+    combine_gate comparison plan:
+      Before retraining, combine_gate values extracted from the existing
+      eButterfly NA_static checkpoint and saved to
+      lab/eButterfly/NA_static/combine_gate_before_fix.txt.
+      After retraining, the same extraction is run on the new checkpoint and
+      saved alongside for comparison. Expected signal: after the fix, gate values
+      should diverge more across species — habitat specialists pulling toward eco
+      (gate → 0), range-generalists pulling toward ST (gate → 1). Uniform gates
+      near 0.5 after retraining would indicate the cross-attention pathways are
+      still not differentiating by species ecology.

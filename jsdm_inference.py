@@ -39,6 +39,7 @@ def run_forward(model, batch, dist_info, device, output_attentions=False):
         source_idx=batch["source_idx"],
         target_site_idx=batch["target_site_idx"],
         env_data=batch["env_data"],
+        target_env=batch["target_env"],
         labels=batch["labels"],
         spatial_dist_pairwise=dist_info["spatial_dist_pairwise"],
         temporal_dist_pairwise=dist_info["temporal_dist_pairwise"],
