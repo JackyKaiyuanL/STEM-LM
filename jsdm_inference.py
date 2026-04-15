@@ -16,7 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from jsdm_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
-from jsdm_data import JSDMDataset, JSDMDataCollator, compute_dist_info
+from jsdm_data import JSDMDataset, JSDMDataCollator, compute_dist_info, h3_block_split, grid_block_split
 
 
 def load_model(model_dir, device):
@@ -46,59 +46,7 @@ def run_forward(model, batch, dist_info, device, output_attentions=False):
     )
 
 
-@torch.no_grad()
-def predict_masked(model, loader, dist_info, device, species_names):
-    all_preds = []
-    for batch in loader:
-        output = run_forward(model, batch, dist_info, device)
-        probs = torch.sigmoid(output.logits).squeeze(-1).cpu().numpy()
-        all_preds.append(probs)
-    return pd.DataFrame(np.concatenate(all_preds, axis=0), columns=species_names)
-
-
-@torch.no_grad()
-def extract_interactions(model, loader, dist_info, device, species_names, num_batches=50):
-    per_layer = {i: [] for i in range(model.config.num_hidden_layers)}
-
-    for i, batch in enumerate(loader):
-        if i >= num_batches:
-            break
-        output = run_forward(model, batch, dist_info, device, output_attentions=True)
-        for layer_idx in range(model.config.num_hidden_layers):
-            mat = extract_interaction_matrix(output, layer_idx=layer_idx)
-            per_layer[layer_idx].append(mat.cpu())
-
-    result = {}
-    for layer_idx, matrices in per_layer.items():
-        avg = torch.cat(matrices, dim=0).mean(dim=0).numpy()
-        result[layer_idx] = pd.DataFrame(avg, index=species_names, columns=species_names)
-    return result
-
-
-def main():
-    parser = argparse.ArgumentParser(description="ST-JSDM Inference")
-    parser.add_argument("command", choices=["predict", "interactions"])
-    parser.add_argument("model_dir", type=str)
-    parser.add_argument("csv_path", type=str)
-    parser.add_argument("output_path", type=str)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--num_batches", type=int, default=50)
-    parser.add_argument("--blind_percentile", type=float, default=2.0)
-    parser.add_argument("--spatial_scale_km", type=float, default=None)
-    parser.add_argument("--temporal_scale_days", type=float, default=None)
-    parser.add_argument("--no_time", action="store_true",
-                        help="Ignore time column. Auto-set if model was trained without time.")
-    parser.add_argument("--euclidean_coords", action="store_true",
-                        help="Use Euclidean distance instead of haversine (for simulated data).")
-    args = parser.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, config = load_model(args.model_dir, device)
-
-    with open(os.path.join(args.model_dir, "species_names.json")) as f:
-        species_names = json.load(f)
-
+def build_dataset_and_loader(args, config):
     no_time = args.no_time or (not config.use_temporal)
     dataset = JSDMDataset(
         csv_path=args.csv_path,
@@ -124,8 +72,116 @@ def main():
         dataset, batch_size=args.batch_size, shuffle=False,
         collate_fn=collator, num_workers=args.num_workers,
     )
+    return dataset, dist_info, loader
+
+
+@torch.no_grad()
+def predict_masked(model, loader, dist_info, device, species_names):
+    dist_info = dict(dist_info)
+    dist_info["spatial_dist_pairwise"] = dist_info["spatial_dist_pairwise"].to(device)
+    dist_info["temporal_dist_pairwise"] = dist_info["temporal_dist_pairwise"].to(device)
+    all_preds = []
+    n_batches = len(loader)
+    for b, batch in enumerate(loader):
+        output = run_forward(model, batch, dist_info, device)
+        probs = torch.sigmoid(output.logits).squeeze(-1).cpu().numpy()
+        all_preds.append(probs)
+        if (b + 1) % 50 == 0 or (b + 1) == n_batches:
+            print(f"    batch {b+1}/{n_batches}")
+    return pd.DataFrame(np.concatenate(all_preds, axis=0), columns=species_names)
+
+
+@torch.no_grad()
+def extract_interactions(model, loader, dist_info, device, species_names, num_batches=50):
+    dist_info = dict(dist_info)
+    dist_info["spatial_dist_pairwise"] = dist_info["spatial_dist_pairwise"].to(device)
+    dist_info["temporal_dist_pairwise"] = dist_info["temporal_dist_pairwise"].to(device)
+    per_layer = {i: [] for i in range(model.config.num_hidden_layers)}
+
+    for i, batch in enumerate(loader):
+        if i >= num_batches:
+            break
+        output = run_forward(model, batch, dist_info, device, output_attentions=True)
+        for layer_idx in range(model.config.num_hidden_layers):
+            mat = extract_interaction_matrix(output, layer_idx=layer_idx)
+            per_layer[layer_idx].append(mat.cpu())
+
+    result = {}
+    for layer_idx, matrices in per_layer.items():
+        avg = torch.cat(matrices, dim=0).mean(dim=0).numpy()
+        result[layer_idx] = pd.DataFrame(avg, index=species_names, columns=species_names)
+    return result
+
+
+def add_common_args(p):
+    p.add_argument("model_dir", type=str)
+    p.add_argument("csv_path", type=str,
+                   help="CSV with species observations.")
+    p.add_argument("output_path", type=str)
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--blind_percentile", type=float, default=2.0)
+    p.add_argument("--spatial_scale_km", type=float, default=None)
+    p.add_argument("--temporal_scale_days", type=float, default=None)
+    p.add_argument("--no_time", action="store_true",
+                   help="Ignore time column. Auto-set if model was trained without time.")
+    p.add_argument("--euclidean_coords", action="store_true",
+                   help="Use Euclidean distance instead of haversine (for simulated data).")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ST-JSDM Inference")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # ── predict ───────────────────────────────────────────────────────────────
+    p_pred = sub.add_parser("predict", help="Predict masked species at sites")
+    add_common_args(p_pred)
+    p_pred.add_argument("--fold", choices=["random", "h3", "grid"], default="random",
+                        help="Split method used during training. Restricts source pool to "
+                             "training observations so inference matches training setup.")
+    p_pred.add_argument("--h3_resolution", type=int, default=2,
+                        help="H3 resolution used during training (--fold h3 only).")
+    p_pred.add_argument("--train_frac", type=float, default=0.8)
+    p_pred.add_argument("--test_frac", type=float, default=0.1)
+    p_pred.add_argument("--seed", type=int, default=42)
+    p_pred.add_argument("--grid_cells", type=int, default=20,
+                        help="Grid cell count used during training (--fold grid only).")
+
+    # ── interactions ──────────────────────────────────────────────────────────
+    p_int = sub.add_parser("interactions", help="Extract species interaction matrices")
+    add_common_args(p_int)
+    p_int.add_argument("--num_batches", type=int, default=50)
+
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, config = load_model(args.model_dir, device)
+
+    with open(os.path.join(args.model_dir, "species_names.json")) as f:
+        species_names = json.load(f)
+
+    dataset, dist_info, loader = build_dataset_and_loader(args, config)
 
     if args.command == "predict":
+        if args.fold == "h3":
+            train_idx, _, _ = h3_block_split(
+                dataset.lats, dataset.lons,
+                resolution=args.h3_resolution,
+                train_frac=args.train_frac, test_frac=args.test_frac, seed=args.seed,
+            )
+            dataset.source_pool = train_idx
+            print(f"Source pool: {len(train_idx)} training observations (h3 res={args.h3_resolution})")
+        elif args.fold == "grid":
+            train_idx, _, _ = grid_block_split(
+                dataset.lats, dataset.lons,
+                n_cells=args.grid_cells,
+                train_frac=args.train_frac, test_frac=args.test_frac, seed=args.seed,
+            )
+            dataset.source_pool = train_idx
+            print(f"Source pool: {len(train_idx)} training observations (grid {args.grid_cells}×{args.grid_cells})")
+        else:
+            print("Source pool: all observations")
+
         result = predict_masked(model, loader, dist_info, device, species_names)
         result.to_parquet(args.output_path, index=False)
         print(f"Predictions saved to {args.output_path}")
