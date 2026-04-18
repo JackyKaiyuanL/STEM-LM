@@ -27,38 +27,21 @@ from scipy.spatial.distance import cdist
 from typing import Optional, List, Dict, Any
 
 
-def haversine_pairwise(lat_deg: np.ndarray, lon_deg: np.ndarray,
-                       tile_size: int = 4096) -> np.ndarray:
-    """Pairwise haversine distances in km. Tiled GPU computation: only
-    tile_size×N memory live at once, avoiding OOM from multiple N×N intermediates."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    N = len(lat_deg)
-    lat = torch.tensor(np.radians(lat_deg), dtype=torch.float32, device=device)
-    lon = torch.tensor(np.radians(lon_deg), dtype=torch.float32, device=device)
-    out = torch.empty(N, N, dtype=torch.float32, device=device)
-    for i in range(0, N, tile_size):
-        lat_i = lat[i:i + tile_size, None]
-        lon_i = lon[i:i + tile_size, None]
-        dlat = lat_i - lat[None, :]
-        dlon = lon_i - lon[None, :]
-        a = (torch.sin(dlat / 2.0) ** 2
-             + torch.cos(lat_i) * torch.cos(lat[None, :]) * torch.sin(dlon / 2.0) ** 2)
-        out[i:i + tile_size] = 6371.0 * 2.0 * torch.arcsin(torch.sqrt(a.clamp(0.0, 1.0)))
-    return out.cpu().numpy()
+def haversine_pairwise(lat_deg: np.ndarray, lon_deg: np.ndarray) -> np.ndarray:
+    """Pairwise haversine distances in kilometers. Use for real geographic coordinates."""
+    lat = np.radians(lat_deg.astype(np.float64))
+    lon = np.radians(lon_deg.astype(np.float64))
+    lat1 = lat[:, None]; lat2 = lat[None, :]
+    dlat = lat1 - lat2
+    dlon = lon[:, None] - lon[None, :]
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    return (6371.0 * 2.0 * np.arcsin(np.sqrt(a))).astype(np.float32)
 
 
-def euclidean_pairwise(x: np.ndarray, y: np.ndarray,
-                       tile_size: int = 4096) -> np.ndarray:
-    """Pairwise Euclidean distances. Tiled GPU computation."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    coords = torch.tensor(np.stack([x, y], axis=1), dtype=torch.float32, device=device)
-    N = len(x)
-    out = torch.empty(N, N, dtype=torch.float32, device=device)
-    for i in range(0, N, tile_size):
-        diff = coords[i:i + tile_size, None, :] - coords[None, :, :]
-        out[i:i + tile_size] = torch.sqrt((diff ** 2).sum(-1))
-    return out.cpu().numpy()
-
+def euclidean_pairwise(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Pairwise Euclidean distances. Use for simulated or arbitrary 2D coordinates."""
+    coords = np.stack([x, y], axis=1).astype(np.float64)
+    return cdist(coords, coords).astype(np.float32)
 
 
 def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
@@ -148,14 +131,14 @@ class JSDMDataset(Dataset):
             ).astype(np.float32)
         else:
             self.temporal_dists = np.zeros((N, N), dtype=np.float32)
-        print("Done.")
         self.spatial_scale_km = _resolve_scale(
             spatial_scale_km, float(self.spatial_dists.max()), "spatial_scale_km"
         )
-        self.temporal_scale_days = _resolve_scale(
-            temporal_scale_days, float(self.temporal_dists.max()) if has_time else 0.0, "temporal_scale_days"
+        self.temporal_scale_days = 1.0 if not has_time else _resolve_scale(
+            temporal_scale_days, float(self.temporal_dists.max()), "temporal_scale_days"
         )
         self.source_pool = None  # None = all rows; set to train indices for h3/blocked splits
+        print("Done.")
 
     def __len__(self):
         return len(self.species_data)
@@ -169,7 +152,7 @@ class JSDMDataset(Dataset):
         spatial = self.spatial_dists[idx] / self.spatial_scale_km
         temporal = self.temporal_dists[idx] / self.temporal_scale_days
         combined_dist = np.sqrt(spatial ** 2 + temporal ** 2)
-        combined_dist[idx] = np.inf  # exclude self
+        combined_dist[idx] = np.inf
         inv_dist = 1.0 / (combined_dist + 1e-6)
 
         if self.source_pool is not None:
@@ -249,7 +232,6 @@ class JSDMDataCollator:
         batch["source_ids"] = source_ids                 # (B, S, N) long
         batch["labels"] = labels.unsqueeze(-1)
         batch["env_data"] = batch.pop("source_env")
-        batch["target_env"] = batch["target_env"]        # (B, E) — target site's own env vars
         batch["target_site_idx"] = batch.pop("target_idx").unsqueeze(-1)
 
         del batch["target_species"]
@@ -278,10 +260,13 @@ def compute_dist_info(
         (spatial_dist / spatial_scale_km) ** 2 + (temporal_dist / temporal_scale_days) ** 2
     ).astype(np.float32)
 
-    N = combined.shape[0]
-    flat = combined[np.triu_indices(N, k=1)]
-    nonzero = flat[flat > 0]
-    blind_threshold = float(np.percentile(nonzero, blind_percentile)) if len(nonzero) > 0 else 0.0
+    N = len(spatial_dist)
+    triu = combined[np.triu_indices(N, k=1)]
+    nonzero = triu[triu > 0]
+    if len(nonzero) > 0:
+        blind_threshold = float(np.percentile(nonzero, blind_percentile))
+    else:
+        blind_threshold = 0.0
     print(f"  Blind threshold: {blind_threshold:.4f} ({blind_percentile}th percentile of pairwise distances)")
 
     return {

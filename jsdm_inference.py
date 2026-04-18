@@ -2,7 +2,7 @@
 Inference for ST-JSDM.
 
 Commands:
-  predict       - Predict masked species at sites
+  predict       - Predict all species at val/test sites (fully masked, train-only sources)
   interactions  - Extract species interaction matrices from attention weights
 """
 
@@ -13,10 +13,11 @@ import os
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
+from sklearn.metrics import roc_auc_score
+from torch.utils.data import DataLoader, Subset
 
 from jsdm_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
-from jsdm_data import JSDMDataset, JSDMDataCollator, compute_dist_info, h3_block_split, grid_block_split
+from jsdm_data import JSDMDataset, JSDMDataCollator, compute_dist_info, h3_block_split
 
 
 def load_model(model_dir, device):
@@ -47,14 +48,11 @@ def run_forward(model, batch, dist_info, device, output_attentions=False):
     )
 
 
-def build_dataset_and_loader(args, config):
+def build_dataset_and_dist(args, config):
     no_time = args.no_time or (not config.use_temporal)
     dataset = JSDMDataset(
         csv_path=args.csv_path,
         num_source_sites=config.num_source_sites,
-        spatial_scale_km=args.spatial_scale_km,
-        temporal_scale_days=args.temporal_scale_days,
-        euclidean_coords=args.euclidean_coords,
         no_time=no_time,
     )
     dist_info = compute_dist_info(
@@ -64,32 +62,39 @@ def build_dataset_and_loader(args, config):
         temporal_scale_days=dataset.temporal_scale_days,
         blind_percentile=args.blind_percentile,
     )
-    collator = JSDMDataCollator(
-        mlm_probability=config.mlm_probability,
-        combined_dist=dist_info["combined_dist"],
-        blind_threshold=dist_info["blind_threshold"],
-    )
-    loader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collator, num_workers=args.num_workers,
-    )
-    return dataset, dist_info, loader
+    return dataset, dist_info
 
 
 @torch.no_grad()
-def predict_masked(model, loader, dist_info, device, species_names):
+def predict(model, loader, dist_info, device, species_names):
     dist_info = dict(dist_info)
     dist_info["spatial_dist_pairwise"] = dist_info["spatial_dist_pairwise"].to(device)
     dist_info["temporal_dist_pairwise"] = dist_info["temporal_dist_pairwise"].to(device)
-    all_preds = []
+
+    all_probs, all_labels = [], []
     n_batches = len(loader)
     for b, batch in enumerate(loader):
         output = run_forward(model, batch, dist_info, device)
-        probs = torch.sigmoid(output.logits).squeeze(-1).cpu().numpy()
-        all_preds.append(probs)
+        probs = torch.sigmoid(output.logits).squeeze(-1).cpu().numpy()   # (B, S)
+        labels = batch["labels"].squeeze(-1).cpu().numpy()               # (B, S)
+        all_probs.append(probs)
+        all_labels.append(labels)
         if (b + 1) % 50 == 0 or (b + 1) == n_batches:
             print(f"    batch {b+1}/{n_batches}")
-    return pd.DataFrame(np.concatenate(all_preds, axis=0), columns=species_names)
+
+    probs  = np.concatenate(all_probs,  axis=0)  # (N_eval, S)
+    labels = np.concatenate(all_labels, axis=0)  # (N_eval, S)
+    return probs, labels
+
+
+def compute_auc(probs, labels, species_names):
+    aucs = {}
+    for s, name in enumerate(species_names):
+        mask = labels[:, s] != -100
+        if mask.sum() > 0 and len(np.unique(labels[mask, s])) == 2:
+            aucs[name] = roc_auc_score(labels[mask, s], probs[mask, s])
+    mean_auc = np.mean(list(aucs.values())) if aucs else float("nan")
+    return aucs, mean_auc
 
 
 @torch.no_grad()
@@ -115,19 +120,14 @@ def extract_interactions(model, loader, dist_info, device, species_names, num_ba
 
 
 def add_common_args(p):
-    p.add_argument("model_dir", type=str)
-    p.add_argument("csv_path", type=str,
-                   help="CSV with species observations.")
+    p.add_argument("model_dir",   type=str)
+    p.add_argument("csv_path",    type=str)
     p.add_argument("output_path", type=str)
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--batch_size",       type=int,   default=32)
+    p.add_argument("--num_workers",      type=int,   default=0)
     p.add_argument("--blind_percentile", type=float, default=2.0)
-    p.add_argument("--spatial_scale_km", type=float, default=None)
-    p.add_argument("--temporal_scale_days", type=float, default=None)
-    p.add_argument("--no_time", action="store_true",
-                   help="Ignore time column. Auto-set if model was trained without time.")
-    p.add_argument("--euclidean_coords", action="store_true",
-                   help="Use Euclidean distance instead of haversine (for simulated data).")
+    p.add_argument("--no_time",          action="store_true")
+    p.add_argument("--euclidean_coords", action="store_true")
 
 
 def main():
@@ -135,18 +135,13 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     # ── predict ───────────────────────────────────────────────────────────────
-    p_pred = sub.add_parser("predict", help="Predict masked species at sites")
+    p_pred = sub.add_parser("predict", help="Fully masked prediction on eval split")
     add_common_args(p_pred)
-    p_pred.add_argument("--fold", choices=["random", "h3", "grid"], default="random",
-                        help="Split method used during training. Restricts source pool to "
-                             "training observations so inference matches training setup.")
-    p_pred.add_argument("--h3_resolution", type=int, default=2,
-                        help="H3 resolution used during training (--fold h3 only).")
-    p_pred.add_argument("--train_frac", type=float, default=0.8)
-    p_pred.add_argument("--test_frac", type=float, default=0.1)
-    p_pred.add_argument("--seed", type=int, default=42)
-    p_pred.add_argument("--grid_cells", type=int, default=20,
-                        help="Grid cell count used during training (--fold grid only).")
+    p_pred.add_argument("--eval_split", choices=["val", "test"], default="test")
+    p_pred.add_argument("--h3_resolution", type=int,   default=2)
+    p_pred.add_argument("--train_frac",    type=float, default=0.8)
+    p_pred.add_argument("--test_frac",     type=float, default=0.1)
+    p_pred.add_argument("--seed",          type=int,   default=42)
 
     # ── interactions ──────────────────────────────────────────────────────────
     p_int = sub.add_parser("interactions", help="Extract species interaction matrices")
@@ -161,33 +156,69 @@ def main():
     with open(os.path.join(args.model_dir, "species_names.json")) as f:
         species_names = json.load(f)
 
-    dataset, dist_info, loader = build_dataset_and_loader(args, config)
+    dataset, dist_info = build_dataset_and_dist(args, config)
+
+    # H3 split — restrict sources to training observations only
+    train_idx, val_idx, test_idx = h3_block_split(
+        dataset.lats, dataset.lons,
+        resolution=args.h3_resolution,
+        train_frac=args.train_frac, test_frac=args.test_frac, seed=args.seed,
+    )
+    dataset.source_pool = train_idx
+    print(f"Source pool: {len(train_idx)} training observations")
 
     if args.command == "predict":
-        if args.fold == "h3":
-            train_idx, _, _ = h3_block_split(
-                dataset.lats, dataset.lons,
-                resolution=args.h3_resolution,
-                train_frac=args.train_frac, test_frac=args.test_frac, seed=args.seed,
-            )
-            dataset.source_pool = train_idx
-            print(f"Source pool: {len(train_idx)} training observations (h3 res={args.h3_resolution})")
-        elif args.fold == "grid":
-            train_idx, _, _ = grid_block_split(
-                dataset.lats, dataset.lons,
-                n_cells=args.grid_cells,
-                train_frac=args.train_frac, test_frac=args.test_frac, seed=args.seed,
-            )
-            dataset.source_pool = train_idx
-            print(f"Source pool: {len(train_idx)} training observations (grid {args.grid_cells}×{args.grid_cells})")
-        else:
-            print("Source pool: all observations")
+        eval_idx = val_idx if args.eval_split == "val" else test_idx
+        print(f"Predicting on {args.eval_split} set: {len(eval_idx)} sites")
 
-        result = predict_masked(model, loader, dist_info, device, species_names)
-        result.to_parquet(args.output_path, index=False)
+        collator = JSDMDataCollator(
+            mlm_probability=1.0,
+            combined_dist=dist_info["combined_dist"],
+            blind_threshold=dist_info["blind_threshold"],
+        )
+        loader = DataLoader(
+            Subset(dataset, eval_idx), batch_size=args.batch_size,
+            shuffle=False, collate_fn=collator, num_workers=args.num_workers,
+        )
+
+        probs, labels = predict(model, loader, dist_info, device, species_names)
+        aucs, mean_auc = compute_auc(probs, labels, species_names)
+
+        print(f"\nMean AUC ({args.eval_split}): {mean_auc:.4f}  ({len(aucs)}/{len(species_names)} species)")
+
+        # Save predictions with coordinates
+        result_df = pd.DataFrame(probs, columns=species_names)
+        result_df.insert(0, "latitude",  dataset.lats[eval_idx])
+        result_df.insert(1, "longitude", dataset.lons[eval_idx])
+        result_df.to_parquet(args.output_path, index=False)
         print(f"Predictions saved to {args.output_path}")
 
+        # Save per-species AUC
+        auc_path = os.path.join(args.model_dir, f"per_species_auc_{args.eval_split}.csv")
+        auc_df = pd.DataFrame(
+            sorted(aucs.items(), key=lambda x: -x[1]), columns=["species", "auc"]
+        )
+        auc_df.to_csv(auc_path, index=False)
+        print(f"Per-species AUC saved to {auc_path}")
+
+        print(f"\nTop 10:")
+        for _, row in auc_df.head(10).iterrows():
+            print(f"  {row['species']:<50} {row['auc']:.4f}")
+        print(f"Bottom 10:")
+        for _, row in auc_df.tail(10).iterrows():
+            print(f"  {row['species']:<50} {row['auc']:.4f}")
+
     elif args.command == "interactions":
+        collator = JSDMDataCollator(
+            mlm_probability=config.mlm_probability,
+            combined_dist=dist_info["combined_dist"],
+            blind_threshold=dist_info["blind_threshold"],
+        )
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=False,
+            collate_fn=collator, num_workers=args.num_workers,
+        )
+
         interaction_dfs = extract_interactions(
             model, loader, dist_info, device, species_names, args.num_batches
         )
