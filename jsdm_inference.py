@@ -1,5 +1,5 @@
 """
-Inference for ST-JSDM.
+Inference for STEM-LM.
 
 Commands:
   predict       - Predict all species at val/test sites (fully masked, train-only sources)
@@ -131,7 +131,7 @@ def add_common_args(p):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ST-JSDM Inference")
+    parser = argparse.ArgumentParser(description="STEM-LM Inference")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # ── predict ───────────────────────────────────────────────────────────────
@@ -157,6 +157,17 @@ def main():
         species_names = json.load(f)
 
     dataset, dist_info = build_dataset_and_dist(args, config)
+
+    # Consistency check: the CSV's species columns must match the trained model's
+    # species (same names, same order). Silent misalignment would give valid-looking
+    # but wrong per-species AUCs.
+    if list(dataset.species_cols) != list(species_names):
+        raise ValueError(
+            "Species mismatch between training and inference data.\n"
+            f"  Trained on {len(species_names)} species; CSV has {len(dataset.species_cols)}.\n"
+            f"  First divergence: "
+            f"{next((i for i, (a, b) in enumerate(zip(dataset.species_cols, species_names)) if a != b), 'order/length differs')}"
+        )
 
     # H3 split — restrict sources to training observations only
     train_idx, val_idx, test_idx = h3_block_split(

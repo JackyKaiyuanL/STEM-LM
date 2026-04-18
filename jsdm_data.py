@@ -1,22 +1,21 @@
 """
-Data loading and preprocessing for ST-JSDM.
+Data loading and preprocessing for STEM-LM.
 
-Mirrors GPN-star's data pipeline with corrected axis mapping:
+CSV layout: one row per (site, time) observation with columns:
+    time (optional), latitude, longitude, env_*, species_*
 
-    GPN-star                              →  ST-JSDM
-    ──────────────────────────────────────────────────────────
-    GenomeMSA: (L positions, N species)    →  CSV: (N_total rows, S species)
-    get_msa_batch → (B, L, N)             →  get_site_batch → (B, S, N)
+Dataset emits per-sample dicts consumed by JSDMDataCollator:
+    target_species: (S,)     — true 0/1 at target site (becomes labels)
+    source_species: (S, N)   — 0/1 at N nearest source sites
+    source_env:     (N, E)   — env covariates at source sites
+    target_env:     (E,)     — env covariates at target site
+    target_idx:     ()       — index of target row in the full CSV
+    source_idx:     (N,)     — indices of sampled source rows
 
-    tokenize_function:                     →  tokenize_function:
-      Sample 20 target species from clades    Target = 1 site (the row to predict)
-      input_ids = msa subsampled (B,L,T)      input_ids = target row (B, S, T=1)
-      source_ids = full msa (B,L,N)           source_ids = sampled sites (B, S, N)
-
-    DataCollator:                          →  DataCollator:
-      Mask 15% of L positions                 Mask 15% of S species
-      80% → mask token, 10% random, 10% keep  90% → mask_value, 10% keep
-      Mask source_ids in same clade           Mask source_ids in same ST cluster
+Collator applies masked-species augmentation:
+    - mask an mlm_probability fraction of target species → state token 2
+    - 10% of masked positions keep their original state (no-op mask)
+    - for masked species, nearby source entries are set to 2 (proximity blind)
 """
 
 import numpy as np
@@ -106,6 +105,12 @@ class JSDMDataset(Dataset):
         self.species_cols = species_cols
         self.env_cols = env_cols
         self.num_species = len(species_cols)
+        if not env_cols:
+            print(
+                "WARNING: no environmental columns detected (none with 'env_' prefix "
+                "and no --env_cols given). Falling back to a single zero-valued env "
+                "column; the model will train without ecological signal."
+            )
         self.num_env_vars = len(env_cols) if env_cols else 1
 
         self.coords = df[[lat_col, lon_col]].values.astype(np.float32)
@@ -164,17 +169,17 @@ class JSDMDataset(Dataset):
             probs = inv_dist / inv_dist.sum()
             source_idx = np.random.choice(N_total, size=N, replace=(N > N_total - 1), p=probs)
 
-        source_species = self.species_data[source_idx].T  # (S, N)
-        source_env = self.env_data[source_idx]             # (N, E)
-        target_env = self.env_data[idx]                    # (E,)
+        source_species = np.ascontiguousarray(self.species_data[source_idx].T)  # (S, N)
+        source_env = self.env_data[source_idx]                                   # (N, E)
+        target_env = self.env_data[idx]                                          # (E,)
 
         return {
-            "target_species": torch.tensor(target_species, dtype=torch.float32),
-            "source_species": torch.tensor(source_species, dtype=torch.float32),
-            "source_env": torch.tensor(source_env, dtype=torch.float32),
-            "target_env": torch.tensor(target_env, dtype=torch.float32),
-            "target_idx": torch.tensor(idx, dtype=torch.long),
-            "source_idx": torch.tensor(source_idx, dtype=torch.long),
+            "target_species": torch.from_numpy(target_species),
+            "source_species": torch.from_numpy(source_species),
+            "source_env":     torch.from_numpy(source_env),
+            "target_env":     torch.from_numpy(target_env),
+            "target_idx":     torch.tensor(idx, dtype=torch.long),
+            "source_idx":     torch.from_numpy(source_idx.astype(np.int64)),
         }
 
 

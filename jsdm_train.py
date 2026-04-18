@@ -1,5 +1,5 @@
 """
-Training script for ST-JSDM. Mirrors GPN-star's train.py.
+Training script for STEM-LM.
 """
 
 import argparse
@@ -23,8 +23,50 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Shared training utilities (imported by jsdm_ablation.py to avoid drift)
+# =============================================================================
+
+def move_dist_info_to_device(dist_info, device):
+    """Return a shallow copy of dist_info with pairwise tensors on `device`.
+
+    Call once before the training loop so forward passes don't retransfer
+    the full (N, N) pairwise matrices every batch.
+    """
+    out = dict(dist_info)
+    out["spatial_dist_pairwise"]  = out["spatial_dist_pairwise"].to(device)
+    out["temporal_dist_pairwise"] = out["temporal_dist_pairwise"].to(device)
+    return out
+
+
+def compute_class_weights(species_data, train_indices, beta=0.999):
+    """Effective-number-of-samples class weighting (Cui et al., 2019)."""
+    if not (0.0 < beta < 1.0):
+        raise ValueError(f"class_weighting_beta must be in (0, 1), got {beta}")
+    n_s = species_data[train_indices].sum(axis=0).clip(min=1)
+    effective_n = (1 - beta ** n_s) / (1 - beta)
+    w = 1.0 / effective_n
+    w = w / w.mean()
+    return torch.tensor(w, dtype=torch.float32)
+
+
+def _forward(model, batch, dist_info, loss_weight=None):
+    return model(
+        input_ids=batch["input_ids"],
+        source_ids=batch["source_ids"],
+        source_idx=batch["source_idx"],
+        target_site_idx=batch["target_site_idx"],
+        env_data=batch["env_data"],
+        target_env=batch["target_env"],
+        labels=batch["labels"],
+        loss_weight=loss_weight,
+        spatial_dist_pairwise=dist_info["spatial_dist_pairwise"],
+        temporal_dist_pairwise=dist_info["temporal_dist_pairwise"],
+    )
+
+
 def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
-                loss_weight=None, log_interval=50):
+                loss_weight=None, log_interval=50, max_grad_norm=1.0):
     model.train()
     total_loss, total_correct, total_masked, num_batches = 0, 0, 0, 0
 
@@ -34,24 +76,12 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
         B = batch["input_ids"].shape[0]
         w = loss_weight[None, :].expand(B, -1).to(device) if loss_weight is not None else None
 
-        output = model(
-            input_ids=batch["input_ids"],
-            source_ids=batch["source_ids"],
-            source_idx=batch["source_idx"],
-            target_site_idx=batch["target_site_idx"],
-            env_data=batch["env_data"],
-            target_env=batch["target_env"],
-            labels=batch["labels"],
-            loss_weight=w,
-            spatial_dist_pairwise=dist_info["spatial_dist_pairwise"],
-            temporal_dist_pairwise=dist_info["temporal_dist_pairwise"],
-        )
-
+        output = _forward(model, batch, dist_info, loss_weight=w)
         loss = output.loss
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
         scheduler.step()
 
@@ -86,23 +116,14 @@ def evaluate(model, loader, device, dist_info):
 
     for batch in loader:
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        output = model(
-            input_ids=batch["input_ids"],
-            source_ids=batch["source_ids"],
-            source_idx=batch["source_idx"],
-            target_site_idx=batch["target_site_idx"],
-            env_data=batch["env_data"],
-            target_env=batch["target_env"],
-            labels=batch["labels"],
-            spatial_dist_pairwise=dist_info["spatial_dist_pairwise"],
-            temporal_dist_pairwise=dist_info["temporal_dist_pairwise"],
-        )
+        output = _forward(model, batch, dist_info)
+
         total_loss += output.loss.item()
         num_batches += 1
 
         probs  = torch.sigmoid(output.logits).squeeze(-1).cpu().numpy()   # (B, S)
-        labels = batch["labels"].squeeze(-1).cpu().numpy()                 # (B, S)
-        mask   = labels != -100                                             # (B, S)
+        labels = batch["labels"].squeeze(-1).cpu().numpy()                # (B, S)
+        mask   = labels != -100
         for s in range(S):
             b_mask = mask[:, s]
             if b_mask.any():
@@ -129,7 +150,7 @@ def evaluate(model, loader, device, dist_info):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train ST-JSDM")
+    parser = argparse.ArgumentParser(description="Train STEM-LM")
     parser.add_argument("csv_path", type=str)
     parser.add_argument("--num_source_sites", type=int, default=64)
     parser.add_argument("--blind_percentile", type=float, default=2.0,
@@ -180,6 +201,11 @@ def main():
                              "Larger number = finer cells (res 1=483km, 2=183km, 3=69km, 4=26km).")
     parser.add_argument("--grid_cells", type=int, default=20,
                         help="Grid side length for --fold grid (default 20 → 20×20 cells).")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Gradient clipping max norm (default 1.0).")
+    parser.add_argument("--interaction_extract_batches", type=int, default=20,
+                        help="Number of val batches used to estimate the species "
+                             "interaction matrix at the end of training (default 20).")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -208,17 +234,16 @@ def main():
         grid_cells=args.grid_cells,
     )
 
-    # Per-species loss weighting (effective number, beta=0.999)
+    # Per-species loss weighting (effective number)
     loss_weight = None
     if args.class_weighting:
-        train_indices = train_loader.dataset.indices
-        n_s = dataset.species_data[train_indices].sum(axis=0).clip(min=1)  # (S,)
-        beta = args.class_weighting_beta
-        effective_n = (1 - beta ** n_s) / (1 - beta)
-        w = 1.0 / effective_n
-        w = w / w.mean()
-        loss_weight = torch.tensor(w, dtype=torch.float32)
-        logger.info(f"Class weighting: weight range [{w.min():.3f}, {w.max():.3f}]")
+        loss_weight = compute_class_weights(
+            dataset.species_data, train_loader.dataset.indices, beta=args.class_weighting_beta
+        )
+        logger.info(
+            f"Class weighting: weight range "
+            f"[{loss_weight.min().item():.3f}, {loss_weight.max().item():.3f}]"
+        )
 
     # use_temporal mirrors what the dataset actually did with time
     use_temporal = dist_info["max_temporal_dist"] > 0
@@ -258,6 +283,10 @@ def main():
     total_steps = len(train_loader) * args.num_epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
+    # Pre-move pairwise distance matrices to device ONCE — otherwise the (N, N)
+    # tensors would be retransferred on every forward pass.
+    dist_info = move_dist_info_to_device(dist_info, device)
+
     log_csv = os.path.join(args.output_dir, "training_log.csv")
     with open(log_csv, "w", newline="") as f:
         csv.writer(f).writerow(["epoch", "train_loss", "train_acc", "val_loss", "val_acc", "val_auc", "lr", "elapsed_s"])
@@ -266,7 +295,8 @@ def main():
     for epoch in range(1, args.num_epochs + 1):
         t0 = time.time()
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scheduler, device, dist_info, epoch, loss_weight
+            model, train_loader, optimizer, scheduler, device, dist_info, epoch,
+            loss_weight=loss_weight, max_grad_norm=args.max_grad_norm,
         )
         val_loss, val_acc, val_auc, _ = evaluate(model, val_loader, device, dist_info)
         elapsed = time.time() - t0
@@ -313,7 +343,7 @@ def main():
     interactions = []
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
-            if i >= 20:
+            if i >= args.interaction_extract_batches:
                 break
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             output = model(
