@@ -1,0 +1,20 @@
+{
+  "num_species": 179,
+  "num_source_sites": 64,
+  "num_target_sites": 1,
+  "max_spatial_dist": 9978.99267578125,
+  "max_temporal_dist": 0.0,
+  "use_temporal": false,
+  "num_env_vars": 28,
+  "num_env_groups": 5,
+  "hidden_size": 256,
+  "num_attention_heads": 4,
+  "num_hidden_layers": 3,
+  "intermediate_size": 1024,
+  "hidden_dropout_prob": 0.1,
+  "attention_probs_dropout_prob": 0.1,
+  "layer_norm_eps": 1e-06,
+  "fire_hidden_size": 32,
+  "mlm_probability": 0.5,
+  "ablation": "full"
+}
