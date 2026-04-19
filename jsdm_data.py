@@ -188,13 +188,16 @@ class JSDMDataset(Dataset):
 
 class JSDMDataCollator:
     def __init__(self, mlm_probability=0.15, combined_dist=None, blind_threshold=None,
-                 mask_token_prob=0.9):
+                 mask_token_prob=1.0):
         self.mlm_probability = mlm_probability
         self.combined_dist = combined_dist    # (N_total, N_total) numpy array or None
         self.blind_threshold = blind_threshold  # scalar float or None
-        # Fraction of masked positions that get the [MASK] token (id=2). The rest
-        # keep their original value in input_ids — BERT's regularizer trick. Set
-        # to 1.0 at inference to avoid label leak when scoring all positions.
+        # Fraction of masked positions that get the [MASK] token (id=2); the rest
+        # keep their original value (BERT's 10% keep-original trick). Default 1.0:
+        # BERT's rationale (pretrain/finetune gap, bidirectional conditioning at
+        # non-masked positions) doesn't apply here — our train task = inference
+        # task, [MASK] marks "predict here" in both, and keep-original creates an
+        # eval leak at any mlm_probability < 1.
         self.mask_token_prob = mask_token_prob
 
     def __call__(self, examples):

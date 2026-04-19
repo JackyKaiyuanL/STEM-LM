@@ -197,7 +197,6 @@ def main():
             mlm_probability=1.0,
             combined_dist=dist_info["combined_dist"],
             blind_threshold=dist_info["blind_threshold"],
-            mask_token_prob=1.0,  # no keep-original: every scored position is actually masked
         )
         loader = DataLoader(
             Subset(dataset, eval_idx), batch_size=args.batch_size,
