@@ -19,6 +19,8 @@ Species values must be 0/1.
 - `--fold {random,h3,grid}` — split strategy. `h3` is spatial block CV (real lat/lon); `grid` is for euclidean/simulated coords.
 - `--h3_resolution` (default `2`, ~183 km cells) — finer = more, smaller cells.
 - `--train_frac` / `--test_frac` (default `0.8` / `0.1`) — val is the remainder.
+- `--splits_path` — path to a `splits.json` from a prior training run; bypasses fold recomputation. Use this to keep train/val/test partitions identical across ablations and inference. Row indices are stored, so the CSV must not have been reordered or resized.
+- `--no_save_splits` (train / ablation) — suppress the automatic `splits.json` dump written next to `best_model.pt`.
 - `--num_source_sites` (default `64`) — N source sites per target, weighted by proximity.
 - `--blind_percentile` (default `2.0`) — proximity threshold below which source entries are masked for masked species (prevents trivial copying).
 - `--env_cols col1 col2 ...` — explicit env column list; otherwise all columns with `env_` prefix.
@@ -40,11 +42,12 @@ Species values must be 0/1.
 - `--ablation {full,no_st,no_eco,no_st_eco}` — which cross-attention branches to keep. Param counts differ across modes; a note is written to `ablation_summary.json`.
 
 **Inference**
-- `predict` subcommand flags: `--eval_split {val,test}` (default `test`), plus the data/split flags above (must match the trained model's H3 split).
+- `predict` subcommand flags: `--eval_split {val,test}` (default `test`), plus the data/split flags above. Pass `--splits_path <model_dir>/splits.json` to reuse the exact train/val/test partition from training; otherwise supply matching `--h3_resolution`/`--train_frac`/`--test_frac`/`--seed` so the H3 split is reproduced.
+- `interactions` subcommand also accepts `--splits_path` to restrict the source pool to the original training rows.
 - Species ordering in the CSV must match the trained model's `species_names.json`; the script asserts this and errors on mismatch.
 
 ## Outputs
 Training writes to `--output_dir`: `best_model.pt`, `config.json`, `species_names.json`,
-`training_log.csv`, `per_species_auc_jsdm.csv`, `interaction_matrix.npy`, and periodic
-checkpoints. Inference writes predictions as a parquet with per-row lat/lon plus one column
-per species, and a `per_species_auc_{val,test}.csv`.
+`splits.json` (unless `--no_save_splits`), `training_log.csv`, `per_species_auc_jsdm.csv`,
+`interaction_matrix.npy`, and periodic checkpoints. Inference writes predictions as a parquet
+with per-row lat/lon plus one column per species, and a `per_species_auc_{val,test}.csv`.

@@ -17,7 +17,7 @@ from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
 
 from jsdm_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
-from jsdm_data import JSDMDataset, JSDMDataCollator, compute_dist_info, h3_block_split
+from jsdm_data import JSDMDataset, JSDMDataCollator, compute_dist_info, h3_block_split, load_splits
 
 
 def load_model(model_dir, device):
@@ -128,6 +128,12 @@ def add_common_args(p):
     p.add_argument("--blind_percentile", type=float, default=2.0)
     p.add_argument("--no_time",          action="store_true")
     p.add_argument("--euclidean_coords", action="store_true")
+    p.add_argument("--splits_path",      type=str,   default=None,
+                   help="Path to splits.json from training; bypasses fold recomputation.")
+    p.add_argument("--h3_resolution",    type=int,   default=2)
+    p.add_argument("--train_frac",       type=float, default=0.8)
+    p.add_argument("--test_frac",        type=float, default=0.1)
+    p.add_argument("--seed",             type=int,   default=42)
 
 
 def main():
@@ -138,10 +144,6 @@ def main():
     p_pred = sub.add_parser("predict", help="Fully masked prediction on eval split")
     add_common_args(p_pred)
     p_pred.add_argument("--eval_split", choices=["val", "test"], default="test")
-    p_pred.add_argument("--h3_resolution", type=int,   default=2)
-    p_pred.add_argument("--train_frac",    type=float, default=0.8)
-    p_pred.add_argument("--test_frac",     type=float, default=0.1)
-    p_pred.add_argument("--seed",          type=int,   default=42)
 
     # ── interactions ──────────────────────────────────────────────────────────
     p_int = sub.add_parser("interactions", help="Extract species interaction matrices")
@@ -169,12 +171,21 @@ def main():
             f"{next((i for i, (a, b) in enumerate(zip(dataset.species_cols, species_names)) if a != b), 'order/length differs')}"
         )
 
-    # H3 split — restrict sources to training observations only
-    train_idx, val_idx, test_idx = h3_block_split(
-        dataset.lats, dataset.lons,
-        resolution=args.h3_resolution,
-        train_frac=args.train_frac, test_frac=args.test_frac, seed=args.seed,
-    )
+    # Split — restrict sources to training observations only. Prefer a saved
+    # splits.json (from training) so eval matches exactly; otherwise recompute
+    # H3 split with the same flags the model was trained on.
+    splits_path = getattr(args, "splits_path", None)
+    if splits_path is not None:
+        print(f"Loading splits from {splits_path}")
+        train_idx, val_idx, test_idx = load_splits(
+            splits_path, expected_num_rows=len(dataset)
+        )
+    else:
+        train_idx, val_idx, test_idx = h3_block_split(
+            dataset.lats, dataset.lons,
+            resolution=args.h3_resolution,
+            train_frac=args.train_frac, test_frac=args.test_frac, seed=args.seed,
+        )
     dataset.source_pool = train_idx
     print(f"Source pool: {len(train_idx)} training observations")
 

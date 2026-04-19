@@ -18,12 +18,15 @@ Collator applies masked-species augmentation:
     - for masked species, nearby source entries are set to 2 (proximity blind)
 """
 
+import json
+import os
+
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 from scipy.spatial.distance import cdist
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 
 def haversine_pairwise(lat_deg: np.ndarray, lon_deg: np.ndarray) -> np.ndarray:
@@ -317,6 +320,45 @@ def grid_block_split(x, y, n_cells=20, train_frac=0.8, test_frac=0.1, seed=42):
     return train_idx, val_idx, test_idx
 
 
+def save_splits(path: str, train_idx, val_idx, test_idx, num_rows: Optional[int] = None,
+                meta: Optional[dict] = None) -> None:
+    """Persist train/val/test row indices as JSON for reproducible reloading.
+
+    `num_rows` is stored as a sanity check — load_splits rejects the file if
+    the CSV it is being applied to has a different row count.
+    `meta` can carry fold_method, h3_resolution, seed, etc. for provenance.
+    """
+    payload = {
+        "num_rows": int(num_rows) if num_rows is not None else None,
+        "meta":     meta or {},
+        "train":    [int(x) for x in np.asarray(train_idx).ravel()],
+        "val":      [int(x) for x in np.asarray(val_idx).ravel()],
+        "test":     [int(x) for x in np.asarray(test_idx).ravel()],
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f)
+
+
+def load_splits(path: str, expected_num_rows: Optional[int] = None
+                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load train/val/test indices saved by `save_splits`."""
+    with open(path) as f:
+        payload = json.load(f)
+    saved_n = payload.get("num_rows")
+    if expected_num_rows is not None and saved_n is not None and saved_n != expected_num_rows:
+        raise ValueError(
+            f"Split file at {path} was built for {saved_n} rows but the current "
+            f"dataset has {expected_num_rows}. Splits are row-index based; the CSV "
+            f"must not have been reordered or resized since the split was saved."
+        )
+    return (
+        np.array(payload["train"], dtype=np.int64),
+        np.array(payload["val"],   dtype=np.int64),
+        np.array(payload["test"],  dtype=np.int64),
+    )
+
+
 def h3_block_split(lats, lons, resolution=4, train_frac=0.8, test_frac=0.1, seed=42):
     """
     Split observation indices into train/val/test by H3 spatial blocks.
@@ -358,7 +400,20 @@ def create_dataloaders(
     seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
     euclidean_coords=False, no_time=False,
     fold_method="random", h3_resolution=2, grid_cells=20,
+    saved_splits: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    restrict_source_pool_with_saved_splits: bool = True,
 ):
+    """Build train/val/test dataloaders.
+
+    If `saved_splits=(train_idx, val_idx, test_idx)` is given, those indices
+    are used directly and fold_method is ignored. Source pool is restricted
+    to train indices by default (treat as blocked CV); set
+    `restrict_source_pool_with_saved_splits=False` to keep the full pool.
+
+    Returns:
+        train_loader, val_loader, test_loader, dataset, dist_info, splits
+    where `splits = {"train": np.ndarray, "val": np.ndarray, "test": np.ndarray}`.
+    """
     dataset = JSDMDataset(
         csv_path=csv_path,
         num_source_sites=num_source_sites,
@@ -379,13 +434,22 @@ def create_dataloaders(
     )
 
     # Split into train / val / test
-    if fold_method == "h3":
+    if saved_splits is not None:
+        train_indices, val_indices, test_indices = saved_splits
+        train_indices = np.asarray(train_indices, dtype=np.int64)
+        val_indices   = np.asarray(val_indices,   dtype=np.int64)
+        test_indices  = np.asarray(test_indices,  dtype=np.int64)
+        source_pool_restricted = restrict_source_pool_with_saved_splits
+        split_origin = "saved"
+    elif fold_method == "h3":
         if euclidean_coords:
             raise ValueError("--fold h3 requires real lat/lon coordinates. Use --fold grid for euclidean datasets.")
         train_indices, val_indices, test_indices = h3_block_split(
             dataset.lats, dataset.lons,
             resolution=h3_resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
         )
+        source_pool_restricted = True
+        split_origin = "h3"
     elif fold_method == "grid":
         if not euclidean_coords:
             raise ValueError("--fold grid is for euclidean/simulated datasets. Use --fold h3 for real lat/lon.")
@@ -393,6 +457,8 @@ def create_dataloaders(
             dataset.lats, dataset.lons,
             n_cells=grid_cells, train_frac=train_frac, test_frac=test_frac, seed=seed,
         )
+        source_pool_restricted = True
+        split_origin = "grid"
     else:  # random (default)
         np.random.seed(seed)
         n = len(dataset)
@@ -402,10 +468,10 @@ def create_dataloaders(
         train_indices = indices[:n_train]
         val_indices   = indices[n_train : n - n_test if n_test > 0 else n]
         test_indices  = indices[n - n_test:] if n_test > 0 else np.array([], dtype=int)
+        source_pool_restricted = False
+        split_origin = "random"
 
-    # Restrict source pool to training rows for blocked splits so val/test
-    # targets cannot use held-out species observations as context.
-    if fold_method != "random":
+    if source_pool_restricted:
         dataset.source_pool = train_indices
 
     train_dataset = torch.utils.data.Subset(dataset, train_indices)
@@ -425,9 +491,8 @@ def create_dataloaders(
     test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
                                collate_fn=collator, num_workers=num_workers, pin_memory=True) if test_dataset else None
 
-    n_train = len(train_indices)
-    n_val   = len(val_indices)
-    n_test  = len(test_indices)
-    print(f"Split ({fold_method}): {n_train} train / {n_val} val / {n_test} test")
+    print(f"Split ({split_origin}): "
+          f"{len(train_indices)} train / {len(val_indices)} val / {len(test_indices)} test")
 
-    return train_loader, val_loader, test_loader, dataset, dist_info
+    splits = {"train": train_indices, "val": val_indices, "test": test_indices}
+    return train_loader, val_loader, test_loader, dataset, dist_info, splits

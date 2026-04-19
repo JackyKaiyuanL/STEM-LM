@@ -17,7 +17,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from jsdm_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
-from jsdm_data import create_dataloaders
+from jsdm_data import create_dataloaders, save_splits, load_splits
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -206,6 +206,12 @@ def main():
     parser.add_argument("--interaction_extract_batches", type=int, default=20,
                         help="Number of val batches used to estimate the species "
                              "interaction matrix at the end of training (default 20).")
+    parser.add_argument("--splits_path", type=str, default=None,
+                        help="Path to a splits.json (written by a previous training run). "
+                             "When set, overrides --fold / --h3_resolution / --grid_cells / "
+                             "--seed for the split, so train/val/test are exactly reproduced.")
+    parser.add_argument("--no_save_splits", action="store_true",
+                        help="Skip writing splits.json to output_dir.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -213,8 +219,15 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Optional: preload saved splits (CSV row count will be sanity-checked later)
+    saved_splits = None
+    if args.splits_path is not None:
+        logger.info(f"Loading splits from {args.splits_path}")
+        # Row-count check deferred to after dataset load via assert.
+        saved_splits = load_splits(args.splits_path)
+
     # Data
-    train_loader, val_loader, test_loader, dataset, dist_info = create_dataloaders(
+    train_loader, val_loader, test_loader, dataset, dist_info, splits = create_dataloaders(
         csv_path=args.csv_path,
         batch_size=args.batch_size,
         num_source_sites=args.num_source_sites,
@@ -232,7 +245,26 @@ def main():
         fold_method=args.fold,
         h3_resolution=args.h3_resolution,
         grid_cells=args.grid_cells,
+        saved_splits=saved_splits,
     )
+
+    # Persist splits for downstream scripts (inference, ablation comparisons)
+    if not args.no_save_splits:
+        splits_out = os.path.join(args.output_dir, "splits.json")
+        save_splits(
+            splits_out, splits["train"], splits["val"], splits["test"],
+            num_rows=len(dataset),
+            meta={
+                "fold":          args.fold if saved_splits is None else "loaded",
+                "h3_resolution": args.h3_resolution,
+                "grid_cells":    args.grid_cells,
+                "train_frac":    args.train_frac,
+                "test_frac":     args.test_frac,
+                "seed":          args.seed,
+                "source":        args.splits_path if saved_splits is not None else None,
+            },
+        )
+        logger.info(f"Splits saved to {splits_out}")
 
     # Per-species loss weighting (effective number)
     loss_weight = None

@@ -42,7 +42,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers.modeling_outputs import ModelOutput
 
-from jsdm_data import create_dataloaders
+from jsdm_data import create_dataloaders, save_splits, load_splits
 from jsdm_train import (
     train_epoch,
     evaluate,
@@ -407,6 +407,11 @@ def main():
     parser.add_argument("--h3_resolution", type=int, default=2)
     parser.add_argument("--grid_cells", type=int, default=20)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--splits_path", type=str, default=None,
+                        help="Path to a splits.json (e.g. from a baseline training run). "
+                             "When set, all ablation modes use the SAME train/val/test "
+                             "split — required for a clean ablation comparison.")
+    parser.add_argument("--no_save_splits", action="store_true")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -426,8 +431,13 @@ def main():
     logger.info(f"  Output directory:    {output_dir}")
     logger.info(f"=" * 60)
 
+    saved_splits = None
+    if args.splits_path is not None:
+        logger.info(f"Loading splits from {args.splits_path}")
+        saved_splits = load_splits(args.splits_path)
+
     # Data
-    train_loader, val_loader, test_loader, dataset, dist_info = create_dataloaders(
+    train_loader, val_loader, test_loader, dataset, dist_info, splits = create_dataloaders(
         csv_path=args.csv_path,
         batch_size=args.batch_size,
         num_source_sites=args.num_source_sites,
@@ -445,7 +455,25 @@ def main():
         fold_method=args.fold,
         h3_resolution=args.h3_resolution,
         grid_cells=args.grid_cells,
+        saved_splits=saved_splits,
     )
+
+    if not args.no_save_splits:
+        splits_out = os.path.join(output_dir, "splits.json")
+        save_splits(
+            splits_out, splits["train"], splits["val"], splits["test"],
+            num_rows=len(dataset),
+            meta={
+                "fold":          args.fold if saved_splits is None else "loaded",
+                "h3_resolution": args.h3_resolution,
+                "grid_cells":    args.grid_cells,
+                "train_frac":    args.train_frac,
+                "test_frac":     args.test_frac,
+                "seed":          args.seed,
+                "source":        args.splits_path if saved_splits is not None else None,
+            },
+        )
+        logger.info(f"Splits saved to {splits_out}")
 
     # Per-species loss weighting
     loss_weight = None
