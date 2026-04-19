@@ -48,6 +48,7 @@ from jsdm_train import (
     evaluate,
     compute_class_weights,
     move_dist_info_to_device,
+    _parse_rate,
 )
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -389,7 +390,11 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--mlm_probability", type=float, default=0.15)
+    parser.add_argument("--p_pres", type=_parse_rate, default=0.15,
+                        help="Per-row mask rate for presences. Float in [0,1] or "
+                             "'rand[:lo,hi]' (Uniform[lo, hi] per row).")
+    parser.add_argument("--p_abs",  type=_parse_rate, default=0.15,
+                        help="Per-row mask rate for absences. Same format as --p_pres.")
     parser.add_argument("--train_frac", type=float, default=0.8)
     parser.add_argument("--test_frac", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
@@ -441,7 +446,8 @@ def main():
         csv_path=args.csv_path,
         batch_size=args.batch_size,
         num_source_sites=args.num_source_sites,
-        mlm_probability=args.mlm_probability,
+        p_pres=args.p_pres,
+        p_abs=args.p_abs,
         blind_percentile=args.blind_percentile,
         train_frac=args.train_frac,
         test_frac=args.test_frac,
@@ -505,7 +511,8 @@ def main():
         intermediate_size=args.intermediate_size,
         hidden_dropout_prob=args.dropout,
         attention_probs_dropout_prob=args.dropout,
-        mlm_probability=args.mlm_probability,
+        p_pres=args.p_pres,
+        p_abs=args.p_abs,
         ablation=args.ablation,
     )
 

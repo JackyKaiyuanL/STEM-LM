@@ -194,7 +194,7 @@ def main():
         print(f"Predicting on {args.eval_split} set: {len(eval_idx)} sites")
 
         collator = JSDMDataCollator(
-            mlm_probability=1.0,
+            p_pres=1.0, p_abs=1.0,
             combined_dist=dist_info["combined_dist"],
             blind_threshold=dist_info["blind_threshold"],
         )
@@ -232,7 +232,7 @@ def main():
 
     elif args.command == "interactions":
         collator = JSDMDataCollator(
-            mlm_probability=config.mlm_probability,
+            p_pres=config.p_pres, p_abs=config.p_abs,
             combined_dist=dist_info["combined_dist"],
             blind_threshold=dist_info["blind_threshold"],
         )

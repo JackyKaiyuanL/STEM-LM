@@ -13,8 +13,8 @@ Dataset emits per-sample dicts consumed by JSDMDataCollator:
     source_idx:     (N,)     — indices of sampled source rows
 
 Collator applies masked-species augmentation:
-    - mask an mlm_probability fraction of target species → state token 2
-    - 10% of masked positions keep their original state (no-op mask)
+    - mask target species with per-class rates p_pres and p_abs → state token 2
+      (each can be a fixed float or "rand" for Uniform[0, 1] per row)
     - for masked species, nearby source entries are set to 2 (proximity blind)
 """
 
@@ -187,9 +187,17 @@ class JSDMDataset(Dataset):
 
 
 class JSDMDataCollator:
-    def __init__(self, mlm_probability=0.15, combined_dist=None, blind_threshold=None,
-                 mask_token_prob=1.0):
-        self.mlm_probability = mlm_probability
+    def __init__(self, p_pres=0.15, p_abs=0.15, combined_dist=None,
+                 blind_threshold=None, mask_token_prob=1.0):
+        # Per-class mask rates. Each is either a float in [0, 1] or a
+        # 'rand[:lo,hi]' string → sample Uniform[lo, hi] per row.
+        # 'rand' alone is shorthand for 'rand:0.0,1.0'. Examples:
+        #   p_pres=0.15,           p_abs=0.15           → fixed 15% random mask
+        #   p_pres='rand',         p_abs='rand'         → independent per-class rates per row
+        #   p_pres='rand:0.3,1.0', p_abs=1.0            → presence-only, varying completeness in [0.3, 1]
+        #   p_pres=1.0,            p_abs=1.0            → always 100% mask
+        self.p_pres = self._canonicalize(p_pres)
+        self.p_abs  = self._canonicalize(p_abs)
         self.combined_dist = combined_dist    # (N_total, N_total) numpy array or None
         self.blind_threshold = blind_threshold  # scalar float or None
         # Fraction of masked positions that get the [MASK] token (id=2); the rest
@@ -197,8 +205,40 @@ class JSDMDataCollator:
         # BERT's rationale (pretrain/finetune gap, bidirectional conditioning at
         # non-masked positions) doesn't apply here — our train task = inference
         # task, [MASK] marks "predict here" in both, and keep-original creates an
-        # eval leak at any mlm_probability < 1.
+        # eval leak at any mask rate < 1.
         self.mask_token_prob = mask_token_prob
+
+    @staticmethod
+    def _canonicalize(r):
+        """Return a canonical form: float in [0,1] or a 'rand:lo,hi' string."""
+        if isinstance(r, str):
+            if r == "rand":
+                return "rand:0.0,1.0"
+            if r.startswith("rand:"):
+                try:
+                    lo, hi = [float(x) for x in r[len("rand:"):].split(",")]
+                except Exception:
+                    raise ValueError(f"rand range must be 'rand:lo,hi'; got {r!r}")
+                if not (0.0 <= lo <= hi <= 1.0):
+                    raise ValueError(
+                        f"rand range must satisfy 0 <= lo <= hi <= 1; got [{lo}, {hi}]"
+                    )
+                return f"rand:{lo},{hi}"
+            raise ValueError(
+                f"mask rate string must be 'rand' or 'rand:lo,hi'; got {r!r}"
+            )
+        r = float(r)
+        if not 0.0 <= r <= 1.0:
+            raise ValueError(f"mask rate must be in [0, 1] or 'rand[:lo,hi]'; got {r}")
+        return r
+
+    @staticmethod
+    def _sample_row_rates(B, r):
+        if isinstance(r, str):
+            # r is 'rand:lo,hi' (canonical form)
+            lo, hi = [float(x) for x in r[len("rand:"):].split(",")]
+            return torch.rand(B) * (hi - lo) + lo
+        return torch.full((B,), float(r))
 
     def __call__(self, examples):
         batch = {
@@ -213,7 +253,13 @@ class JSDMDataCollator:
 
         labels = target_species.clone()
 
-        probability_matrix = torch.full((B, S), self.mlm_probability)
+        # Per-row mask rates, then per-position probability picked by class.
+        p_pres_row = self._sample_row_rates(B, self.p_pres)          # (B,)
+        p_abs_row  = self._sample_row_rates(B, self.p_abs)           # (B,)
+        is_pres = target_species.bool()                               # (B, S)
+        probability_matrix = torch.where(
+            is_pres, p_pres_row[:, None], p_abs_row[:, None]
+        ).expand(B, S)
         masked_indices = torch.bernoulli(probability_matrix).bool()
         for b in range(B):
             if not masked_indices[b].any():
@@ -408,7 +454,8 @@ def h3_block_split(lats, lons, resolution=4, train_frac=0.8, test_frac=0.1, seed
 
 
 def create_dataloaders(
-    csv_path, batch_size=32, num_source_sites=64, mlm_probability=0.15,
+    csv_path, batch_size=32, num_source_sites=64,
+    p_pres=0.15, p_abs=0.15,
     blind_percentile=2.0,
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
@@ -493,7 +540,8 @@ def create_dataloaders(
     test_dataset  = torch.utils.data.Subset(dataset, test_indices) if len(test_indices) > 0 else None
 
     collator = JSDMDataCollator(
-        mlm_probability=mlm_probability,
+        p_pres=p_pres,
+        p_abs=p_abs,
         combined_dist=dist_info["combined_dist"],
         blind_threshold=dist_info["blind_threshold"],
     )

@@ -65,8 +65,10 @@ class JSDMConfig:
     # Positional encoding
     fire_hidden_size: int = 32
 
-    # Training
-    mlm_probability: float = 0.15
+    # Training — per-class mask rates. Each is a float in [0, 1] or a
+    # 'rand[:lo,hi]' string (sample Uniform[lo, hi] per row; 'rand' = 'rand:0.0,1.0').
+    p_pres: "float | str" = 0.15
+    p_abs:  "float | str" = 0.15
 
     def __post_init__(self):
         if self.num_attention_heads < 2 or self.num_attention_heads % 2 != 0:

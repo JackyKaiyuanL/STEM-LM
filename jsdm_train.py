@@ -23,6 +23,13 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 
+def _parse_rate(s):
+    """argparse type: float in [0, 1] or 'rand[:lo,hi]' string (validated downstream)."""
+    if isinstance(s, str) and (s == "rand" or s.startswith("rand:")):
+        return s
+    return float(s)
+
+
 # =============================================================================
 # Shared training utilities (imported by jsdm_ablation.py to avoid drift)
 # =============================================================================
@@ -165,7 +172,12 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--mlm_probability", type=float, default=0.15)
+    parser.add_argument("--p_pres", type=_parse_rate, default=0.15,
+                        help="Per-row mask rate for presences. Float in [0,1] or "
+                             "'rand[:lo,hi]' (Uniform[lo, hi] per row; 'rand' = 'rand:0.0,1.0').")
+    parser.add_argument("--p_abs",  type=_parse_rate, default=0.15,
+                        help="Per-row mask rate for absences. Same format as --p_pres. "
+                             "Set to 1.0 for presence-only training (all absences hidden).")
     parser.add_argument("--train_frac", type=float, default=0.8)
     parser.add_argument("--test_frac", type=float, default=0.1,
                         help="Fraction of data held out as test set for final AUC. "
@@ -231,7 +243,8 @@ def main():
         csv_path=args.csv_path,
         batch_size=args.batch_size,
         num_source_sites=args.num_source_sites,
-        mlm_probability=args.mlm_probability,
+        p_pres=args.p_pres,
+        p_abs=args.p_abs,
         blind_percentile=args.blind_percentile,
         train_frac=args.train_frac,
         test_frac=args.test_frac,
@@ -297,7 +310,8 @@ def main():
         intermediate_size=args.intermediate_size,
         hidden_dropout_prob=args.dropout,
         attention_probs_dropout_prob=args.dropout,
-        mlm_probability=args.mlm_probability,
+        p_pres=args.p_pres,
+        p_abs=args.p_abs,
     )
 
     with open(os.path.join(args.output_dir, "config.json"), "w") as f:
