@@ -187,10 +187,15 @@ class JSDMDataset(Dataset):
 
 
 class JSDMDataCollator:
-    def __init__(self, mlm_probability=0.15, combined_dist=None, blind_threshold=None):
+    def __init__(self, mlm_probability=0.15, combined_dist=None, blind_threshold=None,
+                 mask_token_prob=0.9):
         self.mlm_probability = mlm_probability
         self.combined_dist = combined_dist    # (N_total, N_total) numpy array or None
         self.blind_threshold = blind_threshold  # scalar float or None
+        # Fraction of masked positions that get the [MASK] token (id=2). The rest
+        # keep their original value in input_ids — BERT's regularizer trick. Set
+        # to 1.0 at inference to avoid label leak when scoring all positions.
+        self.mask_token_prob = mask_token_prob
 
     def __call__(self, examples):
         batch = {
@@ -213,8 +218,14 @@ class JSDMDataCollator:
 
         # Target token ids: 0=absent, 1=present, 2=mask
         target_ids = target_species.long()  # (B, S)
-        indices_replaced = torch.bernoulli(torch.full((B, S), 0.9)).bool() & masked_indices
-        target_ids[indices_replaced] = 2  # 90% of masked → mask token; 10% keep original
+        if self.mask_token_prob >= 1.0:
+            indices_replaced = masked_indices
+        else:
+            indices_replaced = (
+                torch.bernoulli(torch.full((B, S), self.mask_token_prob)).bool()
+                & masked_indices
+            )
+        target_ids[indices_replaced] = 2  # mask_token_prob of masked → [MASK]; rest keep original
 
         # Source ids: convert float {0, 1} to long {0, 1}, then blind nearby sites to 2
         source_ids = source_species.long()  # (B, S, N)
