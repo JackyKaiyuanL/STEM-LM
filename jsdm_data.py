@@ -1,30 +1,32 @@
 """
-Data loading and preprocessing for ST-JSDM.
+Data loading and preprocessing for STEM-LM.
 
-Mirrors GPN-star's data pipeline with corrected axis mapping:
+CSV layout: one row per (site, time) observation with columns:
+    time (optional), latitude, longitude, env_*, species_*
 
-    GPN-star                              →  ST-JSDM
-    ──────────────────────────────────────────────────────────
-    GenomeMSA: (L positions, N species)    →  CSV: (N_total rows, S species)
-    get_msa_batch → (B, L, N)             →  get_site_batch → (B, S, N)
+Dataset emits per-sample dicts consumed by JSDMDataCollator:
+    target_species: (S,)     — true 0/1 at target site (becomes labels)
+    source_species: (S, N)   — 0/1 at N nearest source sites
+    source_env:     (N, E)   — env covariates at source sites
+    target_env:     (E,)     — env covariates at target site
+    target_idx:     ()       — index of target row in the full CSV
+    source_idx:     (N,)     — indices of sampled source rows
 
-    tokenize_function:                     →  tokenize_function:
-      Sample 20 target species from clades    Target = 1 site (the row to predict)
-      input_ids = msa subsampled (B,L,T)      input_ids = target row (B, S, T=1)
-      source_ids = full msa (B,L,N)           source_ids = sampled sites (B, S, N)
-
-    DataCollator:                          →  DataCollator:
-      Mask 15% of L positions                 Mask 15% of S species
-      80% → mask token, 10% random, 10% keep  90% → mask_value, 10% keep
-      Mask source_ids in same clade           Mask source_ids in same ST cluster
+Collator applies masked-species augmentation:
+    - mask target species with per-class rates p_pres and p_abs → state token 2
+      (each can be a fixed float or "rand" for Uniform[0, 1] per row)
+    - for masked species, nearby source entries are set to 2 (proximity blind)
 """
+
+import json
+import os
 
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 from scipy.spatial.distance import cdist
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 
 def haversine_pairwise(lat_deg: np.ndarray, lon_deg: np.ndarray) -> np.ndarray:
@@ -106,6 +108,12 @@ class JSDMDataset(Dataset):
         self.species_cols = species_cols
         self.env_cols = env_cols
         self.num_species = len(species_cols)
+        if not env_cols:
+            print(
+                "WARNING: no environmental columns detected (none with 'env_' prefix "
+                "and no --env_cols given). Falling back to a single zero-valued env "
+                "column; the model will train without ecological signal."
+            )
         self.num_env_vars = len(env_cols) if env_cols else 1
 
         self.coords = df[[lat_col, lon_col]].values.astype(np.float32)
@@ -164,23 +172,73 @@ class JSDMDataset(Dataset):
             probs = inv_dist / inv_dist.sum()
             source_idx = np.random.choice(N_total, size=N, replace=(N > N_total - 1), p=probs)
 
-        source_species = self.species_data[source_idx].T  # (S, N)
-        source_env = self.env_data[source_idx]             # (N, E)
+        source_species = np.ascontiguousarray(self.species_data[source_idx].T)  # (S, N)
+        source_env = self.env_data[source_idx]                                   # (N, E)
+        target_env = self.env_data[idx]                                          # (E,)
 
         return {
-            "target_species": torch.tensor(target_species, dtype=torch.float32),
-            "source_species": torch.tensor(source_species, dtype=torch.float32),
-            "source_env": torch.tensor(source_env, dtype=torch.float32),
-            "target_idx": torch.tensor(idx, dtype=torch.long),
-            "source_idx": torch.tensor(source_idx, dtype=torch.long),
+            "target_species": torch.from_numpy(target_species),
+            "source_species": torch.from_numpy(source_species),
+            "source_env":     torch.from_numpy(source_env),
+            "target_env":     torch.from_numpy(target_env),
+            "target_idx":     torch.tensor(idx, dtype=torch.long),
+            "source_idx":     torch.from_numpy(source_idx.astype(np.int64)),
         }
 
 
 class JSDMDataCollator:
-    def __init__(self, mlm_probability=0.15, combined_dist=None, blind_threshold=None):
-        self.mlm_probability = mlm_probability
+    def __init__(self, p_pres=0.15, p_abs=0.15, combined_dist=None,
+                 blind_threshold=None, mask_token_prob=1.0):
+        # Per-class mask rates. Each is either a float in [0, 1] or a
+        # 'rand[:lo,hi]' string → sample Uniform[lo, hi] per row.
+        # 'rand' alone is shorthand for 'rand:0.0,1.0'. Examples:
+        #   p_pres=0.15,           p_abs=0.15           → fixed 15% random mask
+        #   p_pres='rand',         p_abs='rand'         → independent per-class rates per row
+        #   p_pres='rand:0.3,1.0', p_abs=1.0            → presence-only, varying completeness in [0.3, 1]
+        #   p_pres=1.0,            p_abs=1.0            → always 100% mask
+        self.p_pres = self._canonicalize(p_pres)
+        self.p_abs  = self._canonicalize(p_abs)
         self.combined_dist = combined_dist    # (N_total, N_total) numpy array or None
         self.blind_threshold = blind_threshold  # scalar float or None
+        # Fraction of masked positions that get the [MASK] token (id=2); the rest
+        # keep their original value (BERT's 10% keep-original trick). Default 1.0:
+        # BERT's rationale (pretrain/finetune gap, bidirectional conditioning at
+        # non-masked positions) doesn't apply here — our train task = inference
+        # task, [MASK] marks "predict here" in both, and keep-original creates an
+        # eval leak at any mask rate < 1.
+        self.mask_token_prob = mask_token_prob
+
+    @staticmethod
+    def _canonicalize(r):
+        """Return a canonical form: float in [0,1] or a 'rand:lo,hi' string."""
+        if isinstance(r, str):
+            if r == "rand":
+                return "rand:0.0,1.0"
+            if r.startswith("rand:"):
+                try:
+                    lo, hi = [float(x) for x in r[len("rand:"):].split(",")]
+                except Exception:
+                    raise ValueError(f"rand range must be 'rand:lo,hi'; got {r!r}")
+                if not (0.0 <= lo <= hi <= 1.0):
+                    raise ValueError(
+                        f"rand range must satisfy 0 <= lo <= hi <= 1; got [{lo}, {hi}]"
+                    )
+                return f"rand:{lo},{hi}"
+            raise ValueError(
+                f"mask rate string must be 'rand' or 'rand:lo,hi'; got {r!r}"
+            )
+        r = float(r)
+        if not 0.0 <= r <= 1.0:
+            raise ValueError(f"mask rate must be in [0, 1] or 'rand[:lo,hi]'; got {r}")
+        return r
+
+    @staticmethod
+    def _sample_row_rates(B, r):
+        if isinstance(r, str):
+            # r is 'rand:lo,hi' (canonical form)
+            lo, hi = [float(x) for x in r[len("rand:"):].split(",")]
+            return torch.rand(B) * (hi - lo) + lo
+        return torch.full((B,), float(r))
 
     def __call__(self, examples):
         batch = {
@@ -195,7 +253,13 @@ class JSDMDataCollator:
 
         labels = target_species.clone()
 
-        probability_matrix = torch.full((B, S), self.mlm_probability)
+        # Per-row mask rates, then per-position probability picked by class.
+        p_pres_row = self._sample_row_rates(B, self.p_pres)          # (B,)
+        p_abs_row  = self._sample_row_rates(B, self.p_abs)           # (B,)
+        is_pres = target_species.bool()                               # (B, S)
+        probability_matrix = torch.where(
+            is_pres, p_pres_row[:, None], p_abs_row[:, None]
+        ).expand(B, S)
         masked_indices = torch.bernoulli(probability_matrix).bool()
         for b in range(B):
             if not masked_indices[b].any():
@@ -203,8 +267,14 @@ class JSDMDataCollator:
 
         # Target token ids: 0=absent, 1=present, 2=mask
         target_ids = target_species.long()  # (B, S)
-        indices_replaced = torch.bernoulli(torch.full((B, S), 0.9)).bool() & masked_indices
-        target_ids[indices_replaced] = 2  # 90% of masked → mask token; 10% keep original
+        if self.mask_token_prob >= 1.0:
+            indices_replaced = masked_indices
+        else:
+            indices_replaced = (
+                torch.bernoulli(torch.full((B, S), self.mask_token_prob)).bool()
+                & masked_indices
+            )
+        target_ids[indices_replaced] = 2  # mask_token_prob of masked → [MASK]; rest keep original
 
         # Source ids: convert float {0, 1} to long {0, 1}, then blind nearby sites to 2
         source_ids = source_species.long()  # (B, S, N)
@@ -310,6 +380,45 @@ def grid_block_split(x, y, n_cells=20, train_frac=0.8, test_frac=0.1, seed=42):
     return train_idx, val_idx, test_idx
 
 
+def save_splits(path: str, train_idx, val_idx, test_idx, num_rows: Optional[int] = None,
+                meta: Optional[dict] = None) -> None:
+    """Persist train/val/test row indices as JSON for reproducible reloading.
+
+    `num_rows` is stored as a sanity check — load_splits rejects the file if
+    the CSV it is being applied to has a different row count.
+    `meta` can carry fold_method, h3_resolution, seed, etc. for provenance.
+    """
+    payload = {
+        "num_rows": int(num_rows) if num_rows is not None else None,
+        "meta":     meta or {},
+        "train":    [int(x) for x in np.asarray(train_idx).ravel()],
+        "val":      [int(x) for x in np.asarray(val_idx).ravel()],
+        "test":     [int(x) for x in np.asarray(test_idx).ravel()],
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f)
+
+
+def load_splits(path: str, expected_num_rows: Optional[int] = None
+                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load train/val/test indices saved by `save_splits`."""
+    with open(path) as f:
+        payload = json.load(f)
+    saved_n = payload.get("num_rows")
+    if expected_num_rows is not None and saved_n is not None and saved_n != expected_num_rows:
+        raise ValueError(
+            f"Split file at {path} was built for {saved_n} rows but the current "
+            f"dataset has {expected_num_rows}. Splits are row-index based; the CSV "
+            f"must not have been reordered or resized since the split was saved."
+        )
+    return (
+        np.array(payload["train"], dtype=np.int64),
+        np.array(payload["val"],   dtype=np.int64),
+        np.array(payload["test"],  dtype=np.int64),
+    )
+
+
 def h3_block_split(lats, lons, resolution=4, train_frac=0.8, test_frac=0.1, seed=42):
     """
     Split observation indices into train/val/test by H3 spatial blocks.
@@ -345,13 +454,27 @@ def h3_block_split(lats, lons, resolution=4, train_frac=0.8, test_frac=0.1, seed
 
 
 def create_dataloaders(
-    csv_path, batch_size=32, num_source_sites=64, mlm_probability=0.15,
+    csv_path, batch_size=32, num_source_sites=64,
+    p_pres=0.15, p_abs=0.15,
     blind_percentile=2.0,
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
     euclidean_coords=False, no_time=False,
     fold_method="random", h3_resolution=2, grid_cells=20,
+    saved_splits: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    restrict_source_pool_with_saved_splits: bool = True,
 ):
+    """Build train/val/test dataloaders.
+
+    If `saved_splits=(train_idx, val_idx, test_idx)` is given, those indices
+    are used directly and fold_method is ignored. Source pool is restricted
+    to train indices by default (treat as blocked CV); set
+    `restrict_source_pool_with_saved_splits=False` to keep the full pool.
+
+    Returns:
+        train_loader, val_loader, test_loader, dataset, dist_info, splits
+    where `splits = {"train": np.ndarray, "val": np.ndarray, "test": np.ndarray}`.
+    """
     dataset = JSDMDataset(
         csv_path=csv_path,
         num_source_sites=num_source_sites,
@@ -372,13 +495,22 @@ def create_dataloaders(
     )
 
     # Split into train / val / test
-    if fold_method == "h3":
+    if saved_splits is not None:
+        train_indices, val_indices, test_indices = saved_splits
+        train_indices = np.asarray(train_indices, dtype=np.int64)
+        val_indices   = np.asarray(val_indices,   dtype=np.int64)
+        test_indices  = np.asarray(test_indices,  dtype=np.int64)
+        source_pool_restricted = restrict_source_pool_with_saved_splits
+        split_origin = "saved"
+    elif fold_method == "h3":
         if euclidean_coords:
             raise ValueError("--fold h3 requires real lat/lon coordinates. Use --fold grid for euclidean datasets.")
         train_indices, val_indices, test_indices = h3_block_split(
             dataset.lats, dataset.lons,
             resolution=h3_resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
         )
+        source_pool_restricted = True
+        split_origin = "h3"
     elif fold_method == "grid":
         if not euclidean_coords:
             raise ValueError("--fold grid is for euclidean/simulated datasets. Use --fold h3 for real lat/lon.")
@@ -386,6 +518,8 @@ def create_dataloaders(
             dataset.lats, dataset.lons,
             n_cells=grid_cells, train_frac=train_frac, test_frac=test_frac, seed=seed,
         )
+        source_pool_restricted = True
+        split_origin = "grid"
     else:  # random (default)
         np.random.seed(seed)
         n = len(dataset)
@@ -395,10 +529,10 @@ def create_dataloaders(
         train_indices = indices[:n_train]
         val_indices   = indices[n_train : n - n_test if n_test > 0 else n]
         test_indices  = indices[n - n_test:] if n_test > 0 else np.array([], dtype=int)
+        source_pool_restricted = False
+        split_origin = "random"
 
-    # Restrict source pool to training rows for blocked splits so val/test
-    # targets cannot use held-out species observations as context.
-    if fold_method != "random":
+    if source_pool_restricted:
         dataset.source_pool = train_indices
 
     train_dataset = torch.utils.data.Subset(dataset, train_indices)
@@ -406,7 +540,8 @@ def create_dataloaders(
     test_dataset  = torch.utils.data.Subset(dataset, test_indices) if len(test_indices) > 0 else None
 
     collator = JSDMDataCollator(
-        mlm_probability=mlm_probability,
+        p_pres=p_pres,
+        p_abs=p_abs,
         combined_dist=dist_info["combined_dist"],
         blind_threshold=dist_info["blind_threshold"],
     )
@@ -418,9 +553,8 @@ def create_dataloaders(
     test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
                                collate_fn=collator, num_workers=num_workers, pin_memory=True) if test_dataset else None
 
-    n_train = len(train_indices)
-    n_val   = len(val_indices)
-    n_test  = len(test_indices)
-    print(f"Split ({fold_method}): {n_train} train / {n_val} val / {n_test} test")
+    print(f"Split ({split_origin}): "
+          f"{len(train_indices)} train / {len(val_indices)} val / {len(test_indices)} test")
 
-    return train_loader, val_loader, test_loader, dataset, dist_info
+    splits = {"train": train_indices, "val": val_indices, "test": test_indices}
+    return train_loader, val_loader, test_loader, dataset, dist_info, splits

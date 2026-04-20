@@ -1,5 +1,5 @@
 """
-Ablation study for ST-JSDM cross-attention components.
+Ablation study for STEM-LM cross-attention components.
 
 Three ablation modes (plus the full model baseline):
     full        — both ST cross-attention and ecological cross-attention (default)
@@ -42,7 +42,14 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers.modeling_outputs import ModelOutput
 
-from jsdm_data import create_dataloaders
+from jsdm_data import create_dataloaders, save_splits, load_splits
+from jsdm_train import (
+    train_epoch,
+    evaluate,
+    compute_class_weights,
+    move_dist_info_to_device,
+    _parse_rate,
+)
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,6 +70,7 @@ from jsdm_model import (
     RMSNorm,
     TargetInput,
     EcoSourceModule,
+    TargetEnvModule,
     SpeciesSelfAttention,
     SpeciesSelfOutput,
     SpeciesRowAttention,
@@ -275,13 +283,14 @@ class AblationModel(nn.Module):
         self.use_eco = config.ablation in ("full", "no_st")
         if self.use_eco:
             self.eco_source_module = EcoSourceModule(config)
+            self.target_env_module = TargetEnvModule(config)
 
         self.encoder = AblationEncoder(config)
 
     def forward(
         self,
         input_ids, source_ids, source_idx, target_site_idx,
-        env_data, spatial_dist_pairwise, temporal_dist_pairwise,
+        env_data, target_env, spatial_dist_pairwise, temporal_dist_pairwise,
         output_attentions=False, output_hidden_states=False,
     ):
         # 1. Target input
@@ -296,8 +305,9 @@ class AblationModel(nn.Module):
         # 3. Ecological context
         if self.use_eco:
             eco_emb = self.eco_source_module(env_data)
+            target_env_token = self.target_env_module(target_env)
+            eco_emb = torch.cat([eco_emb, target_env_token], dim=1)
         else:
-            # Placeholder — encoder won't use it
             eco_emb = None
 
         # 4. Target-to-source distances
@@ -359,117 +369,11 @@ class AblationForMaskedSpeciesPrediction(nn.Module):
 
 
 # =====================================================================
-# Training & evaluation (mirrors jsdm_train.py)
-# =====================================================================
-
-def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
-                loss_weight=None, log_interval=50):
-    model.train()
-    total_loss, total_correct, total_masked, num_batches = 0, 0, 0, 0
-
-    for batch_idx, batch in enumerate(loader):
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
-        B = batch["input_ids"].shape[0]
-        w = loss_weight[None, :].expand(B, -1).to(device) if loss_weight is not None else None
-
-        output = model(
-            input_ids=batch["input_ids"],
-            source_ids=batch["source_ids"],
-            source_idx=batch["source_idx"],
-            target_site_idx=batch["target_site_idx"],
-            env_data=batch["env_data"],
-            labels=batch["labels"],
-            loss_weight=w,
-            spatial_dist_pairwise=dist_info["spatial_dist_pairwise"],
-            temporal_dist_pairwise=dist_info["temporal_dist_pairwise"],
-        )
-
-        loss = output.loss
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
-
-        total_loss += loss.item()
-        num_batches += 1
-
-        mask = batch["labels"] != -100
-        if mask.any():
-            preds = (output.logits[mask] > 0).long()
-            targets = batch["labels"][mask].long()
-            total_correct += (preds == targets).sum().item()
-            total_masked += mask.sum().item()
-
-        if (batch_idx + 1) % log_interval == 0:
-            logger.info(
-                f"Epoch {epoch} | Batch {batch_idx+1}/{len(loader)} | "
-                f"Loss: {total_loss/num_batches:.4f} | "
-                f"Acc: {total_correct/max(total_masked,1):.4f} | "
-                f"LR: {scheduler.get_last_lr()[0]:.2e}"
-            )
-
-    return total_loss / max(num_batches, 1), total_correct / max(total_masked, 1)
-
-
-@torch.no_grad()
-def evaluate(model, loader, device, dist_info):
-    model.eval()
-    total_loss, num_batches = 0, 0
-    S = model.config.num_species
-    species_preds = [[] for _ in range(S)]
-    species_labels = [[] for _ in range(S)]
-
-    for batch in loader:
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        output = model(
-            input_ids=batch["input_ids"],
-            source_ids=batch["source_ids"],
-            source_idx=batch["source_idx"],
-            target_site_idx=batch["target_site_idx"],
-            env_data=batch["env_data"],
-            labels=batch["labels"],
-            spatial_dist_pairwise=dist_info["spatial_dist_pairwise"],
-            temporal_dist_pairwise=dist_info["temporal_dist_pairwise"],
-        )
-        total_loss += output.loss.item()
-        num_batches += 1
-
-        probs = torch.sigmoid(output.logits).squeeze(-1).cpu().numpy()
-        labels = batch["labels"].squeeze(-1).cpu().numpy()
-        mask = labels != -100
-        for s in range(S):
-            b_mask = mask[:, s]
-            if b_mask.any():
-                species_preds[s].extend(probs[b_mask, s].tolist())
-                species_labels[s].extend(labels[b_mask, s].tolist())
-
-    per_species_aucs = {}
-    total_correct, total_masked = 0, 0
-    aucs = []
-    for s in range(S):
-        if len(species_labels[s]) > 0:
-            arr_p = np.array(species_preds[s])
-            arr_l = np.array(species_labels[s])
-            total_correct += ((arr_p > 0.5) == arr_l).sum()
-            total_masked += len(arr_l)
-            if len(set(species_labels[s])) == 2 and not np.isnan(arr_p).any():
-                auc_s = roc_auc_score(arr_l, arr_p)
-                aucs.append(auc_s)
-                per_species_aucs[s] = auc_s
-    mean_auc = float(np.mean(aucs)) if aucs else float("nan")
-    acc = total_correct / max(total_masked, 1)
-
-    return total_loss / max(num_batches, 1), acc, mean_auc, per_species_aucs
-
-
-# =====================================================================
 # Main
 # =====================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Ablation study for ST-JSDM")
+    parser = argparse.ArgumentParser(description="Ablation study for STEM-LM")
     parser.add_argument("csv_path", type=str)
     parser.add_argument("--ablation", type=str, default="full", choices=ABLATION_MODES,
                         help="Ablation mode: full (baseline), no_st (remove ST cross-attn), "
@@ -486,7 +390,14 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--mlm_probability", type=float, default=0.15)
+    parser.add_argument("--p", type=_parse_rate, default=None,
+                        help="Per-row mask rate applied to both presences and absences. "
+                             "Float in [0,1] or 'rand[:lo,hi]' (Uniform[lo, hi] per row; "
+                             "'rand' = 'rand:0.0,1.0'). Overrides --p_pres/--p_abs if set.")
+    parser.add_argument("--p_pres", type=_parse_rate, default=0.15,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--p_abs",  type=_parse_rate, default=0.15,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--train_frac", type=float, default=0.8)
     parser.add_argument("--test_frac", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
@@ -503,7 +414,18 @@ def main():
     parser.add_argument("--fold", choices=["random", "h3", "grid"], default="random")
     parser.add_argument("--h3_resolution", type=int, default=2)
     parser.add_argument("--grid_cells", type=int, default=20)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--splits_path", type=str, default=None,
+                        help="Path to a splits.json (e.g. from a baseline training run). "
+                             "When set, all ablation modes use the SAME train/val/test "
+                             "split — required for a clean ablation comparison.")
+    parser.add_argument("--no_save_splits", action="store_true")
     args = parser.parse_args()
+
+    # --p is a convenience that sets both p_pres and p_abs to the same rate.
+    if args.p is not None:
+        args.p_pres = args.p
+        args.p_abs = args.p
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -522,12 +444,18 @@ def main():
     logger.info(f"  Output directory:    {output_dir}")
     logger.info(f"=" * 60)
 
+    saved_splits = None
+    if args.splits_path is not None:
+        logger.info(f"Loading splits from {args.splits_path}")
+        saved_splits = load_splits(args.splits_path)
+
     # Data
-    train_loader, val_loader, test_loader, dataset, dist_info = create_dataloaders(
+    train_loader, val_loader, test_loader, dataset, dist_info, splits = create_dataloaders(
         csv_path=args.csv_path,
         batch_size=args.batch_size,
         num_source_sites=args.num_source_sites,
-        mlm_probability=args.mlm_probability,
+        p_pres=args.p_pres,
+        p_abs=args.p_abs,
         blind_percentile=args.blind_percentile,
         train_frac=args.train_frac,
         test_frac=args.test_frac,
@@ -541,19 +469,36 @@ def main():
         fold_method=args.fold,
         h3_resolution=args.h3_resolution,
         grid_cells=args.grid_cells,
+        saved_splits=saved_splits,
     )
+
+    if not args.no_save_splits:
+        splits_out = os.path.join(output_dir, "splits.json")
+        save_splits(
+            splits_out, splits["train"], splits["val"], splits["test"],
+            num_rows=len(dataset),
+            meta={
+                "fold":          args.fold if saved_splits is None else "loaded",
+                "h3_resolution": args.h3_resolution,
+                "grid_cells":    args.grid_cells,
+                "train_frac":    args.train_frac,
+                "test_frac":     args.test_frac,
+                "seed":          args.seed,
+                "source":        args.splits_path if saved_splits is not None else None,
+            },
+        )
+        logger.info(f"Splits saved to {splits_out}")
 
     # Per-species loss weighting
     loss_weight = None
     if args.class_weighting:
-        train_indices = train_loader.dataset.indices
-        n_s = dataset.species_data[train_indices].sum(axis=0).clip(min=1)
-        beta = args.class_weighting_beta
-        effective_n = (1 - beta ** n_s) / (1 - beta)
-        w = 1.0 / effective_n
-        w = w / w.mean()
-        loss_weight = torch.tensor(w, dtype=torch.float32)
-        logger.info(f"Class weighting: weight range [{w.min():.3f}, {w.max():.3f}]")
+        loss_weight = compute_class_weights(
+            dataset.species_data, train_loader.dataset.indices, beta=args.class_weighting_beta
+        )
+        logger.info(
+            f"Class weighting: weight range "
+            f"[{loss_weight.min().item():.3f}, {loss_weight.max().item():.3f}]"
+        )
 
     use_temporal = dist_info["max_temporal_dist"] > 0
     if not use_temporal:
@@ -574,7 +519,8 @@ def main():
         intermediate_size=args.intermediate_size,
         hidden_dropout_prob=args.dropout,
         attention_probs_dropout_prob=args.dropout,
-        mlm_probability=args.mlm_probability,
+        p_pres=args.p_pres,
+        p_abs=args.p_abs,
         ablation=args.ablation,
     )
 
@@ -593,6 +539,9 @@ def main():
     total_steps = len(train_loader) * args.num_epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
+    # Pre-move pairwise distance matrices to device ONCE.
+    dist_info = move_dist_info_to_device(dist_info, device)
+
     log_csv = os.path.join(output_dir, "training_log.csv")
     with open(log_csv, "w", newline="") as f:
         csv.writer(f).writerow([
@@ -604,7 +553,8 @@ def main():
     for epoch in range(1, args.num_epochs + 1):
         t0 = time.time()
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scheduler, device, dist_info, epoch, loss_weight
+            model, train_loader, optimizer, scheduler, device, dist_info, epoch,
+            loss_weight=loss_weight, max_grad_norm=args.max_grad_norm,
         )
         val_loss, val_acc, val_auc, _ = evaluate(model, val_loader, device, dist_info)
         elapsed = time.time() - t0
@@ -650,7 +600,11 @@ def main():
         os.path.join(output_dir, f"per_species_auc_{args.ablation}.csv"), index=False
     )
 
-    # Summary JSON for easy comparison across runs
+    # Summary JSON for easy comparison across runs.
+    # NOTE: num_params differs across ablation modes — full has both cross-attention
+    # branches + gate, no_st / no_eco have one branch only, no_st_eco has none. Any
+    # AUC delta between modes therefore conflates mechanism effect with capacity.
+    # Report param counts explicitly so downstream comparison can account for this.
     summary = {
         "ablation": args.ablation,
         "num_params": num_params,
@@ -661,6 +615,10 @@ def main():
         "num_epochs": args.num_epochs,
         "seed": args.seed,
     }
+    logger.info(
+        f"[{args.ablation}] Param count: {num_params:,}  "
+        f"(compare across modes: param counts differ by design)"
+    )
     with open(os.path.join(output_dir, "ablation_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 

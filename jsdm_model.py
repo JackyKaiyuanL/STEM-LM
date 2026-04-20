@@ -1,5 +1,5 @@
 """
-Spatial-Temporal Joint Species Distribution Model (ST-JSDM)
+S(pacial)T(empral)E(co)(JSD)M-L(anguage)M(odel)
 
 Architecture:
     Row self-attention (along S species)  = species attend to species (INTERACTION TERM)
@@ -22,8 +22,8 @@ Training:
 """
 
 import math
-from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, List
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -37,13 +37,12 @@ from transformers.modeling_outputs import ModelOutput
 
 @dataclass
 class JSDMConfig:
-    """Configuration for ST-JSDM."""
+    """Configuration for STEM-LM."""  # S(pacial)T(empral)E(co)(JSD)M-L(anguage)M(odel)
     # Species
     num_species: int = 100           # S: number of species columns
 
     # Source sites
     num_source_sites: int = 64       # N: number of source site-time obs per example
-    num_target_sites: int = 1        # T: number of target sites
 
     # Distance normalization (set from data at training time)
     max_spatial_dist: float = 180.0
@@ -66,19 +65,33 @@ class JSDMConfig:
     # Positional encoding
     fire_hidden_size: int = 32
 
-    # Training
-    mlm_probability: float = 0.15
+    # Training — per-class mask rates. Each is a float in [0, 1] or a
+    # 'rand[:lo,hi]' string (sample Uniform[lo, hi] per row; 'rand' = 'rand:0.0,1.0').
+    p_pres: "float | str" = 0.15
+    p_abs:  "float | str" = 0.15
+
+    def __post_init__(self):
+        if self.num_attention_heads < 2 or self.num_attention_heads % 2 != 0:
+            raise ValueError(
+                f"num_attention_heads must be even and >= 2 (splits into row + cross "
+                f"sub-blocks); got {self.num_attention_heads}."
+            )
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                f"hidden_size ({self.hidden_size}) must be divisible by "
+                f"num_attention_heads ({self.num_attention_heads})."
+            )
 
 
 # =============================================================================
-# FIRE Distance Bias (same as GPN-star FIRETimeBias)
+# FIRE Distance Bias
 # =============================================================================
 
 class FIREDistanceBias(nn.Module):
     """
-    Learned distance bias. Identical to GPN-star's FIRETimeBias.
-    In GPN-star: encodes evolutionary distance.
-    Here: encodes spatial distance, temporal distance, or environmental distance.
+    Learned scalar bias applied to attention logits as a function of distance.
+    Used here for spatial and (optionally) temporal distance between target
+    and source sites.
     """
 
     def __init__(self, max_dist: float, fire_hidden_size: int = 32):
@@ -155,6 +168,33 @@ class TargetInput(nn.Module):
 
 
 # =============================================================================
+# Target Environment Module
+# Projects target site's own env vars into a single token appended to eco_emb.
+# Two-layer MLP + RMSNorm matches the processing depth of eco_emb.
+# =============================================================================
+
+class TargetEnvModule(nn.Module):
+    def __init__(self, config: JSDMConfig):
+        super().__init__()
+        self.env_norm = nn.LayerNorm(config.num_env_vars)
+        self.proj1    = nn.Linear(config.num_env_vars, config.hidden_size)
+        self.act      = nn.SiLU()
+        self.proj2    = nn.Linear(config.hidden_size, config.hidden_size)
+        self.out_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(self, target_env: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            target_env: (B, E)
+        Returns:
+            (B, 1, H) — one token concatenated onto eco_emb (B, C_eco, H)
+        """
+        x = self.proj1(self.env_norm(target_env))
+        x = self.proj2(self.act(x))
+        return self.out_norm(x).unsqueeze(1)
+
+
+# =============================================================================
 # Ecological Source Module (new, parallel to ST source module)
 # =============================================================================
 
@@ -197,14 +237,14 @@ class EcoSourceModule(nn.Module):
 
 # =============================================================================
 # Row Self-Attention along species axis
-# Mirrors GPNStarRowSelfAttention exactly.
-# This is the CORE — species attend to each other = interaction term.
+# Species attend to each other — the interaction term.
 # =============================================================================
 
 class SpeciesSelfAttention(nn.Module):
     """
-    GPN-star detail: Q,K from target species only (index :1), V from all.
-    Here: Q,K from target site only, V from all target sites.
+    Species self-attention along the species axis.
+    Input has been pre-transposed to (B, T, S, H). With T=1 hard-assumed
+    throughout this model, Q/K/V all come from the single target row.
     """
 
     def __init__(self, config: JSDMConfig):
@@ -233,15 +273,9 @@ class SpeciesSelfAttention(nn.Module):
         Args:
             hidden_states: (B, T, S, H) transposed before calling
         """
-        query_layer = self.transpose_for_scores(
-            self.query(hidden_states[:, :1, ...])
-        )  # (B, 1, A, S, D)
-        key_layer = self.transpose_for_scores(
-            self.key(hidden_states[:, :1, ...])
-        )  # (B, 1, A, S, D)
-        value_layer = self.transpose_for_scores(
-            self.value(hidden_states)
-        )  # (B, T, A, S, D)
+        query_layer = self.transpose_for_scores(self.query(hidden_states))  # (B, T, A, S, D)
+        key_layer   = self.transpose_for_scores(self.key(hidden_states))    # (B, T, A, S, D)
+        value_layer = self.transpose_for_scores(self.value(hidden_states))  # (B, T, A, S, D)
 
         if output_attentions:
             attn_scores = torch.matmul(
@@ -292,7 +326,7 @@ class SpeciesRowAttention(nn.Module):
 
 
 # =============================================================================
-# ST Cross-Attention (analogous to GPNStarColCrossAttention)
+# ST Cross-Attention: target species attend to source-site tokens
 # =============================================================================
 
 class STCrossAttention(nn.Module):
@@ -344,7 +378,10 @@ class STCrossAttention(nn.Module):
             if combined_mask is not None:
                 attn_scores = attn_scores + combined_mask
             attn_probs = F.softmax(attn_scores, dim=-1)
-            context = torch.matmul(attn_probs, value_layer)
+            attn_probs_drop = F.dropout(
+                attn_probs, p=self.attention_probs_dropout_prob, training=self.training
+            )
+            context = torch.matmul(attn_probs_drop, value_layer)
             context = context.transpose(-2, -3).contiguous()
             new_shape = context.size()[:-2] + (self.all_head_size,)
             context = context.view(*new_shape)
@@ -449,7 +486,10 @@ class EcoCrossAttention(nn.Module):
             attn_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
             attn_scores = attn_scores / math.sqrt(self.attention_head_size)
             attn_probs = F.softmax(attn_scores, dim=-1)
-            context = torch.matmul(attn_probs, value_layer)
+            attn_probs_drop = F.dropout(
+                attn_probs, p=self.attention_probs_dropout_prob, training=self.training
+            )
+            context = torch.matmul(attn_probs_drop, value_layer)
             context = context.transpose(-2, -3).contiguous()
             new_shape = context.size()[:-2] + (self.all_head_size,)
             context = context.view(*new_shape)
@@ -491,10 +531,9 @@ class EcoColAttention(nn.Module):
 
 
 # =============================================================================
-# Combined Attention (analogous to GPNStarAttention)
+# Combined Attention
 #
-# GPN-star: row_attention → col_attention (sequential)
-# Here: row_attention → (st_col ⊕ eco_col) → gate combine
+# row_attention → (st_col ⊕ eco_col) → gate combine
 # =============================================================================
 
 class JSDMAttention(nn.Module):
@@ -649,7 +688,7 @@ class JSDMEncoderOutput(ModelOutput):
 
 
 # =============================================================================
-# Full Model (analogous to GPNStarModel)
+# Full Model
 # =============================================================================
 
 class JSDMModel(nn.Module):
@@ -657,6 +696,7 @@ class JSDMModel(nn.Module):
         super().__init__()
         self.config = config
         self.target_input = TargetInput(config)
+        self.target_env_module = TargetEnvModule(config)
         self.eco_source_module = EcoSourceModule(config)
         self.encoder = JSDMEncoder(config)
 
@@ -666,7 +706,8 @@ class JSDMModel(nn.Module):
         source_ids,             # (B, S, N) long — 0=absent, 1=present, 2=blinded
         source_idx,             # (B, N) long — indices into full distance matrices
         target_site_idx,        # (B, T) long
-        env_data,               # (B, N, E)
+        env_data,               # (B, N, E) — source site env vars
+        target_env,             # (B, E)    — target site's own env vars
         spatial_dist_pairwise,  # (N_total, N_total) float
         temporal_dist_pairwise, # (N_total, N_total) float
         output_attentions=False,
@@ -681,20 +722,18 @@ class JSDMModel(nn.Module):
         species_emb = self.target_input.species_embedding(species_idx)  # (S, H)
         source_emb = self.target_input.embedding(source_ids) + species_emb[None, :, None, :]
 
-        # 3. Ecological context
-        eco_emb = self.eco_source_module(env_data)  # (B, C_eco, H)
+        # 3. Ecological context: source-site env groups + target site env as one extra token
+        eco_emb = self.eco_source_module(env_data)                    # (B, C_eco, H)
+        target_env_token = self.target_env_module(target_env)         # (B, 1, H)
+        eco_emb = torch.cat([eco_emb, target_env_token], dim=1)       # (B, C_eco+1, H)
 
-        # 4. Target-to-source distances via gather
+        # 4. Target-to-source distances via fancy indexing (avoids (B, T, N_total) intermediate)
         sp_pw = spatial_dist_pairwise.to(hidden_states.device)
         tp_pw = temporal_dist_pairwise.to(hidden_states.device)
-        B, T = target_site_idx.shape
-        N = source_idx.shape[1]
-
-        target_sp_all = sp_pw[target_site_idx]  # (B, T, N_total)
-        target_tp_all = tp_pw[target_site_idx]  # (B, T, N_total)
-        src_idx_exp = source_idx[:, None, :].expand(-1, T, -1)  # (B, T, N)
-        target_to_source_sp = target_sp_all.gather(2, src_idx_exp)  # (B, T, N)
-        target_to_source_tp = target_tp_all.gather(2, src_idx_exp)  # (B, T, N)
+        tgt_idx = target_site_idx[:, :, None]   # (B, T, 1)
+        src_idx = source_idx[:, None, :]        # (B, 1, N)
+        target_to_source_sp = sp_pw[tgt_idx, src_idx]  # (B, T, N)
+        target_to_source_tp = tp_pw[tgt_idx, src_idx]  # (B, T, N)
         st_dist = torch.stack([target_to_source_sp, target_to_source_tp], dim=-1)  # (B, T, N, 2)
 
         # 5. Encode — no attention mask needed (blinding handled in collator)
@@ -708,7 +747,7 @@ class JSDMModel(nn.Module):
 
 
 # =============================================================================
-# Masked prediction wrapper (analogous to GPNStarForMaskedLM)
+# Masked prediction wrapper
 # =============================================================================
 
 @dataclass
