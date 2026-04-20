@@ -24,7 +24,7 @@ Species values must be 0/1.
 - `--num_source_sites` (default `64`) — N source sites per target, weighted by proximity.
 - `--blind_percentile` (default `2.0`) — proximity threshold below which source entries are masked for masked species (prevents trivial copying).
 - `--env_cols col1 col2 ...` — explicit env column list; otherwise all columns with `env_` prefix.
-- `--euclidean_coords` — use Euclidean distance (for simulated data).
+- `--euclidean_coords` — use Euclidean distance.
 - `--no_time` — purely spatial model (disable temporal FIRE bias).
 
 **Model** (train / ablation only)
