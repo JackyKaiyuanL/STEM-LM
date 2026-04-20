@@ -172,12 +172,14 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--p", type=_parse_rate, default=None,
+                        help="Per-row mask rate applied to both presences and absences. "
+                             "Float in [0,1] or 'rand[:lo,hi]' (Uniform[lo, hi] per row; "
+                             "'rand' = 'rand:0.0,1.0'). Overrides --p_pres/--p_abs if set.")
     parser.add_argument("--p_pres", type=_parse_rate, default=0.15,
-                        help="Per-row mask rate for presences. Float in [0,1] or "
-                             "'rand[:lo,hi]' (Uniform[lo, hi] per row; 'rand' = 'rand:0.0,1.0').")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--p_abs",  type=_parse_rate, default=0.15,
-                        help="Per-row mask rate for absences. Same format as --p_pres. "
-                             "Set to 1.0 for presence-only training (all absences hidden).")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--train_frac", type=float, default=0.8)
     parser.add_argument("--test_frac", type=float, default=0.1,
                         help="Fraction of data held out as test set for final AUC. "
@@ -225,6 +227,11 @@ def main():
     parser.add_argument("--no_save_splits", action="store_true",
                         help="Skip writing splits.json to output_dir.")
     args = parser.parse_args()
+
+    # --p is a convenience that sets both p_pres and p_abs to the same rate.
+    if args.p is not None:
+        args.p_pres = args.p
+        args.p_abs = args.p
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)

@@ -33,11 +33,10 @@ Species values must be 0/1.
 
 **Training**
 - `--batch_size` (`32`), `--num_epochs` (`50`), `--learning_rate` (`1e-4`), `--weight_decay` (`0.01`).
-- `--p_pres` / `--p_abs` (both `0.15`) — per-row mask rates for presences (species value `1`) and absences (`0`). Each accepts a float in `[0, 1]` or a `rand[:lo,hi]` string (sample `Uniform[lo, hi]` per row; bare `rand` = `rand:0.0,1.0`). Example regimes:
-  - `--p_pres 0.15 --p_abs 0.15` — fixed 15% random masking (classical JSDM, current default).
-  - `--p_pres rand --p_abs rand` — independent per-class rates per row; mixed-rate training over the full square.
-  - `--p_pres rand:0.3,1.0 --p_abs 1.0` — presence-only training: all absences hidden; 30–100% of presences hidden per row.
-  - `--p_pres 1.0 --p_abs 1.0` — always 100% mask (matches the `predict` deployment regime).
+- `--p` (default `0.15`) — per-row mask rate applied to both presences and absences. Accepts a float in `[0, 1]` or a `rand[:lo,hi]` string (sample `Uniform[lo, hi]` per row; bare `rand` = `rand:0.0,1.0`). Example regimes:
+  - `--p 0.15` — fixed 15% random masking (classical JSDM, current default).
+  - `--p rand` — sample a single mask rate per row from `Uniform[0, 1]`; covers the full range in training.
+  - `--p 1.0` — always 100% mask (matches the `predict` deployment regime).
 - `--max_grad_norm` (`1.0`) — gradient clipping.
 - `--class_weighting` + `--class_weighting_beta` (`0.999`) — up-weight rare species (effective-number).
 - `--gradient_checkpointing` — trade compute for memory.
