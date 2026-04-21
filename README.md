@@ -17,7 +17,7 @@ Species values must be 0/1.
 
 **Data / split**
 - `--fold {random,h3,grid}` — split strategy. `h3` is spatial block CV (real lat/lon); `grid` is for euclidean/simulated coords.
-- `--h3_resolution` (default `2`, ~183 km cells) — finer = more, smaller cells.
+- `--resolution` — block resolution. For `--fold h3`, H3 resolution `0..15` (default `2`, ~183 km edge). For `--fold grid`, grid side length (any positive integer; default `20` → `20×20` cells). Must not be set with `--fold random`.
 - `--train_frac` / `--test_frac` (default `0.8` / `0.1`) — val is the remainder.
 - `--splits_path` — path to a `splits.json` from a prior training run; bypasses fold recomputation. Use this to keep train/val/test partitions identical across ablations and inference. Row indices are stored, so the CSV must not have been reordered or resized.
 - `--no_save_splits` (train / ablation) — suppress the automatic `splits.json` dump written next to `best_model.pt`.
@@ -45,7 +45,7 @@ Species values must be 0/1.
 - `--ablation {full,no_st,no_eco,no_st_eco}` — which cross-attention branches to keep. Param counts differ across modes; a note is written to `ablation_summary.json`.
 
 **Inference**
-- `predict` subcommand flags: `--eval_split {val,test}` (default `test`), plus the data/split flags above. Pass `--splits_path <model_dir>/splits.json` to reuse the exact train/val/test partition from training; otherwise supply matching `--h3_resolution`/`--train_frac`/`--test_frac`/`--seed` so the H3 split is reproduced.
+- `predict` subcommand flags: `--eval_split {val,test}` (default `test`), plus the data/split flags above. Pass `--splits_path <model_dir>/splits.json` to reuse the exact train/val/test partition from training; otherwise supply matching `--fold`/`--resolution`/`--train_frac`/`--test_frac`/`--seed` so the split is reproduced.
 - `interactions` subcommand also accepts `--splits_path` to restrict the source pool to the original training rows.
 - Species ordering in the CSV must match the trained model's `species_names.json`; the script asserts this and errors on mismatch.
 

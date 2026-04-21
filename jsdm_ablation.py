@@ -412,8 +412,10 @@ def main():
     parser.add_argument("--class_weighting_beta", type=float, default=0.999)
     parser.add_argument("--env_cols", nargs="+", default=None)
     parser.add_argument("--fold", choices=["random", "h3", "grid"], default="random")
-    parser.add_argument("--h3_resolution", type=int, default=2)
-    parser.add_argument("--grid_cells", type=int, default=20)
+    parser.add_argument("--resolution", type=int, default=None,
+                        help="Block resolution for spatial splits. For --fold h3, this is the H3 "
+                             "resolution in [0, 15] (default 2). For --fold grid, this is the grid "
+                             "side length (default 20). Not valid with --fold random.")
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--splits_path", type=str, default=None,
                         help="Path to a splits.json (e.g. from a baseline training run). "
@@ -426,6 +428,22 @@ def main():
     if args.p is not None:
         args.p_pres = args.p
         args.p_abs = args.p
+
+    # Split arg validation/defaults (ignored when loading saved splits).
+    if args.splits_path is None:
+        if args.fold == "random":
+            if args.resolution is not None:
+                raise ValueError("--resolution is not valid with --fold random.")
+        elif args.fold == "h3":
+            if args.resolution is None:
+                args.resolution = 2
+            if not (0 <= int(args.resolution) <= 15):
+                raise ValueError("--resolution for --fold h3 must be an integer in [0, 15].")
+        else:  # grid
+            if args.resolution is None:
+                args.resolution = 20
+            if int(args.resolution) < 1:
+                raise ValueError("--resolution for --fold grid must be a positive integer.")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -467,8 +485,7 @@ def main():
         euclidean_coords=args.euclidean_coords,
         no_time=args.no_time,
         fold_method=args.fold,
-        h3_resolution=args.h3_resolution,
-        grid_cells=args.grid_cells,
+        resolution=args.resolution,
         saved_splits=saved_splits,
     )
 
@@ -479,8 +496,7 @@ def main():
             num_rows=len(dataset),
             meta={
                 "fold":          args.fold if saved_splits is None else "loaded",
-                "h3_resolution": args.h3_resolution,
-                "grid_cells":    args.grid_cells,
+                "resolution":    args.resolution,
                 "train_frac":    args.train_frac,
                 "test_frac":     args.test_frac,
                 "seed":          args.seed,

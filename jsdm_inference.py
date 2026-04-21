@@ -17,7 +17,14 @@ from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
 
 from jsdm_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
-from jsdm_data import JSDMDataset, JSDMDataCollator, compute_dist_info, h3_block_split, load_splits
+from jsdm_data import (
+    JSDMDataset,
+    JSDMDataCollator,
+    compute_dist_info,
+    grid_block_split,
+    h3_block_split,
+    load_splits,
+)
 
 
 def load_model(model_dir, device):
@@ -54,6 +61,7 @@ def build_dataset_and_dist(args, config):
         csv_path=args.csv_path,
         num_source_sites=config.num_source_sites,
         no_time=no_time,
+        euclidean_coords=args.euclidean_coords,
     )
     dist_info = compute_dist_info(
         spatial_dist=dataset.spatial_dists,
@@ -130,7 +138,14 @@ def add_common_args(p):
     p.add_argument("--euclidean_coords", action="store_true")
     p.add_argument("--splits_path",      type=str,   default=None,
                    help="Path to splits.json from training; bypasses fold recomputation.")
-    p.add_argument("--h3_resolution",    type=int,   default=2)
+    p.add_argument("--fold", choices=["random", "h3", "grid"], default="random",
+                   help="Train/val/test split strategy. Prefer passing --splits_path to "
+                        "exactly match training; otherwise use the same --fold/--resolution "
+                        "as training.")
+    p.add_argument("--resolution", type=int, default=None,
+                   help="Block resolution for spatial splits. For --fold h3, this is the H3 "
+                        "resolution in [0, 15] (default 2). For --fold grid, this is the grid "
+                        "side length (default 20). Not valid with --fold random.")
     p.add_argument("--train_frac",       type=float, default=0.8)
     p.add_argument("--test_frac",        type=float, default=0.1)
     p.add_argument("--seed",             type=int,   default=42)
@@ -173,7 +188,7 @@ def main():
 
     # Split — restrict sources to training observations only. Prefer a saved
     # splits.json (from training) so eval matches exactly; otherwise recompute
-    # H3 split with the same flags the model was trained on.
+    # the split with the same flags the model was trained on.
     splits_path = getattr(args, "splits_path", None)
     if splits_path is not None:
         print(f"Loading splits from {splits_path}")
@@ -181,11 +196,38 @@ def main():
             splits_path, expected_num_rows=len(dataset)
         )
     else:
-        train_idx, val_idx, test_idx = h3_block_split(
-            dataset.lats, dataset.lons,
-            resolution=args.h3_resolution,
-            train_frac=args.train_frac, test_frac=args.test_frac, seed=args.seed,
-        )
+        if args.fold == "random":
+            if args.resolution is not None:
+                raise ValueError("--resolution is not valid with --fold random.")
+            rng = np.random.RandomState(args.seed)
+            indices = rng.permutation(len(dataset))
+            n_train = int(len(dataset) * args.train_frac)
+            n_test = int(len(dataset) * args.test_frac)
+            train_idx = indices[:n_train]
+            val_idx = indices[n_train : len(dataset) - n_test if n_test > 0 else len(dataset)]
+            test_idx = indices[len(dataset) - n_test :] if n_test > 0 else np.array([], dtype=int)
+        elif args.fold == "h3":
+            if args.euclidean_coords:
+                raise ValueError("--fold h3 requires real lat/lon coordinates. Use --fold grid for euclidean datasets.")
+            resolution = 2 if args.resolution is None else args.resolution
+            if not (0 <= int(resolution) <= 15):
+                raise ValueError("--resolution for --fold h3 must be an integer in [0, 15].")
+            train_idx, val_idx, test_idx = h3_block_split(
+                dataset.lats, dataset.lons,
+                resolution=int(resolution),
+                train_frac=args.train_frac, test_frac=args.test_frac, seed=args.seed,
+            )
+        else:  # grid
+            if not args.euclidean_coords:
+                raise ValueError("--fold grid is for euclidean/simulated datasets. Use --fold h3 for real lat/lon.")
+            resolution = 20 if args.resolution is None else args.resolution
+            if int(resolution) < 1:
+                raise ValueError("--resolution for --fold grid must be a positive integer.")
+            train_idx, val_idx, test_idx = grid_block_split(
+                dataset.lats, dataset.lons,
+                n_cells=int(resolution),
+                train_frac=args.train_frac, test_frac=args.test_frac, seed=args.seed,
+            )
     dataset.source_pool = train_idx
     print(f"Source pool: {len(train_idx)} training observations")
 
