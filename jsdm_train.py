@@ -210,11 +210,11 @@ def main():
                         help="Train/val/test split strategy. 'random': shuffled rows (default). "
                              "'h3': spatial blocks via H3 hexagonal grid (real lat/lon only). "
                              "'grid': spatial blocks via regular 2D grid (euclidean_coords only).")
-    parser.add_argument("--h3_resolution", type=int, default=2,
-                        help="H3 resolution for --fold h3 (default 2, ~183km edge). "
-                             "Larger number = finer cells (res 1=483km, 2=183km, 3=69km, 4=26km).")
-    parser.add_argument("--grid_cells", type=int, default=20,
-                        help="Grid side length for --fold grid (default 20 → 20×20 cells).")
+    parser.add_argument("--resolution", type=int, default=None,
+                        help="Block resolution for spatial splits. For --fold h3, this is the H3 "
+                             "resolution in [0, 15] (default 2 ≈ 183 km edge). For --fold grid, "
+                             "this is the grid side length (default 20 → 20×20 cells). Not valid "
+                             "with --fold random.")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                         help="Gradient clipping max norm (default 1.0).")
     parser.add_argument("--interaction_extract_batches", type=int, default=20,
@@ -222,7 +222,7 @@ def main():
                              "interaction matrix at the end of training (default 20).")
     parser.add_argument("--splits_path", type=str, default=None,
                         help="Path to a splits.json (written by a previous training run). "
-                             "When set, overrides --fold / --h3_resolution / --grid_cells / "
+                             "When set, overrides --fold / --resolution / "
                              "--seed for the split, so train/val/test are exactly reproduced.")
     parser.add_argument("--no_save_splits", action="store_true",
                         help="Skip writing splits.json to output_dir.")
@@ -232,6 +232,22 @@ def main():
     if args.p is not None:
         args.p_pres = args.p
         args.p_abs = args.p
+
+    # Split arg validation/defaults (ignored when loading saved splits).
+    if args.splits_path is None:
+        if args.fold == "random":
+            if args.resolution is not None:
+                raise ValueError("--resolution is not valid with --fold random.")
+        elif args.fold == "h3":
+            if args.resolution is None:
+                args.resolution = 2
+            if not (0 <= int(args.resolution) <= 15):
+                raise ValueError("--resolution for --fold h3 must be an integer in [0, 15].")
+        else:  # grid
+            if args.resolution is None:
+                args.resolution = 20
+            if int(args.resolution) < 1:
+                raise ValueError("--resolution for --fold grid must be a positive integer.")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -263,8 +279,7 @@ def main():
         euclidean_coords=args.euclidean_coords,
         no_time=args.no_time,
         fold_method=args.fold,
-        h3_resolution=args.h3_resolution,
-        grid_cells=args.grid_cells,
+        resolution=args.resolution,
         saved_splits=saved_splits,
     )
 
@@ -276,8 +291,7 @@ def main():
             num_rows=len(dataset),
             meta={
                 "fold":          args.fold if saved_splits is None else "loaded",
-                "h3_resolution": args.h3_resolution,
-                "grid_cells":    args.grid_cells,
+                "resolution":    args.resolution,
                 "train_frac":    args.train_frac,
                 "test_frac":     args.test_frac,
                 "seed":          args.seed,

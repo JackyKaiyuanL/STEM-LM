@@ -386,7 +386,7 @@ def save_splits(path: str, train_idx, val_idx, test_idx, num_rows: Optional[int]
 
     `num_rows` is stored as a sanity check — load_splits rejects the file if
     the CSV it is being applied to has a different row count.
-    `meta` can carry fold_method, h3_resolution, seed, etc. for provenance.
+    `meta` can carry fold method, resolution, seed, etc. for provenance.
     """
     payload = {
         "num_rows": int(num_rows) if num_rows is not None else None,
@@ -460,7 +460,7 @@ def create_dataloaders(
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
     euclidean_coords=False, no_time=False,
-    fold_method="random", h3_resolution=2, grid_cells=20,
+    fold_method="random", resolution: Optional[int] = None,
     saved_splits: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     restrict_source_pool_with_saved_splits: bool = True,
 ):
@@ -505,22 +505,32 @@ def create_dataloaders(
     elif fold_method == "h3":
         if euclidean_coords:
             raise ValueError("--fold h3 requires real lat/lon coordinates. Use --fold grid for euclidean datasets.")
+        if resolution is None:
+            resolution = 2
+        if not isinstance(resolution, int) or not (0 <= resolution <= 15):
+            raise ValueError("--resolution for --fold h3 must be an integer in [0, 15].")
         train_indices, val_indices, test_indices = h3_block_split(
             dataset.lats, dataset.lons,
-            resolution=h3_resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
+            resolution=resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
         )
         source_pool_restricted = True
         split_origin = "h3"
     elif fold_method == "grid":
         if not euclidean_coords:
             raise ValueError("--fold grid is for euclidean/simulated datasets. Use --fold h3 for real lat/lon.")
+        if resolution is None:
+            resolution = 20
+        if not isinstance(resolution, int) or resolution < 1:
+            raise ValueError("--resolution for --fold grid must be a positive integer.")
         train_indices, val_indices, test_indices = grid_block_split(
             dataset.lats, dataset.lons,
-            n_cells=grid_cells, train_frac=train_frac, test_frac=test_frac, seed=seed,
+            n_cells=resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
         )
         source_pool_restricted = True
         split_origin = "grid"
     else:  # random (default)
+        if resolution is not None:
+            raise ValueError("--resolution is only valid with --fold {h3,grid}.")
         np.random.seed(seed)
         n = len(dataset)
         indices = np.random.permutation(n)
