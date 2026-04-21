@@ -16,7 +16,7 @@ Species values must be 0/1.
 ## Options (shared across scripts unless noted)
 
 **Data / split**
-- `--fold {random,h3,grid}` — split strategy. `h3` is spatial block CV (real lat/lon); `grid` is for euclidean/simulated coords.
+- `--fold {random,h3,grid}` — split strategy. `h3` is spatial block CV (real lat/lon); `grid` is for euclidean coords.
 - `--resolution` — block resolution. For `--fold h3`, H3 resolution `0..15` (default `2`, ~183 km edge). For `--fold grid`, grid side length (any positive integer; default `20` → `20×20` cells). Must not be set with `--fold random`.
 - `--train_frac` / `--test_frac` (default `0.8` / `0.1`) — val is the remainder.
 - `--splits_path` — path to a `splits.json` from a prior training run; bypasses fold recomputation. Use this to keep train/val/test partitions identical across ablations and inference. Row indices are stored, so the CSV must not have been reordered or resized.
