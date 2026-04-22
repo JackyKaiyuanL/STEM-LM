@@ -542,13 +542,10 @@ class JSDMAttention(nn.Module):
         self.row_attention = SpeciesRowAttention(config)
         self.st_col_attention = STColAttention(config)
         self.eco_col_attention = EcoColAttention(config)
-        # Content-conditional gate: shared H -> H/8 -> 1 MLP routes ST vs Eco per
-        # (example, species, site) from the pre-cross hidden state. Shared across
-        # species so every forward updates it — no per-species gradient dilution.
         self.combine_gate = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size // 8),
+            nn.Linear(config.hidden_size, config.hidden_size * 2),
             nn.SiLU(),
-            nn.Linear(config.hidden_size // 8, 1),
+            nn.Linear(config.hidden_size * 2, 1),
         )
         # Pre-norm layers: applied before each sub-block; residual added here, not inside sub-modules
         self.row_norm  = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
