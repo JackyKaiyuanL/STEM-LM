@@ -144,7 +144,7 @@ def add_common_args(p):
                         "as training.")
     p.add_argument("--resolution", type=int, default=None,
                    help="Block resolution for spatial splits. For --fold h3, this is the H3 "
-                        "resolution in [0, 15] (default 2). For --fold grid, this is the grid "
+                        "resolution in [0, 15] (default 3). For --fold grid, this is the grid "
                         "side length (default 20). Not valid with --fold random.")
     p.add_argument("--train_frac",       type=float, default=0.8)
     p.add_argument("--test_frac",        type=float, default=0.1)
@@ -209,7 +209,7 @@ def main():
         elif args.fold == "h3":
             if args.euclidean_coords:
                 raise ValueError("--fold h3 requires real lat/lon coordinates. Use --fold grid for euclidean datasets.")
-            resolution = 2 if args.resolution is None else args.resolution
+            resolution = 3 if args.resolution is None else args.resolution
             if not (0 <= int(resolution) <= 15):
                 raise ValueError("--resolution for --fold h3 must be an integer in [0, 15].")
             train_idx, val_idx, test_idx = h3_block_split(

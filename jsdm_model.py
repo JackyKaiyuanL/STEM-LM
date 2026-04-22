@@ -542,9 +542,14 @@ class JSDMAttention(nn.Module):
         self.row_attention = SpeciesRowAttention(config)
         self.st_col_attention = STColAttention(config)
         self.eco_col_attention = EcoColAttention(config)
-        # Per-species gate: each species learns its own ST vs ecological context balance.
-        # init=0 → sigmoid(0)=0.5 for all species. Learns habitat-specialists vs range-generalists.
-        self.combine_gate = nn.Parameter(torch.zeros(config.num_species))
+        # Content-conditional gate: shared H -> H/8 -> 1 MLP routes ST vs Eco per
+        # (example, species, site) from the pre-cross hidden state. Shared across
+        # species so every forward updates it — no per-species gradient dilution.
+        self.combine_gate = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size // 8),
+            nn.SiLU(),
+            nn.Linear(config.hidden_size // 8, 1),
+        )
         # Pre-norm layers: applied before each sub-block; residual added here, not inside sub-modules
         self.row_norm  = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.cross_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -566,7 +571,7 @@ class JSDMAttention(nn.Module):
         st_output  = self.st_col_attention(h_normed, st_source_embeddings, st_attention_mask, st_dist, output_attentions)
         eco_output = self.eco_col_attention(h_normed, eco_embeddings, output_attentions)
 
-        gate = torch.sigmoid(self.combine_gate[None, :, None, None])  # (1, S, 1, 1)
+        gate = torch.sigmoid(self.combine_gate(h_normed))  # (B, S, T, 1)
         h = h + gate * st_output[0] + (1 - gate) * eco_output[0]
 
         out = (h,)

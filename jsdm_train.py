@@ -17,7 +17,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from jsdm_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
-from jsdm_data import create_dataloaders, save_splits, load_splits
+from jsdm_data import create_dataloaders, save_splits, load_splits, build_val_loaders_fixed_p
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -197,11 +197,22 @@ def main():
     parser.add_argument("--euclidean_coords", action="store_true",
                         help="Use Euclidean distance instead of haversine. "
                              "For simulated or arbitrary 2D coordinates (not geographic degrees).")
-    parser.add_argument("--class_weighting", action="store_true",
-                        help="Up-weight rare species using effective number weighting")
-    parser.add_argument("--class_weighting_beta", type=float, default=0.999,
-                        help="Beta for effective number class weighting (default 0.999). "
-                             "Lower values (e.g. 0.99) reduce the weight on rare species.")
+    parser.add_argument(
+        "--class_weighting",
+        type=float,
+        nargs="?",
+        const=0.999,
+        default=0.999,
+        help="Effective-number class weighting beta in (0,1). "
+             "Default 0.999 (enabled even if not provided). "
+             "Pass e.g. '--class_weighting 0.99' to reduce weighting. "
+             "Use --no_class_weighting to disable.",
+    )
+    parser.add_argument(
+        "--no_class_weighting",
+        action="store_true",
+        help="Disable per-species loss weighting (overrides --class_weighting).",
+    )
     parser.add_argument("--env_cols", nargs="+", default=None,
                         help="Explicit list of env column names. If not set, columns with 'env_' "
                              "prefix are used. Useful for datasets with non-prefixed env columns "
@@ -212,7 +223,7 @@ def main():
                              "'grid': spatial blocks via regular 2D grid (euclidean_coords only).")
     parser.add_argument("--resolution", type=int, default=None,
                         help="Block resolution for spatial splits. For --fold h3, this is the H3 "
-                             "resolution in [0, 15] (default 2 ≈ 183 km edge). For --fold grid, "
+                             "resolution in [0, 15] (default 3 ≈ 68 km edge). For --fold grid, "
                              "this is the grid side length (default 20 → 20×20 cells). Not valid "
                              "with --fold random.")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
@@ -226,6 +237,11 @@ def main():
                              "--seed for the split, so train/val/test are exactly reproduced.")
     parser.add_argument("--no_save_splits", action="store_true",
                         help="Skip writing splits.json to output_dir.")
+    parser.add_argument("--val_p_list", type=float, nargs="+",
+                        default=[0.25, 0.5, 0.75, 1.0],
+                        help="Fixed mask rates for val AUC (deterministic per batch). "
+                             "Mean AUC across these drives best_model.pt selection, giving "
+                             "apples-to-apples comparison across runs (default 0.25 0.5 0.75 1.0).")
     args = parser.parse_args()
 
     # --p is a convenience that sets both p_pres and p_abs to the same rate.
@@ -240,7 +256,7 @@ def main():
                 raise ValueError("--resolution is not valid with --fold random.")
         elif args.fold == "h3":
             if args.resolution is None:
-                args.resolution = 2
+                args.resolution = 3
             if not (0 <= int(args.resolution) <= 15):
                 raise ValueError("--resolution for --fold h3 must be an integer in [0, 15].")
         else:  # grid
@@ -302,12 +318,13 @@ def main():
 
     # Per-species loss weighting (effective number)
     loss_weight = None
-    if args.class_weighting:
+    if not args.no_class_weighting:
+        beta = args.class_weighting
         loss_weight = compute_class_weights(
-            dataset.species_data, train_loader.dataset.indices, beta=args.class_weighting_beta
+            dataset.species_data, train_loader.dataset.indices, beta=beta
         )
         logger.info(
-            f"Class weighting: weight range "
+            f"Class weighting (beta={beta:.3f}): weight range "
             f"[{loss_weight.min().item():.3f}, {loss_weight.max().item():.3f}]"
         )
 
@@ -346,7 +363,20 @@ def main():
     if args.gradient_checkpointing:
         model.model.encoder.gradient_checkpointing = True
 
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    # Exclude norms, biases, and gate MLP from weight decay.
+    no_decay_keys = ("norm", "bias", "combine_gate")
+    decay_params, nodecay_params = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (nodecay_params if any(k in n for k in no_decay_keys) else decay_params).append(p)
+    optimizer = AdamW(
+        [
+            {"params": decay_params,   "weight_decay": args.weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ],
+        lr=args.learning_rate,
+    )
     total_steps = len(train_loader) * args.num_epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
@@ -354,39 +384,72 @@ def main():
     # tensors would be retransferred on every forward pass.
     dist_info = move_dist_info_to_device(dist_info, device)
 
-    log_csv = os.path.join(args.output_dir, "training_log.csv")
-    with open(log_csv, "w", newline="") as f:
-        csv.writer(f).writerow(["epoch", "train_loss", "train_acc", "val_loss", "val_acc", "val_auc", "lr", "elapsed_s"])
+    # Fixed-p val loaders for selection: deterministic masks, stable across
+    # epochs/runs, so checkpoint selection reflects real improvement.
+    fixed_val_loaders = build_val_loaders_fixed_p(
+        dataset, splits["val"], dist_info, args.val_p_list,
+        batch_size=args.batch_size, num_workers=args.num_workers, base_seed=args.seed,
+    )
 
-    best_val_loss = float("inf")
+    log_csv = os.path.join(args.output_dir, "training_log.csv")
+    per_p_header = []
+    for p, _ in fixed_val_loaders:
+        per_p_header += [f"val_loss_p{p:.2f}", f"val_acc_p{p:.2f}", f"val_auc_p{p:.2f}"]
+    with open(log_csv, "w", newline="") as f:
+        csv.writer(f).writerow(
+            ["epoch", "train_loss", "train_acc",
+             *per_p_header, "val_loss_mean", "val_acc_mean", "val_auc_mean",
+             "lr", "elapsed_s"]
+        )
+
+    best_val_auc_mean = -float("inf")
     for epoch in range(1, args.num_epochs + 1):
         t0 = time.time()
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, scheduler, device, dist_info, epoch,
             loss_weight=loss_weight, max_grad_norm=args.max_grad_norm,
         )
-        val_loss, val_acc, val_auc, _ = evaluate(model, val_loader, device, dist_info)
+        per_p_loss, per_p_acc, per_p_auc, per_p_nauc = [], [], [], []
+        for p, loader in fixed_val_loaders:
+            l, a, u, per_species = evaluate(model, loader, device, dist_info)
+            per_p_loss.append(l)
+            per_p_acc.append(a)
+            per_p_auc.append(u)
+            per_p_nauc.append(len(per_species))
+        val_loss_mean = float(np.mean(per_p_loss)) if per_p_loss else float("nan")
+        val_acc_mean  = float(np.mean(per_p_acc))  if per_p_acc  else float("nan")
+        val_auc_mean  = float(np.mean(per_p_auc))  if per_p_auc  else float("nan")
         elapsed = time.time() - t0
         current_lr = scheduler.get_last_lr()[0]
+        per_p_str = " ".join(
+            f"p{p:.2f}(loss={l:.3f},acc={a:.3f},auc={u:.3f},n_auc={n})"
+            for (p, _), l, a, u, n in zip(
+                fixed_val_loaders, per_p_loss, per_p_acc, per_p_auc, per_p_nauc
+            )
+        )
         logger.info(
             f"Epoch {epoch}/{args.num_epochs} | "
             f"Train loss={train_loss:.4f} acc={train_acc:.4f} | "
-            f"Val loss={val_loss:.4f} acc={val_acc:.4f} auc={val_auc:.4f} | {elapsed:.1f}s"
+            f"{per_p_str} | mean auc={val_auc_mean:.4f} | {elapsed:.1f}s"
         )
         with open(log_csv, "a", newline="") as f:
-            csv.writer(f).writerow([epoch, f"{train_loss:.6f}", f"{train_acc:.6f}",
-                                     f"{val_loss:.6f}", f"{val_acc:.6f}", f"{val_auc:.6f}",
-                                     f"{current_lr:.2e}", f"{elapsed:.1f}"])
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+            row = [epoch, f"{train_loss:.6f}", f"{train_acc:.6f}"]
+            for l, a, u in zip(per_p_loss, per_p_acc, per_p_auc):
+                row += [f"{l:.6f}", f"{a:.6f}", f"{u:.6f}"]
+            row += [f"{val_loss_mean:.6f}", f"{val_acc_mean:.6f}", f"{val_auc_mean:.6f}",
+                    f"{current_lr:.2e}", f"{elapsed:.1f}"]
+            csv.writer(f).writerow(row)
+        if val_auc_mean > best_val_auc_mean:
+            best_val_auc_mean = val_auc_mean
             torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
-            logger.info(f"  → Best model saved")
+            logger.info(f"  → Best model saved (val_auc_mean={val_auc_mean:.4f})")
 
         if epoch % 10 == 0:
             torch.save({
                 "epoch": epoch, "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": val_loss,
+                "val_loss_mean": val_loss_mean,
+                "val_auc_mean": val_auc_mean,
             }, os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"))
 
     # Per-species AUC on best model — use held-out test set if available,

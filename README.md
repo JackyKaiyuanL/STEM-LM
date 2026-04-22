@@ -38,8 +38,9 @@ Species values must be 0/1.
   - `--p rand` — sample a single mask rate per row from `Uniform[0, 1]`; covers the full range in training.
   - `--p 1.0` — always 100% mask (matches the `predict` deployment regime).
 - `--max_grad_norm` (`1.0`) — gradient clipping.
-- `--class_weighting` + `--class_weighting_beta` (`0.999`) — up-weight rare species (effective-number).
+- `--class_weighting` (`0.999`) — up-weight rare species (effective-number).
 - `--gradient_checkpointing` — trade compute for memory.
+- `--val_p_list` (default `0.25 0.5 0.75 1.0`) — fixed mask rates evaluated each epoch with deterministic per-batch seeding (`FixedPValCollator`). Per-p val AUCs are logged to `training_log.csv` as `val_auc_p0.25 ... val_auc_p1.00`; their mean (`val_auc_mean`) drives `best_model.pt` selection, so checkpoint choice is independent of per-batch mask-rate sampling noise.
 
 **Ablation**
 - `--ablation {full,no_st,no_eco,no_st_eco}` — which cross-attention branches to keep. Param counts differ across modes; a note is written to `ablation_summary.json`.
