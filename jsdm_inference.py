@@ -67,8 +67,12 @@ def run_forward(model, batch, dist_info, device, output_attentions=False):
         env_data=batch["env_data"],
         target_env=batch["target_env"],
         labels=batch["labels"],
-        spatial_dist_pairwise=dist_info["spatial_dist_pairwise"],
-        temporal_dist_pairwise=dist_info["temporal_dist_pairwise"],
+        site_lats=dist_info["site_lats"],
+        site_lons=dist_info["site_lons"],
+        site_times=dist_info["site_times"],
+        spatial_scale_km=dist_info["spatial_scale_km"],
+        temporal_scale_days=dist_info["temporal_scale_days"],
+        euclidean=dist_info.get("euclidean", False),
         output_attentions=output_attentions,
     )
 
@@ -81,21 +85,15 @@ def build_dataset_and_dist(args, config):
         no_time=no_time,
         euclidean_coords=args.euclidean_coords,
     )
-    dist_info = compute_dist_info(
-        spatial_dist=dataset.spatial_dists,
-        temporal_dist=dataset.temporal_dists,
-        spatial_scale_km=dataset.spatial_scale_km,
-        temporal_scale_days=dataset.temporal_scale_days,
-        blind_percentile=args.blind_percentile,
-    )
+    dist_info = compute_dist_info(dataset, blind_percentile=args.blind_percentile)
     return dataset, dist_info
 
 
 @torch.no_grad()
 def predict(model, loader, dist_info, device, species_names):
     dist_info = dict(dist_info)
-    dist_info["spatial_dist_pairwise"] = dist_info["spatial_dist_pairwise"].to(device)
-    dist_info["temporal_dist_pairwise"] = dist_info["temporal_dist_pairwise"].to(device)
+    for k in ("site_lats", "site_lons", "site_times"):
+        dist_info[k] = dist_info[k].to(device)
 
     all_probs, all_labels = [], []
     n_batches = len(loader)
@@ -126,8 +124,8 @@ def compute_auc(probs, labels, species_names):
 @torch.no_grad()
 def extract_interactions(model, loader, dist_info, device, species_names, num_batches=50):
     dist_info = dict(dist_info)
-    dist_info["spatial_dist_pairwise"] = dist_info["spatial_dist_pairwise"].to(device)
-    dist_info["temporal_dist_pairwise"] = dist_info["temporal_dist_pairwise"].to(device)
+    for k in ("site_lats", "site_lons", "site_times"):
+        dist_info[k] = dist_info[k].to(device)
     per_layer = {i: [] for i in range(model.config.num_hidden_layers)}
 
     for i, batch in enumerate(loader):
@@ -265,7 +263,10 @@ def main():
             print(f"\n── p = {p:.2f} ──")
             collator = FixedPValCollator(
                 p=p,
-                combined_dist=dist_info["combined_dist"],
+                site_lats=dataset.lats, site_lons=dataset.lons, site_times=dataset.times,
+                spatial_scale_km=dataset.spatial_scale_km,
+                temporal_scale_days=dataset.temporal_scale_days,
+                euclidean=dataset.euclidean_coords,
                 blind_threshold=dist_info["blind_threshold"],
                 base_seed=args.seed + 10_000 + 1000 * i,
             )
@@ -325,7 +326,10 @@ def main():
     elif args.command == "interactions":
         collator = JSDMDataCollator(
             p_pres=config.p_pres, p_abs=config.p_abs,
-            combined_dist=dist_info["combined_dist"],
+            site_lats=dataset.lats, site_lons=dataset.lons, site_times=dataset.times,
+            spatial_scale_km=dataset.spatial_scale_km,
+            temporal_scale_days=dataset.temporal_scale_days,
+            euclidean=dataset.euclidean_coords,
             blind_threshold=dist_info["blind_threshold"],
         )
         loader = DataLoader(

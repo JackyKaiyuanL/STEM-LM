@@ -67,6 +67,7 @@ ABLATION_MODES = ("full", "no_st", "no_eco", "no_st_eco")
 from jsdm_model import (
     JSDMConfig,
     FIREDistanceBias,
+    _haversine_bt_n as _haversine_bt_n_abl,
     RMSNorm,
     TargetInput,
     EcoSourceModule,
@@ -295,7 +296,9 @@ class AblationModel(nn.Module):
     def forward(
         self,
         input_ids, source_ids, source_idx, target_site_idx,
-        env_data, target_env, spatial_dist_pairwise, temporal_dist_pairwise,
+        env_data, target_env,
+        site_lats, site_lons, site_times,
+        spatial_scale_km, temporal_scale_days, euclidean=False,
         output_attentions=False, output_hidden_states=False,
     ):
         # 1. Target input
@@ -315,17 +318,20 @@ class AblationModel(nn.Module):
         else:
             eco_emb = None
 
-        # 4. Target-to-source distances
-        sp_pw = spatial_dist_pairwise.to(hidden_states.device)
-        tp_pw = temporal_dist_pairwise.to(hidden_states.device)
-        B, T = target_site_idx.shape
-        N = source_idx.shape[1]
-
-        target_sp_all = sp_pw[target_site_idx]
-        target_tp_all = tp_pw[target_site_idx]
-        src_idx_exp = source_idx[:, None, :].expand(-1, T, -1)
-        target_to_source_sp = target_sp_all.gather(2, src_idx_exp)
-        target_to_source_tp = target_tp_all.gather(2, src_idx_exp)
+        # 4. Target-to-source distances computed on-the-fly from site coords.
+        dev = hidden_states.device
+        lats = site_lats.to(dev); lons = site_lons.to(dev); times = site_times.to(dev)
+        lat_t = lats[target_site_idx][:, :, None]
+        lon_t = lons[target_site_idx][:, :, None]
+        ti_t  = times[target_site_idx][:, :, None]
+        lat_s = lats[source_idx][:, None, :]
+        lon_s = lons[source_idx][:, None, :]
+        ti_s  = times[source_idx][:, None, :]
+        if euclidean:
+            target_to_source_sp = torch.sqrt((lat_t - lat_s) ** 2 + (lon_t - lon_s) ** 2)
+        else:
+            target_to_source_sp = _haversine_bt_n_abl(lat_t, lon_t, lat_s, lon_s)
+        target_to_source_tp = (ti_t - ti_s).abs()
         st_dist = torch.stack([target_to_source_sp, target_to_source_tp], dim=-1)
 
         # 5. Encode

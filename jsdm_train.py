@@ -35,14 +35,14 @@ def _parse_rate(s):
 # =============================================================================
 
 def move_dist_info_to_device(dist_info, device):
-    """Return a shallow copy of dist_info with pairwise tensors on `device`.
+    """Return a shallow copy of dist_info with coord tensors on `device`.
 
     Call once before the training loop so forward passes don't retransfer
-    the full (N, N) pairwise matrices every batch.
+    the site coordinate vectors every batch.
     """
     out = dict(dist_info)
-    out["spatial_dist_pairwise"]  = out["spatial_dist_pairwise"].to(device)
-    out["temporal_dist_pairwise"] = out["temporal_dist_pairwise"].to(device)
+    for k in ("site_lats", "site_lons", "site_times"):
+        out[k] = out[k].to(device)
     return out
 
 
@@ -67,8 +67,12 @@ def _forward(model, batch, dist_info, loss_weight=None):
         target_env=batch["target_env"],
         labels=batch["labels"],
         loss_weight=loss_weight,
-        spatial_dist_pairwise=dist_info["spatial_dist_pairwise"],
-        temporal_dist_pairwise=dist_info["temporal_dist_pairwise"],
+        site_lats=dist_info["site_lats"],
+        site_lons=dist_info["site_lons"],
+        site_times=dist_info["site_times"],
+        spatial_scale_km=dist_info["spatial_scale_km"],
+        temporal_scale_days=dist_info["temporal_scale_days"],
+        euclidean=dist_info.get("euclidean", False),
     )
 
 
@@ -500,8 +504,12 @@ def main():
                 target_site_idx=batch["target_site_idx"], env_data=batch["env_data"],
                 target_env=batch["target_env"],
                 labels=batch["labels"],
-                spatial_dist_pairwise=dist_info["spatial_dist_pairwise"],
-                temporal_dist_pairwise=dist_info["temporal_dist_pairwise"],
+                site_lats=dist_info["site_lats"],
+                site_lons=dist_info["site_lons"],
+                site_times=dist_info["site_times"],
+                spatial_scale_km=dist_info["spatial_scale_km"],
+                temporal_scale_days=dist_info["temporal_scale_days"],
+                euclidean=dist_info.get("euclidean", False),
                 output_attentions=True,
             )
             interactions.append(extract_interaction_matrix(output).cpu())

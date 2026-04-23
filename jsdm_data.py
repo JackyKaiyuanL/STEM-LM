@@ -29,21 +29,136 @@ from scipy.spatial.distance import cdist
 from typing import Optional, List, Dict, Any, Tuple
 
 
-def haversine_pairwise(lat_deg: np.ndarray, lon_deg: np.ndarray) -> np.ndarray:
-    """Pairwise haversine distances in kilometers. Use for real geographic coordinates."""
-    lat = np.radians(lat_deg.astype(np.float64))
-    lon = np.radians(lon_deg.astype(np.float64))
-    lat1 = lat[:, None]; lat2 = lat[None, :]
-    dlat = lat1 - lat2
-    dlon = lon[:, None] - lon[None, :]
-    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
-    return (6371.0 * 2.0 * np.arcsin(np.sqrt(a))).astype(np.float32)
+EARTH_RADIUS_KM = 6371.0
 
 
-def euclidean_pairwise(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Pairwise Euclidean distances. Use for simulated or arbitrary 2D coordinates."""
-    coords = np.stack([x, y], axis=1).astype(np.float64)
-    return cdist(coords, coords).astype(np.float32)
+def haversine_pairs_np(lat_a: np.ndarray, lon_a: np.ndarray,
+                       lat_b: np.ndarray, lon_b: np.ndarray) -> np.ndarray:
+    """Broadcasted haversine in km. `a`, `b` are same-shape arrays (deg)."""
+    lat_a = np.radians(np.asarray(lat_a, dtype=np.float64))
+    lon_a = np.radians(np.asarray(lon_a, dtype=np.float64))
+    lat_b = np.radians(np.asarray(lat_b, dtype=np.float64))
+    lon_b = np.radians(np.asarray(lon_b, dtype=np.float64))
+    dlat = lat_a - lat_b
+    dlon = lon_a - lon_b
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat_a) * np.cos(lat_b) * np.sin(dlon / 2.0) ** 2
+    return (EARTH_RADIUS_KM * 2.0 * np.arcsin(np.sqrt(a))).astype(np.float32)
+
+
+def haversine_pairs_torch(lat_a: torch.Tensor, lon_a: torch.Tensor,
+                          lat_b: torch.Tensor, lon_b: torch.Tensor) -> torch.Tensor:
+    """Torch analogue. Accepts degrees. Inputs must broadcast."""
+    lat_a = torch.deg2rad(lat_a)
+    lon_a = torch.deg2rad(lon_a)
+    lat_b = torch.deg2rad(lat_b)
+    lon_b = torch.deg2rad(lon_b)
+    dlat = lat_a - lat_b
+    dlon = lon_a - lon_b
+    a = torch.sin(dlat / 2.0) ** 2 + torch.cos(lat_a) * torch.cos(lat_b) * torch.sin(dlon / 2.0) ** 2
+    return EARTH_RADIUS_KM * 2.0 * torch.asin(torch.sqrt(a.clamp(min=0.0)))
+
+
+def _site_distance_rows_np(lats: np.ndarray, lons: np.ndarray,
+                           times: np.ndarray, idx,
+                           euclidean: bool) -> Tuple[np.ndarray, np.ndarray]:
+    """Distances from a single target row `idx` to every site. Returns (spatial_km, temporal_days)."""
+    if euclidean:
+        dx = lats - lats[idx]; dy = lons - lons[idx]
+        spatial = np.sqrt(dx * dx + dy * dy).astype(np.float32)
+    else:
+        spatial = haversine_pairs_np(lats[idx], lons[idx], lats, lons)
+    temporal = np.abs(times - times[idx]).astype(np.float32)
+    return spatial, temporal
+
+
+def _tiled_stats(lats: np.ndarray, lons: np.ndarray, times: np.ndarray,
+                 euclidean: bool, device: str = "cpu", tile: int = 4096):
+    """Streaming N×N pass. Returns:
+        max_spatial, max_temporal,
+        combined_min, combined_max  (with scales applied only *after* max is known,
+                                     so we do a two-phase pass)
+    This fn only computes max_spatial / max_temporal (phase 1).
+    """
+    N = len(lats)
+    lats_t = torch.as_tensor(lats, dtype=torch.float64, device=device)
+    lons_t = torch.as_tensor(lons, dtype=torch.float64, device=device)
+    times_t = torch.as_tensor(times, dtype=torch.float64, device=device)
+    max_sp = torch.tensor(0.0, dtype=torch.float64, device=device)
+    max_tp = torch.tensor(0.0, dtype=torch.float64, device=device)
+    for r0 in range(0, N, tile):
+        r1 = min(r0 + tile, N)
+        la = lats_t[r0:r1, None]; lb = lats_t[None, :]
+        lo_a = lons_t[r0:r1, None]; lo_b = lons_t[None, :]
+        if euclidean:
+            sp = torch.sqrt((la - lb) ** 2 + (lo_a - lo_b) ** 2)
+        else:
+            sp = haversine_pairs_torch(la, lo_a, lb, lo_b)
+        tp = (times_t[r0:r1, None] - times_t[None, :]).abs()
+        max_sp = torch.maximum(max_sp, sp.max())
+        max_tp = torch.maximum(max_tp, tp.max())
+    return float(max_sp.item()), float(max_tp.item())
+
+
+def _tiled_combined_quantile(lats: np.ndarray, lons: np.ndarray, times: np.ndarray,
+                             spatial_scale: float, temporal_scale: float,
+                             percentile: float, euclidean: bool,
+                             device: str = "cpu", tile: int = 4096,
+                             n_bins: int = 1_000_000) -> float:
+    """Streaming histogram quantile of the combined normalized distance over
+    off-diagonal pairs. Exact to one bin width (≈1e-6 × range at n_bins=1e6).
+    """
+    N = len(lats)
+    lats_t  = torch.as_tensor(lats,  dtype=torch.float64, device=device)
+    lons_t  = torch.as_tensor(lons,  dtype=torch.float64, device=device)
+    times_t = torch.as_tensor(times, dtype=torch.float64, device=device)
+    sp_scale = float(spatial_scale)
+    tp_scale = float(temporal_scale)
+
+    def compute_combined_block(r0, r1):
+        la = lats_t[r0:r1, None]; lb = lats_t[None, :]
+        lo_a = lons_t[r0:r1, None]; lo_b = lons_t[None, :]
+        if euclidean:
+            sp = torch.sqrt((la - lb) ** 2 + (lo_a - lo_b) ** 2)
+        else:
+            sp = haversine_pairs_torch(la, lo_a, lb, lo_b)
+        tp = (times_t[r0:r1, None] - times_t[None, :]).abs()
+        return torch.sqrt((sp / sp_scale) ** 2 + (tp / tp_scale) ** 2)
+
+    # Phase A: min / max of combined (exclude diagonal zeros and strict zeros)
+    cmin = torch.tensor(float("inf"), dtype=torch.float64, device=device)
+    cmax = torch.tensor(0.0, dtype=torch.float64, device=device)
+    for r0 in range(0, N, tile):
+        r1 = min(r0 + tile, N)
+        c = compute_combined_block(r0, r1)
+        c_pos = c[c > 0]
+        if c_pos.numel() > 0:
+            cmin = torch.minimum(cmin, c_pos.min())
+            cmax = torch.maximum(cmax, c_pos.max())
+    cmin_v = float(cmin.item()); cmax_v = float(cmax.item())
+    if not np.isfinite(cmin_v) or cmax_v <= 0:
+        return 0.0
+
+    # Phase B: accumulate histogram, then percentile from CDF
+    hist = torch.zeros(n_bins, dtype=torch.int64, device=device)
+    total = 0
+    span = cmax_v - cmin_v
+    for r0 in range(0, N, tile):
+        r1 = min(r0 + tile, N)
+        c = compute_combined_block(r0, r1)
+        c_pos = c[c > 0]
+        if c_pos.numel() == 0:
+            continue
+        bin_idx = ((c_pos - cmin_v) / span * (n_bins - 1)).round().clamp(0, n_bins - 1).long()
+        hist += torch.bincount(bin_idx, minlength=n_bins)
+        total += int(c_pos.numel())
+
+    if total == 0:
+        return 0.0
+    target = percentile / 100.0 * total
+    cdf = torch.cumsum(hist, dim=0)
+    bin_cut = int(torch.searchsorted(cdf, torch.tensor(target, device=device)).item())
+    bin_cut = min(bin_cut, n_bins - 1)
+    return cmin_v + (bin_cut / (n_bins - 1)) * span
 
 
 def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
@@ -130,26 +245,35 @@ class JSDMDataset(Dataset):
             else np.zeros((N, 1), dtype=np.float32)
         )
 
+        self.euclidean_coords = bool(euclidean_coords)
+        self.has_time = bool(has_time)
+
         print(f"Dataset: {N} observations, {self.num_species} species, {self.num_env_vars} env vars")
-        print("Computing pairwise distances...")
-        if euclidean_coords:
-            self.spatial_dists = euclidean_pairwise(self.lats, self.lons)
+        # Pairwise distances are never materialized. Max distances (needed for
+        # scale auto-set) are computed by a streaming tiled pass on GPU when a
+        # scale is not explicitly provided.
+        need_max = (spatial_scale_km is None) or (has_time and temporal_scale_days is None)
+        if need_max:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"  Computing max pairwise distance (tiled, device={device})...")
+            max_sp, max_tp = _tiled_stats(self.lats, self.lons, self.times,
+                                          euclidean=self.euclidean_coords, device=device)
         else:
-            self.spatial_dists = haversine_pairwise(self.lats, self.lons)
-        if has_time:
-            self.temporal_dists = cdist(
-                self.times.reshape(-1, 1), self.times.reshape(-1, 1)
-            ).astype(np.float32)
-        else:
-            self.temporal_dists = np.zeros((N, N), dtype=np.float32)
-        self.spatial_scale_km = _resolve_scale(
-            spatial_scale_km, float(self.spatial_dists.max()), "spatial_scale_km"
-        )
+            max_sp = max_tp = 0.0
+        self.spatial_scale_km   = _resolve_scale(spatial_scale_km,   max_sp, "spatial_scale_km")
         self.temporal_scale_days = 1.0 if not has_time else _resolve_scale(
-            temporal_scale_days, float(self.temporal_dists.max()), "temporal_scale_days"
+            temporal_scale_days, max_tp, "temporal_scale_days"
         )
+        # Cache maxima for downstream consumers (use_temporal etc.)
+        self._max_spatial = max_sp
+        self._max_temporal = max_tp if has_time else 0.0
         self.source_pool = None  # None = all rows; set to train indices for h3/blocked splits
         print("Done.")
+
+    # Row-wise on-the-fly distances: (N,) arrays from site `idx` to all sites.
+    def site_distance_rows(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        return _site_distance_rows_np(self.lats, self.lons, self.times, idx,
+                                      euclidean=self.euclidean_coords)
 
     def __len__(self):
         return len(self.species_data)
@@ -160,8 +284,9 @@ class JSDMDataset(Dataset):
 
         target_species = self.species_data[idx]  # (S,)
 
-        spatial = self.spatial_dists[idx] / self.spatial_scale_km
-        temporal = self.temporal_dists[idx] / self.temporal_scale_days
+        sp_row, tp_row = self.site_distance_rows(idx)
+        spatial = sp_row / self.spatial_scale_km
+        temporal = tp_row / self.temporal_scale_days
         combined_dist = np.sqrt(spatial ** 2 + temporal ** 2)
         combined_dist[idx] = np.inf
         inv_dist = 1.0 / (combined_dist + 1e-6)
@@ -189,8 +314,35 @@ class JSDMDataset(Dataset):
         }
 
 
+def _combined_blind_dists(site_lats, site_lons, site_times,
+                          tgt_idx_np, src_idx_np,
+                          spatial_scale_km, temporal_scale_days,
+                          euclidean=False):
+    """Compute combined normalized (B, N) distances for collator blinding.
+
+    site_lats/lons/times are full (N_total,) numpy arrays. tgt_idx_np is (B,),
+    src_idx_np is (B, N). Returns torch.FloatTensor (B, N).
+    """
+    la_t = site_lats[tgt_idx_np][:, None]
+    lo_t = site_lons[tgt_idx_np][:, None]
+    ti_t = site_times[tgt_idx_np][:, None]
+    la_s = site_lats[src_idx_np]
+    lo_s = site_lons[src_idx_np]
+    ti_s = site_times[src_idx_np]
+    if euclidean:
+        sp = np.sqrt((la_t - la_s) ** 2 + (lo_t - lo_s) ** 2).astype(np.float32)
+    else:
+        sp = haversine_pairs_np(la_t, lo_t, la_s, lo_s)
+    tp = np.abs(ti_t - ti_s).astype(np.float32)
+    combined = np.sqrt((sp / spatial_scale_km) ** 2 + (tp / temporal_scale_days) ** 2)
+    return torch.from_numpy(combined.astype(np.float32))
+
+
 class JSDMDataCollator:
-    def __init__(self, p_pres=0.15, p_abs=0.15, combined_dist=None,
+    def __init__(self, p_pres=0.15, p_abs=0.15,
+                 site_lats=None, site_lons=None, site_times=None,
+                 spatial_scale_km=1.0, temporal_scale_days=1.0,
+                 euclidean=False,
                  blind_threshold=None, mask_token_prob=1.0, seed=None):
         # Per-class mask rates. Each is either a float in [0, 1] or a
         # 'rand[:lo,hi]' string → sample Uniform[lo, hi] per row.
@@ -201,8 +353,20 @@ class JSDMDataCollator:
         #   p_pres=1.0,            p_abs=1.0            → always 100% mask
         self.p_pres = self._canonicalize(p_pres)
         self.p_abs  = self._canonicalize(p_abs)
-        self.combined_dist = combined_dist    # (N_total, N_total) numpy array or None
+        def _to_np(x):
+            if x is None:
+                return None
+            if isinstance(x, torch.Tensor):
+                return x.detach().cpu().numpy()
+            return np.asarray(x)
+        self.site_lats = _to_np(site_lats)
+        self.site_lons = _to_np(site_lons)
+        self.site_times = _to_np(site_times)
+        self.spatial_scale_km = float(spatial_scale_km)
+        self.temporal_scale_days = float(temporal_scale_days)
+        self.euclidean = bool(euclidean)
         self.blind_threshold = blind_threshold  # scalar float or None
+        self._has_coords = self.site_lats is not None and self.site_lons is not None and self.site_times is not None
         # Fraction of masked positions that get the [MASK] token (id=2); the rest
         # keep their original value (BERT's 10% keep-original trick). Default 1.0:
         # BERT's rationale (pretrain/finetune gap, bidirectional conditioning at
@@ -286,13 +450,16 @@ class JSDMDataCollator:
 
         # Source ids: convert float {0, 1} to long {0, 1}, then blind nearby sites to 2
         source_ids = source_species.long()  # (B, S, N)
-        if self.combined_dist is not None and self.blind_threshold is not None:
+        if self._has_coords and self.blind_threshold is not None:
             source_idx = batch["source_idx"]   # (B, N)
             target_idx = batch["target_idx"]   # (B,)
             src_idx_np = source_idx.numpy()    # (B, N)
             tgt_idx_np = target_idx.numpy()    # (B,)
-            blind_dists = torch.tensor(
-                self.combined_dist[tgt_idx_np[:, None], src_idx_np]  # (B, N)
+            blind_dists = _combined_blind_dists(
+                self.site_lats, self.site_lons, self.site_times,
+                tgt_idx_np, src_idx_np,
+                self.spatial_scale_km, self.temporal_scale_days,
+                euclidean=self.euclidean,
             )
             is_blind = blind_dists <= self.blind_threshold  # (B, N)
             # blind_mask[b, s, n] = True iff species s is masked AND source n is nearby
@@ -326,9 +493,15 @@ class FixedPValCollator(JSDMDataCollator):
     rather than drifting with per-batch mask sampling.
     """
 
-    def __init__(self, p, combined_dist=None, blind_threshold=None, base_seed=0):
+    def __init__(self, p,
+                 site_lats=None, site_lons=None, site_times=None,
+                 spatial_scale_km=1.0, temporal_scale_days=1.0, euclidean=False,
+                 blind_threshold=None, base_seed=0):
         super().__init__(p_pres=p, p_abs=p,
-                         combined_dist=combined_dist,
+                         site_lats=site_lats, site_lons=site_lons, site_times=site_times,
+                         spatial_scale_km=spatial_scale_km,
+                         temporal_scale_days=temporal_scale_days,
+                         euclidean=euclidean,
                          blind_threshold=blind_threshold,
                          mask_token_prob=1.0)
         self.p = float(p)
@@ -352,10 +525,15 @@ class FixedPValCollator(JSDMDataCollator):
         target_ids[masked] = 2
 
         source_ids = source_species.long()
-        if self.combined_dist is not None and self.blind_threshold is not None:
+        if self._has_coords and self.blind_threshold is not None:
             src_idx = batch["source_idx"].numpy()
             tgt_idx = batch["target_idx"].numpy()
-            blind_dists = torch.tensor(self.combined_dist[tgt_idx[:, None], src_idx])
+            blind_dists = _combined_blind_dists(
+                self.site_lats, self.site_lons, self.site_times,
+                tgt_idx, src_idx,
+                self.spatial_scale_km, self.temporal_scale_days,
+                euclidean=self.euclidean,
+            )
             is_blind = blind_dists <= self.blind_threshold
             blind_mask = masked[:, :, None] & is_blind[:, None, :]
             source_ids[blind_mask] = 2
@@ -389,7 +567,12 @@ def build_val_loaders_fixed_p(dataset, val_indices, dist_info, p_values,
     for i, p in enumerate(p_values):
         col = FixedPValCollator(
             p=p,
-            combined_dist=dist_info["combined_dist"],
+            site_lats=dist_info["site_lats"],
+            site_lons=dist_info["site_lons"],
+            site_times=dist_info["site_times"],
+            spatial_scale_km=dist_info["spatial_scale_km"],
+            temporal_scale_days=dist_info["temporal_scale_days"],
+            euclidean=dist_info.get("euclidean", False),
             blind_threshold=dist_info["blind_threshold"],
             base_seed=base_seed + 1000 * i,
         )
@@ -401,43 +584,40 @@ def build_val_loaders_fixed_p(dataset, val_indices, dist_info, p_values,
 
 
 def compute_dist_info(
-    spatial_dist: np.ndarray,
-    temporal_dist: np.ndarray,
-    spatial_scale_km: float,
-    temporal_scale_days: float,
+    dataset: "JSDMDataset",
     blind_percentile: float = 2.0,
+    tile: int = 4096,
+    hist_bins: int = 1_000_000,
 ) -> dict:
+    """Coord-only dist_info. Carries site coords (N-vectors) + scales + the
+    blind threshold percentile (computed via streaming GPU histogram).
+
+    No N×N matrix is materialized. Consumed by collators and JSDMModel.forward,
+    which compute per-batch distances on the fly.
     """
-    Compute normalized pairwise distances and a proximity blind threshold.
-
-    The blind_threshold marks the closest blind_percentile% of site pairs as
-    "nearby". During training the collator sets source entries for these nearby
-    sites to the mask token so the model cannot trivially copy from them.
-
-    Returns a dict with keys consumed by JSDMDataCollator and JSDMModel.forward.
-    """
-    combined = np.sqrt(
-        (spatial_dist / spatial_scale_km) ** 2 + (temporal_dist / temporal_scale_days) ** 2
-    ).astype(np.float32)
-
-    N = len(spatial_dist)
-    triu = combined[np.triu_indices(N, k=1)]
-    nonzero = triu[triu > 0]
-    if len(nonzero) > 0:
-        blind_threshold = float(np.percentile(nonzero, blind_percentile))
-    else:
-        blind_threshold = 0.0
-    print(f"  Blind threshold: {blind_threshold:.4f} ({blind_percentile}th percentile of pairwise distances)")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"  Computing blind-threshold percentile (tiled histogram, device={device})...")
+    blind_threshold = _tiled_combined_quantile(
+        dataset.lats, dataset.lons, dataset.times,
+        spatial_scale=dataset.spatial_scale_km,
+        temporal_scale=dataset.temporal_scale_days,
+        percentile=blind_percentile,
+        euclidean=dataset.euclidean_coords,
+        device=device, tile=tile, n_bins=hist_bins,
+    )
+    print(f"  Blind threshold: {blind_threshold:.4f} ({blind_percentile}th percentile)")
 
     return {
-        "combined_dist": combined,
+        # Coord arrays — torch tensors so `.to(device)` moves them uniformly.
+        "site_lats":  torch.as_tensor(dataset.lats,  dtype=torch.float32),
+        "site_lons":  torch.as_tensor(dataset.lons,  dtype=torch.float32),
+        "site_times": torch.as_tensor(dataset.times, dtype=torch.float32),
+        "euclidean":  dataset.euclidean_coords,
         "blind_threshold": blind_threshold,
-        "spatial_dist_pairwise": torch.tensor(spatial_dist),
-        "temporal_dist_pairwise": torch.tensor(temporal_dist),
-        "max_spatial_dist": float(spatial_dist.max()),
-        "max_temporal_dist": float(temporal_dist.max()),
-        "spatial_scale_km": spatial_scale_km,
-        "temporal_scale_days": temporal_scale_days,
+        "max_spatial_dist": float(dataset._max_spatial),
+        "max_temporal_dist": float(dataset._max_temporal),
+        "spatial_scale_km": dataset.spatial_scale_km,
+        "temporal_scale_days": dataset.temporal_scale_days,
     }
 
 
@@ -629,13 +809,7 @@ def create_dataloaders(
     )
 
     print("Computing distance info...")
-    dist_info = compute_dist_info(
-        spatial_dist=dataset.spatial_dists,
-        temporal_dist=dataset.temporal_dists,
-        spatial_scale_km=dataset.spatial_scale_km,
-        temporal_scale_days=dataset.temporal_scale_days,
-        blind_percentile=blind_percentile,
-    )
+    dist_info = compute_dist_info(dataset, blind_percentile=blind_percentile)
 
     # Split into train / val / test
     if saved_splits is not None:
@@ -708,7 +882,12 @@ def create_dataloaders(
     collator = JSDMDataCollator(
         p_pres=p_pres,
         p_abs=p_abs,
-        combined_dist=dist_info["combined_dist"],
+        site_lats=dataset.lats,
+        site_lons=dataset.lons,
+        site_times=dataset.times,
+        spatial_scale_km=dataset.spatial_scale_km,
+        temporal_scale_days=dataset.temporal_scale_days,
+        euclidean=dataset.euclidean_coords,
         blind_threshold=dist_info["blind_threshold"],
         seed=seed,
     )

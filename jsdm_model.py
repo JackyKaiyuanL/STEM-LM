@@ -31,6 +31,20 @@ import torch.nn.functional as F
 from transformers.modeling_outputs import ModelOutput
 
 
+_EARTH_RADIUS_KM = 6371.0
+
+def _haversine_bt_n(lat_a, lon_a, lat_b, lon_b):
+    """Haversine (km) for broadcastable degree tensors. Used by model.forward
+    to build the (B, T, N) spatial distance tensor without ever storing the
+    full N×N pairwise matrix."""
+    lat_a_r = torch.deg2rad(lat_a); lon_a_r = torch.deg2rad(lon_a)
+    lat_b_r = torch.deg2rad(lat_b); lon_b_r = torch.deg2rad(lon_b)
+    dlat = lat_a_r - lat_b_r
+    dlon = lon_a_r - lon_b_r
+    a = torch.sin(dlat / 2.0) ** 2 + torch.cos(lat_a_r) * torch.cos(lat_b_r) * torch.sin(dlon / 2.0) ** 2
+    return _EARTH_RADIUS_KM * 2.0 * torch.asin(torch.sqrt(a.clamp(min=0.0)))
+
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -719,8 +733,12 @@ class JSDMModel(nn.Module):
         target_site_idx,        # (B, T) long
         env_data,               # (B, N, E) — source site env vars
         target_env,             # (B, E)    — target site's own env vars
-        spatial_dist_pairwise,  # (N_total, N_total) float
-        temporal_dist_pairwise, # (N_total, N_total) float
+        site_lats,   # (N_total,) float  — degrees
+        site_lons,   # (N_total,) float  — degrees
+        site_times,  # (N_total,) float  — days (or 0 for no_time)
+        spatial_scale_km,    # float
+        temporal_scale_days, # float
+        euclidean=False,
         output_attentions=False,
         output_hidden_states=False,
     ):
@@ -738,13 +756,23 @@ class JSDMModel(nn.Module):
         target_env_token = self.target_env_module(target_env)         # (B, 1, H)
         eco_emb = torch.cat([eco_emb, target_env_token], dim=1)       # (B, C_eco+1, H)
 
-        # 4. Target-to-source distances via fancy indexing (avoids (B, T, N_total) intermediate)
-        sp_pw = spatial_dist_pairwise.to(hidden_states.device)
-        tp_pw = temporal_dist_pairwise.to(hidden_states.device)
-        tgt_idx = target_site_idx[:, :, None]   # (B, T, 1)
-        src_idx = source_idx[:, None, :]        # (B, 1, N)
-        target_to_source_sp = sp_pw[tgt_idx, src_idx]  # (B, T, N)
-        target_to_source_tp = tp_pw[tgt_idx, src_idx]  # (B, T, N)
+        # 4. Target-to-source distances computed on-the-fly from stored coords.
+        #    Avoids materializing any (N_total, N_total) pairwise tensor.
+        dev = hidden_states.device
+        lats = site_lats.to(dev)
+        lons = site_lons.to(dev)
+        times = site_times.to(dev)
+        # (B, T) and (B, N)
+        lat_t = lats[target_site_idx]; lon_t = lons[target_site_idx]; ti_t = times[target_site_idx]
+        lat_s = lats[source_idx];      lon_s = lons[source_idx];      ti_s = times[source_idx]
+        # broadcast to (B, T, N)
+        lat_t_e = lat_t[:, :, None]; lon_t_e = lon_t[:, :, None]; ti_t_e = ti_t[:, :, None]
+        lat_s_e = lat_s[:, None, :]; lon_s_e = lon_s[:, None, :]; ti_s_e = ti_s[:, None, :]
+        if euclidean:
+            target_to_source_sp = torch.sqrt((lat_t_e - lat_s_e) ** 2 + (lon_t_e - lon_s_e) ** 2)
+        else:
+            target_to_source_sp = _haversine_bt_n(lat_t_e, lon_t_e, lat_s_e, lon_s_e)
+        target_to_source_tp = (ti_t_e - ti_s_e).abs()
         st_dist = torch.stack([target_to_source_sp, target_to_source_tp], dim=-1)  # (B, T, N, 2)
 
         # 5. Encode — no attention mask needed (blinding handled in collator)
