@@ -663,19 +663,38 @@ def main():
                 "ablation": args.ablation,
             }, os.path.join(output_dir, f"checkpoint_epoch{epoch}.pt"))
 
-    # Final evaluation on test (or val)
-    logger.info("Evaluating best model for per-species AUC...")
+    # Final evaluation on test (or val) — per-p fixed mask rates, not random
+    logger.info("Evaluating best model on fixed-p test set...")
     model.load_state_dict(
         torch.load(os.path.join(output_dir, "best_model.pt"), map_location=device)
     )
-    eval_loader = test_loader if test_loader is not None else val_loader
-    eval_split = "test" if test_loader is not None else "val (no test set)"
-    _, _, best_mean_auc, per_species_aucs = evaluate(model, eval_loader, device, dist_info)
-    logger.info(f"[{args.ablation}] Best model {eval_split} AUC (mean): {best_mean_auc:.4f}")
+    eval_split   = "test" if len(splits["test"]) > 0 else "val (no test set)"
+    eval_indices = splits["test"] if len(splits["test"]) > 0 else splits["val"]
+    eval_loaders = build_val_loaders_fixed_p(
+        dataset, eval_indices, dist_info, args.val_p_list,
+        batch_size=args.batch_size, num_workers=args.num_workers,
+        base_seed=args.seed + 10_000,
+    )
+    per_p_auc   = {}
+    per_p_per_species_auc = {}
+    for p, loader in eval_loaders:
+        _, _, m_auc, per_sp = evaluate(model, loader, device, dist_info)
+        per_p_auc[p] = m_auc
+        per_p_per_species_auc[p] = per_sp
+        logger.info(f"[{args.ablation}] {eval_split} p={p:.2f}  mean AUC = {m_auc:.4f}  (species n={len(per_sp)})")
+    test_mean_auc = float(np.mean(list(per_p_auc.values())))
+    logger.info(f"[{args.ablation}] {eval_split} mean over p={list(per_p_auc.keys())}: {test_mean_auc:.4f}")
 
-    auc_rows = [(dataset.species_cols[s], per_species_aucs[s]) for s in sorted(per_species_aucs)]
     import pandas as pd
-    pd.DataFrame(auc_rows, columns=["species", "auc"]).to_csv(
+    auc_rows = []
+    all_species = sorted({s for per_sp in per_p_per_species_auc.values() for s in per_sp})
+    for s in all_species:
+        row = {"species": dataset.species_cols[s]}
+        for p in per_p_auc:
+            row[f"auc_p{p:.2f}"] = per_p_per_species_auc[p].get(s, float("nan"))
+        row["auc_mean"] = float(np.nanmean([row[f"auc_p{p:.2f}"] for p in per_p_auc]))
+        auc_rows.append(row)
+    pd.DataFrame(auc_rows).to_csv(
         os.path.join(output_dir, f"per_species_auc_{args.ablation}.csv"), index=False
     )
 
@@ -683,7 +702,8 @@ def main():
         "ablation": args.ablation,
         "num_params": num_params,
         "best_val_auc_mean": best_val_auc_mean,
-        "test_mean_auc": best_mean_auc,
+        "test_mean_auc": test_mean_auc,
+        "test_auc_by_p": {f"{p:.2f}": per_p_auc[p] for p in per_p_auc},
         "eval_split": eval_split,
         "num_species": config.num_species,
         "num_epochs": args.num_epochs,
