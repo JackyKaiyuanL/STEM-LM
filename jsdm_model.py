@@ -65,6 +65,10 @@ class JSDMConfig:
     # Positional encoding
     fire_hidden_size: int = 32
 
+    # Gate-MLP bottleneck for combining ST and Eco cross-attention outputs.
+    # Default is 2 × hidden_size (set at __post_init__ if left None).
+    gate_hidden_size: Optional[int] = None
+
     # Training — per-class mask rates. Each is a float in [0, 1] or a
     # 'rand[:lo,hi]' string (sample Uniform[lo, hi] per row; 'rand' = 'rand:0.0,1.0').
     p_pres: "float | str" = 0.15
@@ -81,6 +85,11 @@ class JSDMConfig:
                 f"hidden_size ({self.hidden_size}) must be divisible by "
                 f"num_attention_heads ({self.num_attention_heads})."
             )
+        if self.gate_hidden_size is None:
+            # Historical default: H/8 (what older checkpoints were trained with).
+            # Pass --gate_hidden_size explicitly (e.g. 2*hidden_size) in training
+            # to widen the gate.
+            self.gate_hidden_size = self.hidden_size // 8
 
 
 # =============================================================================
@@ -543,9 +552,9 @@ class JSDMAttention(nn.Module):
         self.st_col_attention = STColAttention(config)
         self.eco_col_attention = EcoColAttention(config)
         self.combine_gate = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size * 2),
+            nn.Linear(config.hidden_size, config.gate_hidden_size),
             nn.SiLU(),
-            nn.Linear(config.hidden_size * 2, 1),
+            nn.Linear(config.gate_hidden_size, 1),
         )
         # Pre-norm layers: applied before each sub-block; residual added here, not inside sub-modules
         self.row_norm  = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)

@@ -20,6 +20,7 @@ from jsdm_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_inter
 from jsdm_data import (
     JSDMDataset,
     JSDMDataCollator,
+    FixedPValCollator,
     compute_dist_info,
     grid_block_split,
     h3_block_split,
@@ -30,11 +31,28 @@ from jsdm_data import (
 def load_model(model_dir, device):
     with open(os.path.join(model_dir, "config.json")) as f:
         config_dict = json.load(f)
-    config = JSDMConfig(**config_dict)
-    model = JSDMForMaskedSpeciesPrediction(config)
-    model.load_state_dict(
-        torch.load(os.path.join(model_dir, "best_model.pt"), map_location=device)
-    )
+
+    # Ablation-trained checkpoints carry an 'ablation' field and need the
+    # matching AblationForMaskedSpeciesPrediction (different module tree).
+    ablation = config_dict.get("ablation", None)
+    if ablation is not None and ablation != "full":
+        from jsdm_ablation import AblationConfig, AblationForMaskedSpeciesPrediction
+        import inspect
+        cfg_params = set(inspect.signature(AblationConfig).parameters)
+        cfg_d = {k: v for k, v in config_dict.items() if k in cfg_params}
+        config = AblationConfig(**cfg_d)
+        model  = AblationForMaskedSpeciesPrediction(config)
+    else:
+        import inspect
+        cfg_params = set(inspect.signature(JSDMConfig).parameters)
+        cfg_d = {k: v for k, v in config_dict.items() if k in cfg_params}
+        config = JSDMConfig(**cfg_d)
+        model  = JSDMForMaskedSpeciesPrediction(config)
+
+    sd = torch.load(os.path.join(model_dir, "best_model.pt"), map_location=device)
+    if isinstance(sd, dict) and "model_state_dict" in sd:
+        sd = sd["model_state_dict"]
+    model.load_state_dict(sd)
     model.to(device).eval()
     return model, config
 
@@ -156,9 +174,13 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     # ── predict ───────────────────────────────────────────────────────────────
-    p_pred = sub.add_parser("predict", help="Fully masked prediction on eval split")
+    p_pred = sub.add_parser("predict", help="Per-p deterministic eval on val/test split")
     add_common_args(p_pred)
     p_pred.add_argument("--eval_split", choices=["val", "test"], default="test")
+    p_pred.add_argument("--p", type=float, nargs="+", default=[0.25, 0.5, 0.75, 1.0],
+                        help="Fixed mask rate(s). One or more floats in [0,1]. "
+                             "FixedPValCollator gives per-batch-deterministic masks at each p. "
+                             "Output parquet/CSV carry a suffix per p.")
 
     # ── interactions ──────────────────────────────────────────────────────────
     p_int = sub.add_parser("interactions", help="Extract species interaction matrices")
@@ -170,21 +192,22 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, config = load_model(args.model_dir, device)
 
-    with open(os.path.join(args.model_dir, "species_names.json")) as f:
-        species_names = json.load(f)
-
     dataset, dist_info = build_dataset_and_dist(args, config)
 
-    # Consistency check: the CSV's species columns must match the trained model's
-    # species (same names, same order). Silent misalignment would give valid-looking
-    # but wrong per-species AUCs.
-    if list(dataset.species_cols) != list(species_names):
-        raise ValueError(
-            "Species mismatch between training and inference data.\n"
-            f"  Trained on {len(species_names)} species; CSV has {len(dataset.species_cols)}.\n"
-            f"  First divergence: "
-            f"{next((i for i, (a, b) in enumerate(zip(dataset.species_cols, species_names)) if a != b), 'order/length differs')}"
-        )
+    species_names_path = os.path.join(args.model_dir, "species_names.json")
+    if os.path.exists(species_names_path):
+        with open(species_names_path) as f:
+            species_names = json.load(f)
+        if list(dataset.species_cols) != list(species_names):
+            raise ValueError(
+                "Species mismatch between training and inference data.\n"
+                f"  Trained on {len(species_names)} species; CSV has {len(dataset.species_cols)}.\n"
+                f"  First divergence: "
+                f"{next((i for i, (a, b) in enumerate(zip(dataset.species_cols, species_names)) if a != b), 'order/length differs')}"
+            )
+    else:
+        print(f"  No species_names.json in {args.model_dir} — falling back to CSV species_cols")
+        species_names = list(dataset.species_cols)
 
     # Split — restrict sources to training observations only. Prefer a saved
     # splits.json (from training) so eval matches exactly; otherwise recompute
@@ -235,42 +258,69 @@ def main():
         eval_idx = val_idx if args.eval_split == "val" else test_idx
         print(f"Predicting on {args.eval_split} set: {len(eval_idx)} sites")
 
-        collator = JSDMDataCollator(
-            p_pres=1.0, p_abs=1.0,
-            combined_dist=dist_info["combined_dist"],
-            blind_threshold=dist_info["blind_threshold"],
-        )
-        loader = DataLoader(
-            Subset(dataset, eval_idx), batch_size=args.batch_size,
-            shuffle=False, collate_fn=collator, num_workers=args.num_workers,
-        )
+        per_p_species_auc = {}
+        per_p_mean_auc    = {}
+        last_probs = None
+        for i, p in enumerate(args.p):
+            print(f"\n── p = {p:.2f} ──")
+            collator = FixedPValCollator(
+                p=p,
+                combined_dist=dist_info["combined_dist"],
+                blind_threshold=dist_info["blind_threshold"],
+                base_seed=args.seed + 10_000 + 1000 * i,
+            )
+            loader = DataLoader(
+                Subset(dataset, eval_idx), batch_size=args.batch_size,
+                shuffle=False, collate_fn=collator, num_workers=args.num_workers,
+            )
+            probs, labels = predict(model, loader, dist_info, device, species_names)
+            aucs, mean_auc = compute_auc(probs, labels, species_names)
+            per_p_species_auc[p] = aucs
+            per_p_mean_auc[p]    = mean_auc
+            print(f"  mean AUC = {mean_auc:.4f}  ({len(aucs)}/{len(species_names)} species)")
+            last_probs = probs
 
-        probs, labels = predict(model, loader, dist_info, device, species_names)
-        aucs, mean_auc = compute_auc(probs, labels, species_names)
+        overall = float(np.mean(list(per_p_mean_auc.values())))
+        print(f"\n============================================================")
+        print(f"{args.eval_split} per-p mean AUC (deterministic):")
+        for p, m in per_p_mean_auc.items():
+            print(f"  p={p:.2f}  {m:.4f}")
+        print(f"  mean over p = {overall:.4f}")
+        print(f"============================================================")
 
-        print(f"\nMean AUC ({args.eval_split}): {mean_auc:.4f}  ({len(aucs)}/{len(species_names)} species)")
-
-        # Save predictions with coordinates
-        result_df = pd.DataFrame(probs, columns=species_names)
+        # Save predictions (parquet) using the LAST p's output — matches legacy p=1.0 use
+        result_df = pd.DataFrame(last_probs, columns=species_names)
         result_df.insert(0, "latitude",  dataset.lats[eval_idx])
         result_df.insert(1, "longitude", dataset.lons[eval_idx])
         result_df.to_parquet(args.output_path, index=False)
-        print(f"Predictions saved to {args.output_path}")
+        print(f"Predictions saved to {args.output_path}  (at p={args.p[-1]:.2f})")
 
-        # Save per-species AUC
-        auc_path = os.path.join(args.model_dir, f"per_species_auc_{args.eval_split}.csv")
-        auc_df = pd.DataFrame(
-            sorted(aucs.items(), key=lambda x: -x[1]), columns=["species", "auc"]
-        )
+        # Per-species AUC table with one column per p
+        all_species = sorted({s for a in per_p_species_auc.values() for s in a})
+        rows = []
+        for s in all_species:
+            row = {"species": s}
+            for p in args.p:
+                row[f"auc_p{p:.2f}"] = per_p_species_auc[p].get(s, float("nan"))
+            row["auc_mean"] = float(np.nanmean([row[f"auc_p{p:.2f}"] for p in args.p]))
+            rows.append(row)
+        auc_df = pd.DataFrame(rows).sort_values("auc_mean", ascending=False)
+        auc_path = os.path.join(args.model_dir, f"per_species_auc_{args.eval_split}_by_p.csv")
         auc_df.to_csv(auc_path, index=False)
-        print(f"Per-species AUC saved to {auc_path}")
+        print(f"Per-species AUC (per-p) saved to {auc_path}")
 
-        print(f"\nTop 10:")
-        for _, row in auc_df.head(10).iterrows():
-            print(f"  {row['species']:<50} {row['auc']:.4f}")
-        print(f"Bottom 10:")
-        for _, row in auc_df.tail(10).iterrows():
-            print(f"  {row['species']:<50} {row['auc']:.4f}")
+        # JSON summary
+        summary = {
+            "eval_split": args.eval_split,
+            "n_eval_rows": int(len(eval_idx)),
+            "p_list": [float(p) for p in args.p],
+            "per_p_mean_auc": {f"{p:.2f}": float(per_p_mean_auc[p]) for p in args.p},
+            "overall_mean_auc": overall,
+        }
+        js_path = os.path.join(args.model_dir, f"test_per_p_summary.json")
+        with open(js_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Summary saved to {js_path}")
 
     elif args.command == "interactions":
         collator = JSDMDataCollator(
