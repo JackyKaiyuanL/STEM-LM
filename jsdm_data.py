@@ -90,10 +90,14 @@ class JSDMDataset(Dataset):
             reason = "--no_time" if no_time else f"column '{time_col}' not found"
             print(f"  Time ignored ({reason}) — purely spatial model")
 
+        self.half_months: Optional[np.ndarray] = None
         if has_time:
             if df[time_col].dtype == "object" or pd.api.types.is_datetime64_any_dtype(df[time_col]):
-                df[time_col] = pd.to_datetime(df[time_col])
-                df[time_col] = (df[time_col] - df[time_col].min()).dt.days.astype(float)
+                dt = pd.to_datetime(df[time_col])
+                months = dt.dt.month.values
+                days   = dt.dt.day.values
+                self.half_months = (2 * (months - 1) + (days > 15).astype(np.int64)).astype(np.int64)
+                df[time_col] = (dt - dt.min()).dt.days.astype(float)
             else:
                 df[time_col] = df[time_col].astype(float)
 
@@ -312,6 +316,90 @@ class JSDMDataCollator:
         return batch
 
 
+class FixedPValCollator(JSDMDataCollator):
+    """Deterministic fixed-p mask collator for validation.
+
+    Mask rate is a single scalar p applied to both presences and absences.
+    Randomness is seeded deterministically from batch content (first
+    target_idx), so the same batch produces identical masks across epochs —
+    the val AUC trajectory becomes a noise-free signal of model quality
+    rather than drifting with per-batch mask sampling.
+    """
+
+    def __init__(self, p, combined_dist=None, blind_threshold=None, base_seed=0):
+        super().__init__(p_pres=p, p_abs=p,
+                         combined_dist=combined_dist,
+                         blind_threshold=blind_threshold,
+                         mask_token_prob=1.0)
+        self.p = float(p)
+        self.base_seed = int(base_seed)
+
+    def __call__(self, examples):
+        batch = {k: torch.stack([ex[k] for ex in examples]) for k in examples[0].keys()}
+        target_species = batch["target_species"]
+        source_species = batch["source_species"]
+        B, S = target_species.shape
+
+        seed = self.base_seed + int(batch["target_idx"][0].item())
+        g = torch.Generator().manual_seed(seed)
+
+        masked = torch.bernoulli(torch.full((B, S), self.p), generator=g).bool()
+        for b in range(B):
+            if not masked[b].any():
+                masked[b, torch.randint(S, (1,), generator=g)] = True
+
+        target_ids = target_species.long()
+        target_ids[masked] = 2
+
+        source_ids = source_species.long()
+        if self.combined_dist is not None and self.blind_threshold is not None:
+            src_idx = batch["source_idx"].numpy()
+            tgt_idx = batch["target_idx"].numpy()
+            blind_dists = torch.tensor(self.combined_dist[tgt_idx[:, None], src_idx])
+            is_blind = blind_dists <= self.blind_threshold
+            blind_mask = masked[:, :, None] & is_blind[:, None, :]
+            source_ids[blind_mask] = 2
+        else:
+            source_ids[masked[:, :, None].expand_as(source_ids)] = 2
+
+        labels = target_species.clone()
+        labels[~masked] = -100
+
+        batch["input_ids"] = target_ids.unsqueeze(-1)
+        batch["source_ids"] = source_ids
+        batch["labels"] = labels.unsqueeze(-1)
+        batch["env_data"] = batch.pop("source_env")
+        batch["target_site_idx"] = batch.pop("target_idx").unsqueeze(-1)
+        del batch["target_species"]
+        del batch["source_species"]
+        return batch
+
+
+def build_val_loaders_fixed_p(dataset, val_indices, dist_info, p_values,
+                               batch_size, num_workers=0, base_seed=0):
+    """Return list of (p, DataLoader) using FixedPValCollator for each p.
+
+    Used for apples-to-apples val AUC logging and checkpoint selection:
+    mask-rate sampling noise is removed, so `best_model.pt` selection
+    reflects true model improvements rather than lucky-p epochs.
+    """
+    from torch.utils.data import DataLoader, Subset
+    subset = Subset(dataset, val_indices)
+    loaders = []
+    for i, p in enumerate(p_values):
+        col = FixedPValCollator(
+            p=p,
+            combined_dist=dist_info["combined_dist"],
+            blind_threshold=dist_info["blind_threshold"],
+            base_seed=base_seed + 1000 * i,
+        )
+        loaders.append((float(p), DataLoader(
+            subset, batch_size=batch_size, shuffle=False,
+            collate_fn=col, num_workers=num_workers, pin_memory=True,
+        )))
+    return loaders
+
+
 def compute_dist_info(
     spatial_dist: np.ndarray,
     temporal_dist: np.ndarray,
@@ -457,6 +545,57 @@ def h3_block_split(lats, lons, resolution=4, train_frac=0.8, test_frac=0.1, seed
     return train_idx, val_idx, test_idx
 
 
+def h3_time_block_split(lats, lons, half_months, resolution=3,
+                        train_frac=0.8, test_frac=0.1, seed=42):
+    """Spatiotemporal block on (H3 cell, half-month).
+
+    Independently partitions H3 cells and half-month bins (0..23) into
+    train/val/test. A row is:
+      - train if both its cell AND its half-month are train-assigned,
+      - test  if either its cell OR its half-month is test-assigned,
+      - val   otherwise (at least one axis is val, neither is test).
+    Val therefore covers three regimes: spatial-only (new cell, seen season),
+    seasonal-only (seen cell, new season), and combined (new cell, new season).
+    """
+    try:
+        import h3 as h3lib
+    except ImportError:
+        raise ImportError("h3 package required for --fold h3. Install with: pip install h3")
+    cells = np.array([h3lib.latlng_to_cell(float(lat), float(lon), resolution)
+                      for lat, lon in zip(lats, lons)])
+    hm = np.asarray(half_months, dtype=np.int64)
+
+    def partition(uniq, seed_shift):
+        rng = np.random.RandomState(seed + seed_shift)
+        arr = uniq.copy(); rng.shuffle(arr)
+        n = len(arr)
+        n_te = max(1, round(n * test_frac))
+        n_va = max(1, round(n * (1 - train_frac - test_frac)))
+        return set(arr[:n_te].tolist()), set(arr[n_te:n_te+n_va].tolist()), set(arr[n_te+n_va:].tolist())
+
+    test_c, val_c, train_c = partition(np.unique(cells), 0)
+    test_h, val_h, train_h = partition(np.unique(hm),    1)
+
+    c_tr = np.isin(cells, list(train_c)); c_va = np.isin(cells, list(val_c)); c_te = np.isin(cells, list(test_c))
+    h_tr = np.isin(hm,    list(train_h)); h_va = np.isin(hm,    list(val_h)); h_te = np.isin(hm,    list(test_h))
+
+    train_idx = np.where(c_tr & h_tr)[0]
+    test_idx  = np.where(c_te | h_te)[0]
+    val_idx   = np.where(~(c_tr & h_tr) & ~(c_te | h_te))[0]
+
+    n_spatial  = int((c_va & h_tr).sum())
+    n_seasonal = int((c_tr & h_va).sum())
+    n_combined = int((c_va & h_va).sum())
+    print(f"  H3 res={resolution} × half-month | cells {len(np.unique(cells))} "
+          f"({len(train_c)}/{len(val_c)}/{len(test_c)}) | "
+          f"half-months {len(np.unique(hm))} "
+          f"({len(train_h)}/{len(val_h)}/{len(test_h)})")
+    print(f"  rows: train {len(train_idx)} | val {len(val_idx)} "
+          f"(spatial {n_spatial} + seasonal {n_seasonal} + combined {n_combined}) "
+          f"| test {len(test_idx)}")
+    return train_idx, val_idx, test_idx
+
+
 def create_dataloaders(
     csv_path, batch_size=32, num_source_sites=64,
     p_pres=0.15, p_abs=0.15,
@@ -513,12 +652,25 @@ def create_dataloaders(
             resolution = 2
         if not isinstance(resolution, int) or not (0 <= resolution <= 15):
             raise ValueError("--resolution for --fold h3 must be an integer in [0, 15].")
-        train_indices, val_indices, test_indices = h3_block_split(
-            dataset.lats, dataset.lons,
-            resolution=resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
-        )
+        if dataset.half_months is not None:
+            train_indices, val_indices, test_indices = h3_time_block_split(
+                dataset.lats, dataset.lons, dataset.half_months,
+                resolution=resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
+            )
+            split_origin = "h3_time"
+        elif no_time:
+            train_indices, val_indices, test_indices = h3_block_split(
+                dataset.lats, dataset.lons,
+                resolution=resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
+            )
+            split_origin = "h3"
+        else:
+            raise ValueError(
+                "--fold h3 with time enabled requires parseable dates in the 'time' column "
+                "(e.g. 'YYYY-MM-DD') so month/day can be extracted for spatiotemporal blocking. "
+                "Either pass --no_time or convert the time column to a standard date string."
+            )
         source_pool_restricted = True
-        split_origin = "h3"
     elif fold_method == "grid":
         if not euclidean_coords:
             raise ValueError("--fold grid is for euclidean/simulated datasets. Use --fold h3 for real lat/lon.")
@@ -561,10 +713,10 @@ def create_dataloaders(
         seed=seed,
     )
 
-    shuffle_gen = torch.Generator().manual_seed(seed)
+    train_shuffle_gen = torch.Generator().manual_seed(int(seed))
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                                collate_fn=collator, num_workers=num_workers, pin_memory=True,
-                               generator=shuffle_gen)
+                               generator=train_shuffle_gen)
     val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
                                collate_fn=collator, num_workers=num_workers, pin_memory=True)
     test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
