@@ -49,14 +49,10 @@ def euclidean_pairwise(x: np.ndarray, y: np.ndarray) -> np.ndarray:
 def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
     if value is None:
         if fallback <= 0:
-            # Static dataset: all distances are zero, scale is irrelevant.
-            # Return 1.0 so downstream divisions are safe (0/1 = 0).
-            print(f"  Note: {name} set to 1.0 (all pairwise distances are 0 — static dataset)")
+            print(f"  Note: {name} auto-set to 1.0 (all pairwise distances are 0 — static dataset)")
             return 1.0
-        raise ValueError(
-            f"{name} is required (no auto-scale). "
-            f"Pass --{name} to set the space/time tradeoff explicitly."
-        )
+        print(f"  Note: {name} auto-set to {fallback:.3f} (max pairwise distance)")
+        return float(fallback)
     if value <= 0:
         raise ValueError(f"{name} must be > 0, got {value}")
     return float(value)
