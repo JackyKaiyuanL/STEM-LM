@@ -9,10 +9,12 @@ import logging
 import os
 import time
 
+from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -27,6 +29,13 @@ def _parse_rate(s):
     """argparse type: float in [0, 1] or 'rand[:lo,hi]' string (validated downstream)."""
     if isinstance(s, str) and (s == "rand" or s.startswith("rand:")):
         return s
+    return float(s)
+
+
+def _parse_blind_pct(s):
+    """argparse type: float percentile in [0, 100] or the literal 'auto'."""
+    if isinstance(s, str) and s.lower() == "auto":
+        return "auto"
     return float(s)
 
 
@@ -76,8 +85,22 @@ def _forward(model, batch, dist_info, loss_weight=None):
     )
 
 
+def _gate_l1_penalty(output) -> Optional[torch.Tensor]:
+    """ReLU L1 on gate logits (positive side only). Encourages gate to sit at
+    its Env-biased init unless ST genuinely helps. No-op in ablated modes where
+    `gate_logits` is None or contains only Nones."""
+    gl = getattr(output, "gate_logits", None)
+    if not gl:
+        return None
+    per_layer = [F.relu(g).mean() for g in gl if g is not None]
+    if not per_layer:
+        return None
+    return torch.stack(per_layer).mean()
+
+
 def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
-                loss_weight=None, log_interval=50, max_grad_norm=1.0):
+                loss_weight=None, log_interval=50, max_grad_norm=1.0,
+                gate_l1: float = 0.0):
     model.train()
     total_loss, total_correct, total_masked, num_batches = 0, 0, 0, 0
 
@@ -89,6 +112,10 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
 
         output = _forward(model, batch, dist_info, loss_weight=w)
         loss = output.loss
+        if gate_l1 > 0.0:
+            pen = _gate_l1_penalty(output)
+            if pen is not None:
+                loss = loss + gate_l1 * pen
 
         optimizer.zero_grad()
         loss.backward()
@@ -142,8 +169,9 @@ def evaluate(model, loader, device, dist_info):
                 species_labels[s].extend(labels[b_mask, s].tolist())
 
     per_species_aucs = {}
+    per_species_auprcs = {}
     total_correct, total_masked = 0, 0
-    aucs = []
+    aucs, auprcs = [], []
     for s in range(S):
         if len(species_labels[s]) > 0:
             arr_p = np.array(species_preds[s])
@@ -151,21 +179,28 @@ def evaluate(model, loader, device, dist_info):
             total_correct += ((arr_p > 0.5) == arr_l).sum()
             total_masked  += len(arr_l)
             if len(set(species_labels[s])) == 2 and not np.isnan(arr_p).any():
-                auc_s = roc_auc_score(arr_l, arr_p)
-                aucs.append(auc_s)
-                per_species_aucs[s] = auc_s
-    mean_auc = float(np.mean(aucs)) if aucs else float("nan")
+                auc_s   = roc_auc_score(arr_l, arr_p)
+                auprc_s = average_precision_score(arr_l, arr_p)
+                aucs.append(auc_s); auprcs.append(auprc_s)
+                per_species_aucs[s]   = auc_s
+                per_species_auprcs[s] = auprc_s
+    mean_auc   = float(np.mean(aucs))   if aucs   else float("nan")
+    mean_auprc = float(np.mean(auprcs)) if auprcs else float("nan")
     acc = total_correct / max(total_masked, 1)
 
-    return total_loss / max(num_batches, 1), acc, mean_auc, per_species_aucs
+    return (total_loss / max(num_batches, 1), acc,
+            mean_auc, mean_auprc,
+            per_species_aucs, per_species_auprcs)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train STEM-LM")
     parser.add_argument("csv_path", type=str)
     parser.add_argument("--num_source_sites", type=int, default=64)
-    parser.add_argument("--blind_percentile", type=float, default=2.0,
-                        help="Percentile of pairwise distances used as proximity blind threshold")
+    parser.add_argument("--blind_percentile", type=_parse_blind_pct, default="auto",
+                        help="Percentile of normalized spatial pairwise distance used as the "
+                             "blind radius. Default 'auto': picked via the half-decay rule on "
+                             "the dataset's Jaccard(d) curve. Pass a float to override.")
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--num_attention_heads", type=int, default=8)
     parser.add_argument("--num_hidden_layers", type=int, default=4)
@@ -246,6 +281,40 @@ def main():
                         help="Fixed mask rates for val AUC (deterministic per batch). "
                              "Mean AUC across these drives best_model.pt selection, giving "
                              "apples-to-apples comparison across runs (default 0.25 0.5 0.75 1.0).")
+    parser.add_argument("--ablation", choices=["full", "no_st", "no_env", "no_st_env"],
+                        default="full",
+                        help="Ablation mode. 'full' uses both ST and Env cross-attention "
+                             "with a gated combination; the others disable one or both.")
+    parser.add_argument("--temporal_fire_init_periods", type=float, nargs="+", default=None,
+                        help="Init periods (days) for learnable sin/cos channels in the "
+                             "temporal FIRE bias. The length of this list is the number of "
+                             "periodic channels K; each ω_k is learnable. Omit or pass empty "
+                             "to disable periodicity (legacy monotone FIRE). "
+                             "Recommended: '365 180 730 1825' (annual / semi / biennial / "
+                             "5-yr) or '365 180 120 91 730 1825' (+ sub-annual for "
+                             "multivoltine insects).")
+    parser.add_argument("--fire_no_zero_init_periodic", action="store_true",
+                        help="Disable zero-init of periodic channels in FIRE's MLP. "
+                             "By default the periodic (sin/cos) weights start at zero so "
+                             "the module is arithmetically equivalent to legacy FIRE at step 0; "
+                             "the optimizer must earn the periodic contribution.")
+    parser.add_argument("--per_species_fire_shape", action="store_true",
+                        help="Enable per-species FIRE shape head (zero-init). Lets each "
+                             "species learn a distinct distance-bias shape, not just "
+                             "amplitude. Safe: step-0 output unchanged. Recommended for "
+                             "datasets with heterogeneous phenology (birds: residents + "
+                             "migrants + multivoltines); optional for butterflies.")
+    parser.add_argument("--gate_hidden_size", type=int, default=None,
+                        help="Bottleneck width of the ST/Env combine_gate MLP. "
+                             "Default: hidden_size // 8.")
+    parser.add_argument("--gate_init_bias", type=float, default=0.0,
+                        help="Initial bias of combine_gate's final Linear. Negative values "
+                             "(e.g. -2.0 → sigmoid≈0.12) start training with the gate "
+                             "favoring Env, so ST must earn its weight.")
+    parser.add_argument("--gate_l1", type=float, default=0.0,
+                        help="L1 penalty weight on ReLU(gate_logit) (positive side only). "
+                             "Encourages gate to remain near its Env-biased init unless "
+                             "ST genuinely helps. 0 disables.")
     args = parser.parse_args()
 
     # --p is a convenience that sets both p_pres and p_abs to the same rate.
@@ -352,6 +421,15 @@ def main():
         intermediate_size=args.intermediate_size,
         hidden_dropout_prob=args.dropout,
         attention_probs_dropout_prob=args.dropout,
+        temporal_fire_init_periods=(
+            tuple(args.temporal_fire_init_periods)
+            if args.temporal_fire_init_periods else None
+        ),
+        fire_zero_init_periodic=(not args.fire_no_zero_init_periodic),
+        per_species_fire_shape=args.per_species_fire_shape,
+        gate_hidden_size=args.gate_hidden_size,
+        gate_init_bias=args.gate_init_bias,
+        ablation=args.ablation,
         p_pres=args.p_pres,
         p_abs=args.p_abs,
     )
@@ -384,12 +462,10 @@ def main():
     total_steps = len(train_loader) * args.num_epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
-    # Pre-move pairwise distance matrices to device ONCE — otherwise the (N, N)
-    # tensors would be retransferred on every forward pass.
     dist_info = move_dist_info_to_device(dist_info, device)
 
-    # Fixed-p val loaders for selection: deterministic masks, stable across
-    # epochs/runs, so checkpoint selection reflects real improvement.
+    # Fixed-p val loaders: deterministic masks so best-checkpoint selection
+    # isn't drowned in mask-rate sampling noise.
     fixed_val_loaders = build_val_loaders_fixed_p(
         dataset, splits["val"], dist_info, args.val_p_list,
         batch_size=args.batch_size, num_workers=args.num_workers, base_seed=args.seed,
@@ -398,55 +474,65 @@ def main():
     log_csv = os.path.join(args.output_dir, "training_log.csv")
     per_p_header = []
     for p, _ in fixed_val_loaders:
-        per_p_header += [f"val_loss_p{p:.2f}", f"val_acc_p{p:.2f}", f"val_auc_p{p:.2f}"]
+        per_p_header += [f"val_loss_p{p:.2f}", f"val_acc_p{p:.2f}",
+                         f"val_auc_p{p:.2f}", f"val_auprc_p{p:.2f}"]
     with open(log_csv, "w", newline="") as f:
         csv.writer(f).writerow(
             ["epoch", "train_loss", "train_acc",
-             *per_p_header, "val_loss_mean", "val_acc_mean", "val_auc_mean",
+             *per_p_header,
+             "val_loss_mean", "val_acc_mean", "val_auc_mean", "val_auprc_mean",
              "lr", "elapsed_s"]
         )
 
+    # best_model.pt is selected on AUPRC — more sensitive than AUROC for
+    # JSDM's rare-species-heavy label distribution.
+    best_val_auprc_mean = -float("inf")
     best_val_auc_mean = -float("inf")
     for epoch in range(1, args.num_epochs + 1):
         t0 = time.time()
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, scheduler, device, dist_info, epoch,
             loss_weight=loss_weight, max_grad_norm=args.max_grad_norm,
+            gate_l1=args.gate_l1,
         )
-        per_p_loss, per_p_acc, per_p_auc, per_p_nauc = [], [], [], []
+        per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_nauc = [], [], [], [], []
         for p, loader in fixed_val_loaders:
-            l, a, u, per_species = evaluate(model, loader, device, dist_info)
+            l, a, u, ap, per_species, _ = evaluate(model, loader, device, dist_info)
             per_p_loss.append(l)
             per_p_acc.append(a)
             per_p_auc.append(u)
+            per_p_auprc.append(ap)
             per_p_nauc.append(len(per_species))
-        val_loss_mean = float(np.mean(per_p_loss)) if per_p_loss else float("nan")
-        val_acc_mean  = float(np.mean(per_p_acc))  if per_p_acc  else float("nan")
-        val_auc_mean  = float(np.mean(per_p_auc))  if per_p_auc  else float("nan")
+        val_loss_mean  = float(np.mean(per_p_loss))  if per_p_loss  else float("nan")
+        val_acc_mean   = float(np.mean(per_p_acc))   if per_p_acc   else float("nan")
+        val_auc_mean   = float(np.mean(per_p_auc))   if per_p_auc   else float("nan")
+        val_auprc_mean = float(np.mean(per_p_auprc)) if per_p_auprc else float("nan")
         elapsed = time.time() - t0
         current_lr = scheduler.get_last_lr()[0]
         per_p_str = " ".join(
-            f"p{p:.2f}(loss={l:.3f},acc={a:.3f},auc={u:.3f},n_auc={n})"
-            for (p, _), l, a, u, n in zip(
-                fixed_val_loaders, per_p_loss, per_p_acc, per_p_auc, per_p_nauc
+            f"p{p:.2f}(loss={l:.3f},acc={a:.3f},auc={u:.3f},auprc={ap:.3f},n={n})"
+            for (p, _), l, a, u, ap, n in zip(
+                fixed_val_loaders, per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_nauc
             )
         )
         logger.info(
             f"Epoch {epoch}/{args.num_epochs} | "
             f"Train loss={train_loss:.4f} acc={train_acc:.4f} | "
-            f"{per_p_str} | mean auc={val_auc_mean:.4f} | {elapsed:.1f}s"
+            f"{per_p_str} | mean auprc={val_auprc_mean:.4f} auc={val_auc_mean:.4f} | {elapsed:.1f}s"
         )
         with open(log_csv, "a", newline="") as f:
             row = [epoch, f"{train_loss:.6f}", f"{train_acc:.6f}"]
-            for l, a, u in zip(per_p_loss, per_p_acc, per_p_auc):
-                row += [f"{l:.6f}", f"{a:.6f}", f"{u:.6f}"]
-            row += [f"{val_loss_mean:.6f}", f"{val_acc_mean:.6f}", f"{val_auc_mean:.6f}",
+            for l, a, u, ap in zip(per_p_loss, per_p_acc, per_p_auc, per_p_auprc):
+                row += [f"{l:.6f}", f"{a:.6f}", f"{u:.6f}", f"{ap:.6f}"]
+            row += [f"{val_loss_mean:.6f}", f"{val_acc_mean:.6f}",
+                    f"{val_auc_mean:.6f}", f"{val_auprc_mean:.6f}",
                     f"{current_lr:.2e}", f"{elapsed:.1f}"]
             csv.writer(f).writerow(row)
-        if val_auc_mean > best_val_auc_mean:
+        if val_auprc_mean > best_val_auprc_mean:
+            best_val_auprc_mean = val_auprc_mean
             best_val_auc_mean = val_auc_mean
             torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
-            logger.info(f"  → Best model saved (val_auc_mean={val_auc_mean:.4f})")
+            logger.info(f"  → Best model saved (val_auprc_mean={val_auprc_mean:.4f})")
 
         if epoch % 10 == 0:
             torch.save({
@@ -454,6 +540,7 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss_mean": val_loss_mean,
                 "val_auc_mean": val_auc_mean,
+                "val_auprc_mean": val_auprc_mean,
             }, os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"))
 
     # Per-species AUC on best model — fixed-p eval on test (or val fallback).
@@ -467,27 +554,55 @@ def main():
         base_seed=args.seed + 10_000,
     )
     per_p_auc = {}
-    per_p_per_species_auc = {}
+    per_p_auprc = {}
+    per_p_per_species_auc   = {}
+    per_p_per_species_auprc = {}
     for p, loader in eval_loaders:
-        _, _, m_auc, per_sp = evaluate(model, loader, device, dist_info)
-        per_p_auc[p] = m_auc
-        per_p_per_species_auc[p] = per_sp
-        logger.info(f"{eval_split} p={p:.2f}  mean AUC = {m_auc:.4f}  (species n={len(per_sp)})")
-    best_mean_auc = float(np.mean(list(per_p_auc.values())))
-    logger.info(f"{eval_split} mean over p={list(per_p_auc.keys())}: {best_mean_auc:.4f}")
+        _, _, m_auc, m_auprc, per_sp_auc, per_sp_auprc = evaluate(model, loader, device, dist_info)
+        per_p_auc[p]   = m_auc
+        per_p_auprc[p] = m_auprc
+        per_p_per_species_auc[p]   = per_sp_auc
+        per_p_per_species_auprc[p] = per_sp_auprc
+        logger.info(f"{eval_split} p={p:.2f}  mean AUPRC = {m_auprc:.4f}  AUC = {m_auc:.4f}  "
+                    f"(species n={len(per_sp_auc)})")
+    best_mean_auc   = float(np.mean(list(per_p_auc.values())))
+    best_mean_auprc = float(np.mean(list(per_p_auprc.values())))
+    logger.info(f"{eval_split} mean over p={list(per_p_auc.keys())}: "
+                f"AUPRC={best_mean_auprc:.4f}  AUC={best_mean_auc:.4f}")
 
     import pandas as pd
     all_species = sorted({s for per_sp in per_p_per_species_auc.values() for s in per_sp})
-    auc_rows = []
+    rows = []
     for s in all_species:
         row = {"species": dataset.species_cols[s]}
         for p in per_p_auc:
-            row[f"auc_p{p:.2f}"] = per_p_per_species_auc[p].get(s, float("nan"))
-        row["auc_mean"] = float(np.nanmean([row[f"auc_p{p:.2f}"] for p in per_p_auc]))
-        auc_rows.append(row)
-    pd.DataFrame(auc_rows).to_csv(
+            row[f"auc_p{p:.2f}"]   = per_p_per_species_auc[p].get(s, float("nan"))
+            row[f"auprc_p{p:.2f}"] = per_p_per_species_auprc[p].get(s, float("nan"))
+        row["auc_mean"]   = float(np.nanmean([row[f"auc_p{p:.2f}"]   for p in per_p_auc]))
+        row["auprc_mean"] = float(np.nanmean([row[f"auprc_p{p:.2f}"] for p in per_p_auc]))
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(
         os.path.join(args.output_dir, "per_species_auc_jsdm.csv"), index=False)
-    logger.info(f"Per-species AUC saved to {args.output_dir}/per_species_auc_jsdm.csv")
+    logger.info(f"Per-species AUC/AUPRC saved to {args.output_dir}/per_species_auc_jsdm.csv")
+
+    # Standard summary consumed by the ablation master and any downstream tools.
+    # Primary metric is AUPRC; AUC retained for reference.
+    summary = {
+        "ablation":           config.ablation,
+        "num_params":         num_params,
+        "best_val_auprc_mean": best_val_auprc_mean,
+        "best_val_auc_mean":   best_val_auc_mean,
+        "test_mean_auprc":    best_mean_auprc,
+        "test_mean_auc":      best_mean_auc,
+        "test_auprc_by_p":    {f"{p:.2f}": per_p_auprc[p] for p in per_p_auprc},
+        "test_auc_by_p":      {f"{p:.2f}": per_p_auc[p]   for p in per_p_auc},
+        "eval_split":         eval_split,
+        "num_species":        config.num_species,
+        "num_epochs":         args.num_epochs,
+        "seed":               args.seed,
+    }
+    with open(os.path.join(args.output_dir, "ablation_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
 
     # Extract interaction matrix
     logger.info("Extracting species interaction matrix...")

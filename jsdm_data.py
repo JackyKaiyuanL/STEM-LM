@@ -73,12 +73,7 @@ def _site_distance_rows_np(lats: np.ndarray, lons: np.ndarray,
 
 def _tiled_stats(lats: np.ndarray, lons: np.ndarray, times: np.ndarray,
                  euclidean: bool, device: str = "cpu", tile: int = 4096):
-    """Streaming N×N pass. Returns:
-        max_spatial, max_temporal,
-        combined_min, combined_max  (with scales applied only *after* max is known,
-                                     so we do a two-phase pass)
-    This fn only computes max_spatial / max_temporal (phase 1).
-    """
+    """Max spatial and temporal pairwise distance."""
     N = len(lats)
     lats_t = torch.as_tensor(lats, dtype=torch.float64, device=device)
     lons_t = torch.as_tensor(lons, dtype=torch.float64, device=device)
@@ -99,37 +94,31 @@ def _tiled_stats(lats: np.ndarray, lons: np.ndarray, times: np.ndarray,
     return float(max_sp.item()), float(max_tp.item())
 
 
-def _tiled_combined_quantile(lats: np.ndarray, lons: np.ndarray, times: np.ndarray,
-                             spatial_scale: float, temporal_scale: float,
-                             percentile: float, euclidean: bool,
-                             device: str = "cpu", tile: int = 4096,
-                             n_bins: int = 1_000_000) -> float:
-    """Streaming histogram quantile of the combined normalized distance over
-    off-diagonal pairs. Exact to one bin width (≈1e-6 × range at n_bins=1e6).
-    """
+def _tiled_spatial_quantile(lats: np.ndarray, lons: np.ndarray,
+                            spatial_scale: float, percentile: float,
+                            euclidean: bool,
+                            device: str = "cpu", tile: int = 4096,
+                            n_bins: int = 1_000_000) -> float:
+    """Quantile of normalized spatial pairwise distance, off-diagonal only."""
     N = len(lats)
-    lats_t  = torch.as_tensor(lats,  dtype=torch.float64, device=device)
-    lons_t  = torch.as_tensor(lons,  dtype=torch.float64, device=device)
-    times_t = torch.as_tensor(times, dtype=torch.float64, device=device)
+    lats_t = torch.as_tensor(lats, dtype=torch.float64, device=device)
+    lons_t = torch.as_tensor(lons, dtype=torch.float64, device=device)
     sp_scale = float(spatial_scale)
-    tp_scale = float(temporal_scale)
 
-    def compute_combined_block(r0, r1):
+    def compute_block(r0, r1):
         la = lats_t[r0:r1, None]; lb = lats_t[None, :]
         lo_a = lons_t[r0:r1, None]; lo_b = lons_t[None, :]
         if euclidean:
             sp = torch.sqrt((la - lb) ** 2 + (lo_a - lo_b) ** 2)
         else:
             sp = haversine_pairs_torch(la, lo_a, lb, lo_b)
-        tp = (times_t[r0:r1, None] - times_t[None, :]).abs()
-        return torch.sqrt((sp / sp_scale) ** 2 + (tp / tp_scale) ** 2)
+        return sp / sp_scale
 
-    # Phase A: min / max of combined (exclude diagonal zeros and strict zeros)
+    # Pass A: min/max, excluding zeros so the diagonal doesn't pin the low end.
     cmin = torch.tensor(float("inf"), dtype=torch.float64, device=device)
     cmax = torch.tensor(0.0, dtype=torch.float64, device=device)
     for r0 in range(0, N, tile):
-        r1 = min(r0 + tile, N)
-        c = compute_combined_block(r0, r1)
+        c = compute_block(r0, min(r0 + tile, N))
         c_pos = c[c > 0]
         if c_pos.numel() > 0:
             cmin = torch.minimum(cmin, c_pos.min())
@@ -138,13 +127,12 @@ def _tiled_combined_quantile(lats: np.ndarray, lons: np.ndarray, times: np.ndarr
     if not np.isfinite(cmin_v) or cmax_v <= 0:
         return 0.0
 
-    # Phase B: accumulate histogram, then percentile from CDF
+    # Pass B: histogram → CDF → percentile.
     hist = torch.zeros(n_bins, dtype=torch.int64, device=device)
     total = 0
     span = cmax_v - cmin_v
     for r0 in range(0, N, tile):
-        r1 = min(r0 + tile, N)
-        c = compute_combined_block(r0, r1)
+        c = compute_block(r0, min(r0 + tile, N))
         c_pos = c[c > 0]
         if c_pos.numel() == 0:
             continue
@@ -205,13 +193,13 @@ class JSDMDataset(Dataset):
             reason = "--no_time" if no_time else f"column '{time_col}' not found"
             print(f"  Time ignored ({reason}) — purely spatial model")
 
-        self.half_months: Optional[np.ndarray] = None
         if has_time:
-            if df[time_col].dtype == "object" or pd.api.types.is_datetime64_any_dtype(df[time_col]):
-                dt = pd.to_datetime(df[time_col])
-                months = dt.dt.month.values
-                days   = dt.dt.day.values
-                self.half_months = (2 * (months - 1) + (days > 15).astype(np.int64)).astype(np.int64)
+            col = df[time_col]
+            is_stringlike = (col.dtype == "object"
+                             or pd.api.types.is_datetime64_any_dtype(col)
+                             or pd.api.types.is_string_dtype(col))
+            if is_stringlike:
+                dt = pd.to_datetime(col)
                 df[time_col] = (dt - dt.min()).dt.days.astype(float)
             else:
                 df[time_col] = df[time_col].astype(float)
@@ -230,7 +218,7 @@ class JSDMDataset(Dataset):
             print(
                 "WARNING: no environmental columns detected (none with 'env_' prefix "
                 "and no --env_cols given). Falling back to a single zero-valued env "
-                "column; the model will train without ecological signal."
+                "column; the model will train without environmental signal."
             )
         self.num_env_vars = len(env_cols) if env_cols else 1
 
@@ -249,9 +237,6 @@ class JSDMDataset(Dataset):
         self.has_time = bool(has_time)
 
         print(f"Dataset: {N} observations, {self.num_species} species, {self.num_env_vars} env vars")
-        # Pairwise distances are never materialized. Max distances (needed for
-        # scale auto-set) are computed by a streaming tiled pass on GPU when a
-        # scale is not explicitly provided.
         need_max = (spatial_scale_km is None) or (has_time and temporal_scale_days is None)
         if need_max:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -260,17 +245,17 @@ class JSDMDataset(Dataset):
                                           euclidean=self.euclidean_coords, device=device)
         else:
             max_sp = max_tp = 0.0
-        self.spatial_scale_km   = _resolve_scale(spatial_scale_km,   max_sp, "spatial_scale_km")
+        self.spatial_scale_km = _resolve_scale(spatial_scale_km, max_sp, "spatial_scale_km")
         self.temporal_scale_days = 1.0 if not has_time else _resolve_scale(
             temporal_scale_days, max_tp, "temporal_scale_days"
         )
-        # Cache maxima for downstream consumers (use_temporal etc.)
         self._max_spatial = max_sp
         self._max_temporal = max_tp if has_time else 0.0
-        self.source_pool = None  # None = all rows; set to train indices for h3/blocked splits
+        # None = draw sources from all rows; set to train indices under
+        # h3/grid/saved-splits to prevent val/test leakage through the source pool.
+        self.source_pool = None
         print("Done.")
 
-    # Row-wise on-the-fly distances: (N,) arrays from site `idx` to all sites.
     def site_distance_rows(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
         return _site_distance_rows_np(self.lats, self.lons, self.times, idx,
                                       euclidean=self.euclidean_coords)
@@ -314,28 +299,19 @@ class JSDMDataset(Dataset):
         }
 
 
-def _combined_blind_dists(site_lats, site_lons, site_times,
-                          tgt_idx_np, src_idx_np,
-                          spatial_scale_km, temporal_scale_days,
-                          euclidean=False):
-    """Compute combined normalized (B, N) distances for collator blinding.
-
-    site_lats/lons/times are full (N_total,) numpy arrays. tgt_idx_np is (B,),
-    src_idx_np is (B, N). Returns torch.FloatTensor (B, N).
-    """
+def _spatial_blind_dists(site_lats, site_lons,
+                         tgt_idx_np, src_idx_np,
+                         spatial_scale_km, euclidean=False):
+    """(B, N) normalized spatial target→source distances for blinding."""
     la_t = site_lats[tgt_idx_np][:, None]
     lo_t = site_lons[tgt_idx_np][:, None]
-    ti_t = site_times[tgt_idx_np][:, None]
     la_s = site_lats[src_idx_np]
     lo_s = site_lons[src_idx_np]
-    ti_s = site_times[src_idx_np]
     if euclidean:
         sp = np.sqrt((la_t - la_s) ** 2 + (lo_t - lo_s) ** 2).astype(np.float32)
     else:
         sp = haversine_pairs_np(la_t, lo_t, la_s, lo_s)
-    tp = np.abs(ti_t - ti_s).astype(np.float32)
-    combined = np.sqrt((sp / spatial_scale_km) ** 2 + (tp / temporal_scale_days) ** 2)
-    return torch.from_numpy(combined.astype(np.float32))
+    return torch.from_numpy((sp / spatial_scale_km).astype(np.float32))
 
 
 class JSDMDataCollator:
@@ -455,11 +431,10 @@ class JSDMDataCollator:
             target_idx = batch["target_idx"]   # (B,)
             src_idx_np = source_idx.numpy()    # (B, N)
             tgt_idx_np = target_idx.numpy()    # (B,)
-            blind_dists = _combined_blind_dists(
-                self.site_lats, self.site_lons, self.site_times,
+            blind_dists = _spatial_blind_dists(
+                self.site_lats, self.site_lons,
                 tgt_idx_np, src_idx_np,
-                self.spatial_scale_km, self.temporal_scale_days,
-                euclidean=self.euclidean,
+                self.spatial_scale_km, euclidean=self.euclidean,
             )
             is_blind = blind_dists <= self.blind_threshold  # (B, N)
             # blind_mask[b, s, n] = True iff species s is masked AND source n is nearby
@@ -484,14 +459,7 @@ class JSDMDataCollator:
 
 
 class FixedPValCollator(JSDMDataCollator):
-    """Deterministic fixed-p mask collator for validation.
-
-    Mask rate is a single scalar p applied to both presences and absences.
-    Randomness is seeded deterministically from batch content (first
-    target_idx), so the same batch produces identical masks across epochs —
-    the val AUC trajectory becomes a noise-free signal of model quality
-    rather than drifting with per-batch mask sampling.
-    """
+    """Fixed-p masking with batch-deterministic seeding (masks repeat across epochs)."""
 
     def __init__(self, p,
                  site_lats=None, site_lons=None, site_times=None,
@@ -528,11 +496,10 @@ class FixedPValCollator(JSDMDataCollator):
         if self._has_coords and self.blind_threshold is not None:
             src_idx = batch["source_idx"].numpy()
             tgt_idx = batch["target_idx"].numpy()
-            blind_dists = _combined_blind_dists(
-                self.site_lats, self.site_lons, self.site_times,
+            blind_dists = _spatial_blind_dists(
+                self.site_lats, self.site_lons,
                 tgt_idx, src_idx,
-                self.spatial_scale_km, self.temporal_scale_days,
-                euclidean=self.euclidean,
+                self.spatial_scale_km, euclidean=self.euclidean,
             )
             is_blind = blind_dists <= self.blind_threshold
             blind_mask = masked[:, :, None] & is_blind[:, None, :]
@@ -583,29 +550,129 @@ def build_val_loaders_fixed_p(dataset, val_indices, dist_info, p_values,
     return loaders
 
 
+def auto_blind_percentile(
+    dataset: "JSDMDataset",
+    n_pairs: int = 100_000,
+    seed: int = 0,
+    min_pairs_per_bin: int = 50,
+) -> Tuple[float, dict]:
+    """Half-decay auto-selection of blind_percentile.
+
+    τ = (mean Jaccard in nearest bin + background Jaccard) / 2
+    d* = smallest distance at which mean Jaccard ≤ τ
+    blind_percentile = percentile rank of d* in the normalized pairwise
+    distance distribution.
+
+    Returns (percentile, diagnostics). Raises if the dataset is degenerate
+    (no resolvable autocorrelation signal).
+    """
+    rng = np.random.RandomState(seed)
+    N = len(dataset)
+    i = rng.randint(0, N, n_pairs)
+    j = rng.randint(0, N, n_pairs)
+    keep = i != j
+    i, j = i[keep], j[keep]
+
+    lats = dataset.lats.astype(np.float64)
+    lons = dataset.lons.astype(np.float64)
+    d_km = haversine_pairs_np(lats[i], lons[i], lats[j], lons[j])
+
+    S = dataset.species_data.astype(bool)
+    inter = (S[i] & S[j]).sum(axis=1)
+    union = (S[i] | S[j]).sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        jacc = np.where(union > 0, inter / np.maximum(union, 1), 0.0)
+    bg = float(jacc.mean())
+
+    # Log-spaced distance bins from the data's own range.
+    d_min, d_max = max(1e-3, float(d_km.min())), float(d_km.max())
+    edges = np.logspace(np.log10(max(d_min, 0.1)), np.log10(d_max), 20)
+    edges = np.concatenate([[0.0], edges])
+    j_bins: List[float] = []
+    n_bins: List[int] = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (d_km >= lo) & (d_km < hi)
+        n_bins.append(int(m.sum()))
+        j_bins.append(float(jacc[m].mean()) if m.sum() >= min_pairs_per_bin else float("nan"))
+
+    valid = [k for k, n in enumerate(n_bins) if n >= min_pairs_per_bin]
+    if not valid:
+        raise ValueError("auto blind_percentile: no distance bin has enough pairs.")
+    j0 = j_bins[valid[0]]
+    if not np.isfinite(j0):
+        raise ValueError("auto blind_percentile: nearest-bin Jaccard is undefined.")
+    if j0 <= bg:
+        raise ValueError(
+            f"auto blind_percentile: nearest-bin Jaccard ({j0:.4f}) ≤ background "
+            f"({bg:.4f}). The dataset shows no near-range autocorrelation, so "
+            f"there's nothing for blinding to block. Pass an explicit "
+            f"--blind_percentile instead."
+        )
+
+    tau = 0.5 * (j0 + bg)
+    d_star = None
+    for k in valid:
+        if j_bins[k] <= tau:
+            d_star = edges[k]
+            break
+    if d_star is None:
+        raise ValueError(
+            f"auto blind_percentile: mean Jaccard never drops to τ={tau:.4f} "
+            f"within the observed range. The autocorrelation extends past the "
+            f"sampled extent — set --blind_percentile manually."
+        )
+
+    # Percentile of the *normalized spatial* distance (same space the collator
+    # applies the blind threshold in: sp_km / spatial_scale_km).
+    d_norm = d_km / dataset.spatial_scale_km
+    pct = float((d_norm <= d_star / dataset.spatial_scale_km).mean() * 100.0)
+    diag = {
+        "background_jaccard": bg,
+        "nearest_bin_jaccard": j0,
+        "tau": tau,
+        "d_star_km": float(d_star),
+        "d_star_norm": float(d_star / dataset.spatial_scale_km),
+        "spatial_scale_km": dataset.spatial_scale_km,
+        "bin_edges_km": edges.tolist(),
+        "mean_jaccard_by_bin": j_bins,
+        "n_pairs_by_bin": n_bins,
+    }
+    return pct, diag
+
+
 def compute_dist_info(
     dataset: "JSDMDataset",
-    blind_percentile: float = 2.0,
+    blind_percentile="auto",   # float | "auto"
     tile: int = 4096,
     hist_bins: int = 1_000_000,
 ) -> dict:
-    """Coord-only dist_info. Carries site coords (N-vectors) + scales + the
-    blind threshold percentile (computed via streaming GPU histogram).
+    """dist_info for collators and model.forward: coords, scales, blind threshold.
 
-    No N×N matrix is materialized. Consumed by collators and JSDMModel.forward,
-    which compute per-batch distances on the fly.
+    `blind_percentile` can be a float or the literal string "auto"; "auto"
+    picks the percentile via half-decay on the dataset's Jaccard(d) curve.
     """
+    # Resolve "auto" before the quantile computation.
+    if isinstance(blind_percentile, str):
+        if blind_percentile.lower() != "auto":
+            raise ValueError(f"blind_percentile must be a float or 'auto'; got {blind_percentile!r}")
+        print("  blind_percentile='auto': measuring Jaccard(d) to pick half-decay radius...")
+        pct, diag = auto_blind_percentile(dataset)
+        print(f"    background Jaccard = {diag['background_jaccard']:.4f}")
+        print(f"    nearest-bin Jaccard = {diag['nearest_bin_jaccard']:.4f}")
+        print(f"    τ (half-decay)      = {diag['tau']:.4f}")
+        print(f"    d* = {diag['d_star_km']:.1f} km  →  percentile = {pct:.3f}%")
+        blind_percentile = pct
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"  Computing blind-threshold percentile (tiled histogram, device={device})...")
-    blind_threshold = _tiled_combined_quantile(
-        dataset.lats, dataset.lons, dataset.times,
+    blind_threshold = _tiled_spatial_quantile(
+        dataset.lats, dataset.lons,
         spatial_scale=dataset.spatial_scale_km,
-        temporal_scale=dataset.temporal_scale_days,
-        percentile=blind_percentile,
+        percentile=float(blind_percentile),
         euclidean=dataset.euclidean_coords,
         device=device, tile=tile, n_bins=hist_bins,
     )
-    print(f"  Blind threshold: {blind_threshold:.4f} ({blind_percentile}th percentile)")
+    print(f"  Blind threshold: {blind_threshold:.4f} ({blind_percentile:.3f}th percentile)")
 
     return {
         # Coord arrays — torch tensors so `.to(device)` moves them uniformly.
@@ -691,7 +758,7 @@ def load_splits(path: str, expected_num_rows: Optional[int] = None
     )
 
 
-def h3_block_split(lats, lons, resolution=4, train_frac=0.8, test_frac=0.1, seed=42):
+def h3_block_split(lats, lons, resolution=2, train_frac=0.8, test_frac=0.1, seed=42):
     """
     Split observation indices into train/val/test by H3 spatial blocks.
     Each H3 cell at the given resolution is assigned entirely to one split.
@@ -725,61 +792,10 @@ def h3_block_split(lats, lons, resolution=4, train_frac=0.8, test_frac=0.1, seed
     return train_idx, val_idx, test_idx
 
 
-def h3_time_block_split(lats, lons, half_months, resolution=3,
-                        train_frac=0.8, test_frac=0.1, seed=42):
-    """Spatiotemporal block on (H3 cell, half-month).
-
-    Independently partitions H3 cells and half-month bins (0..23) into
-    train/val/test. A row is:
-      - train if both its cell AND its half-month are train-assigned,
-      - test  if either its cell OR its half-month is test-assigned,
-      - val   otherwise (at least one axis is val, neither is test).
-    Val therefore covers three regimes: spatial-only (new cell, seen season),
-    seasonal-only (seen cell, new season), and combined (new cell, new season).
-    """
-    try:
-        import h3 as h3lib
-    except ImportError:
-        raise ImportError("h3 package required for --fold h3. Install with: pip install h3")
-    cells = np.array([h3lib.latlng_to_cell(float(lat), float(lon), resolution)
-                      for lat, lon in zip(lats, lons)])
-    hm = np.asarray(half_months, dtype=np.int64)
-
-    def partition(uniq, seed_shift):
-        rng = np.random.RandomState(seed + seed_shift)
-        arr = uniq.copy(); rng.shuffle(arr)
-        n = len(arr)
-        n_te = max(1, round(n * test_frac))
-        n_va = max(1, round(n * (1 - train_frac - test_frac)))
-        return set(arr[:n_te].tolist()), set(arr[n_te:n_te+n_va].tolist()), set(arr[n_te+n_va:].tolist())
-
-    test_c, val_c, train_c = partition(np.unique(cells), 0)
-    test_h, val_h, train_h = partition(np.unique(hm),    1)
-
-    c_tr = np.isin(cells, list(train_c)); c_va = np.isin(cells, list(val_c)); c_te = np.isin(cells, list(test_c))
-    h_tr = np.isin(hm,    list(train_h)); h_va = np.isin(hm,    list(val_h)); h_te = np.isin(hm,    list(test_h))
-
-    train_idx = np.where(c_tr & h_tr)[0]
-    test_idx  = np.where(c_te | h_te)[0]
-    val_idx   = np.where(~(c_tr & h_tr) & ~(c_te | h_te))[0]
-
-    n_spatial  = int((c_va & h_tr).sum())
-    n_seasonal = int((c_tr & h_va).sum())
-    n_combined = int((c_va & h_va).sum())
-    print(f"  H3 res={resolution} × half-month | cells {len(np.unique(cells))} "
-          f"({len(train_c)}/{len(val_c)}/{len(test_c)}) | "
-          f"half-months {len(np.unique(hm))} "
-          f"({len(train_h)}/{len(val_h)}/{len(test_h)})")
-    print(f"  rows: train {len(train_idx)} | val {len(val_idx)} "
-          f"(spatial {n_spatial} + seasonal {n_seasonal} + combined {n_combined}) "
-          f"| test {len(test_idx)}")
-    return train_idx, val_idx, test_idx
-
-
 def create_dataloaders(
     csv_path, batch_size=32, num_source_sites=64,
     p_pres=0.15, p_abs=0.15,
-    blind_percentile=2.0,
+    blind_percentile="auto",
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
     euclidean_coords=False, no_time=False,
@@ -826,24 +842,11 @@ def create_dataloaders(
             resolution = 2
         if not isinstance(resolution, int) or not (0 <= resolution <= 15):
             raise ValueError("--resolution for --fold h3 must be an integer in [0, 15].")
-        if dataset.half_months is not None:
-            train_indices, val_indices, test_indices = h3_time_block_split(
-                dataset.lats, dataset.lons, dataset.half_months,
-                resolution=resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
-            )
-            split_origin = "h3_time"
-        elif no_time:
-            train_indices, val_indices, test_indices = h3_block_split(
-                dataset.lats, dataset.lons,
-                resolution=resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
-            )
-            split_origin = "h3"
-        else:
-            raise ValueError(
-                "--fold h3 with time enabled requires parseable dates in the 'time' column "
-                "(e.g. 'YYYY-MM-DD') so month/day can be extracted for spatiotemporal blocking. "
-                "Either pass --no_time or convert the time column to a standard date string."
-            )
+        train_indices, val_indices, test_indices = h3_block_split(
+            dataset.lats, dataset.lons,
+            resolution=resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
+        )
+        split_origin = "h3"
         source_pool_restricted = True
     elif fold_method == "grid":
         if not euclidean_coords:

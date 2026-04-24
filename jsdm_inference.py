@@ -13,7 +13,7 @@ import os
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 from torch.utils.data import DataLoader, Subset
 
 from jsdm_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
@@ -111,14 +111,16 @@ def predict(model, loader, dist_info, device, species_names):
     return probs, labels
 
 
-def compute_auc(probs, labels, species_names):
-    aucs = {}
+def compute_metrics(probs, labels, species_names):
+    aucs, auprcs = {}, {}
     for s, name in enumerate(species_names):
         mask = labels[:, s] != -100
         if mask.sum() > 0 and len(np.unique(labels[mask, s])) == 2:
-            aucs[name] = roc_auc_score(labels[mask, s], probs[mask, s])
-    mean_auc = np.mean(list(aucs.values())) if aucs else float("nan")
-    return aucs, mean_auc
+            aucs[name]   = roc_auc_score(labels[mask, s], probs[mask, s])
+            auprcs[name] = average_precision_score(labels[mask, s], probs[mask, s])
+    mean_auc   = float(np.mean(list(aucs.values())))   if aucs   else float("nan")
+    mean_auprc = float(np.mean(list(auprcs.values()))) if auprcs else float("nan")
+    return aucs, auprcs, mean_auc, mean_auprc
 
 
 @torch.no_grad()
@@ -149,7 +151,11 @@ def add_common_args(p):
     p.add_argument("output_path", type=str)
     p.add_argument("--batch_size",       type=int,   default=32)
     p.add_argument("--num_workers",      type=int,   default=0)
-    p.add_argument("--blind_percentile", type=float, default=2.0)
+    p.add_argument(
+        "--blind_percentile",
+        type=lambda s: "auto" if isinstance(s, str) and s.lower() == "auto" else float(s),
+        default="auto",
+    )
     p.add_argument("--no_time",          action="store_true")
     p.add_argument("--euclidean_coords", action="store_true")
     p.add_argument("--splits_path",      type=str,   default=None,
@@ -160,7 +166,7 @@ def add_common_args(p):
                         "as training.")
     p.add_argument("--resolution", type=int, default=None,
                    help="Block resolution for spatial splits. For --fold h3, this is the H3 "
-                        "resolution in [0, 15] (default 3). For --fold grid, this is the grid "
+                        "resolution in [0, 15] (default 2). For --fold grid, this is the grid "
                         "side length (default 20). Not valid with --fold random.")
     p.add_argument("--train_frac",       type=float, default=0.8)
     p.add_argument("--test_frac",        type=float, default=0.1)
@@ -230,7 +236,7 @@ def main():
         elif args.fold == "h3":
             if args.euclidean_coords:
                 raise ValueError("--fold h3 requires real lat/lon coordinates. Use --fold grid for euclidean datasets.")
-            resolution = 3 if args.resolution is None else args.resolution
+            resolution = 2 if args.resolution is None else args.resolution
             if not (0 <= int(resolution) <= 15):
                 raise ValueError("--resolution for --fold h3 must be an integer in [0, 15].")
             train_idx, val_idx, test_idx = h3_block_split(
@@ -256,8 +262,10 @@ def main():
         eval_idx = val_idx if args.eval_split == "val" else test_idx
         print(f"Predicting on {args.eval_split} set: {len(eval_idx)} sites")
 
-        per_p_species_auc = {}
-        per_p_mean_auc    = {}
+        per_p_species_auc   = {}
+        per_p_species_auprc = {}
+        per_p_mean_auc      = {}
+        per_p_mean_auprc    = {}
         last_probs = None
         for i, p in enumerate(args.p):
             print(f"\n── p = {p:.2f} ──")
@@ -275,18 +283,22 @@ def main():
                 shuffle=False, collate_fn=collator, num_workers=args.num_workers,
             )
             probs, labels = predict(model, loader, dist_info, device, species_names)
-            aucs, mean_auc = compute_auc(probs, labels, species_names)
-            per_p_species_auc[p] = aucs
-            per_p_mean_auc[p]    = mean_auc
-            print(f"  mean AUC = {mean_auc:.4f}  ({len(aucs)}/{len(species_names)} species)")
+            aucs, auprcs, mean_auc, mean_auprc = compute_metrics(probs, labels, species_names)
+            per_p_species_auc[p]   = aucs
+            per_p_species_auprc[p] = auprcs
+            per_p_mean_auc[p]      = mean_auc
+            per_p_mean_auprc[p]    = mean_auprc
+            print(f"  mean AUPRC = {mean_auprc:.4f}  mean AUC = {mean_auc:.4f}  "
+                  f"({len(aucs)}/{len(species_names)} species)")
             last_probs = probs
 
-        overall = float(np.mean(list(per_p_mean_auc.values())))
+        overall_auc   = float(np.mean(list(per_p_mean_auc.values())))
+        overall_auprc = float(np.mean(list(per_p_mean_auprc.values())))
         print(f"\n============================================================")
-        print(f"{args.eval_split} per-p mean AUC (deterministic):")
-        for p, m in per_p_mean_auc.items():
-            print(f"  p={p:.2f}  {m:.4f}")
-        print(f"  mean over p = {overall:.4f}")
+        print(f"{args.eval_split} per-p (deterministic):")
+        for p in args.p:
+            print(f"  p={p:.2f}  AUPRC={per_p_mean_auprc[p]:.4f}  AUC={per_p_mean_auc[p]:.4f}")
+        print(f"  mean over p   AUPRC={overall_auprc:.4f}  AUC={overall_auc:.4f}")
         print(f"============================================================")
 
         # Save predictions (parquet) using the LAST p's output — matches legacy p=1.0 use
@@ -296,27 +308,31 @@ def main():
         result_df.to_parquet(args.output_path, index=False)
         print(f"Predictions saved to {args.output_path}  (at p={args.p[-1]:.2f})")
 
-        # Per-species AUC table with one column per p
+        # Per-species AUC/AUPRC table with one column per p
         all_species = sorted({s for a in per_p_species_auc.values() for s in a})
         rows = []
         for s in all_species:
             row = {"species": s}
             for p in args.p:
-                row[f"auc_p{p:.2f}"] = per_p_species_auc[p].get(s, float("nan"))
-            row["auc_mean"] = float(np.nanmean([row[f"auc_p{p:.2f}"] for p in args.p]))
+                row[f"auc_p{p:.2f}"]   = per_p_species_auc[p].get(s, float("nan"))
+                row[f"auprc_p{p:.2f}"] = per_p_species_auprc[p].get(s, float("nan"))
+            row["auc_mean"]   = float(np.nanmean([row[f"auc_p{p:.2f}"]   for p in args.p]))
+            row["auprc_mean"] = float(np.nanmean([row[f"auprc_p{p:.2f}"] for p in args.p]))
             rows.append(row)
-        auc_df = pd.DataFrame(rows).sort_values("auc_mean", ascending=False)
+        auc_df = pd.DataFrame(rows).sort_values("auprc_mean", ascending=False)
         auc_path = os.path.join(args.model_dir, f"per_species_auc_{args.eval_split}_by_p.csv")
         auc_df.to_csv(auc_path, index=False)
-        print(f"Per-species AUC (per-p) saved to {auc_path}")
+        print(f"Per-species AUC/AUPRC (per-p) saved to {auc_path}")
 
         # JSON summary
         summary = {
             "eval_split": args.eval_split,
             "n_eval_rows": int(len(eval_idx)),
             "p_list": [float(p) for p in args.p],
-            "per_p_mean_auc": {f"{p:.2f}": float(per_p_mean_auc[p]) for p in args.p},
-            "overall_mean_auc": overall,
+            "per_p_mean_auprc": {f"{p:.2f}": float(per_p_mean_auprc[p]) for p in args.p},
+            "per_p_mean_auc":   {f"{p:.2f}": float(per_p_mean_auc[p])   for p in args.p},
+            "overall_mean_auprc": overall_auprc,
+            "overall_mean_auc":   overall_auc,
         }
         js_path = os.path.join(args.model_dir, f"test_per_p_summary.json")
         with open(js_path, "w") as f:
