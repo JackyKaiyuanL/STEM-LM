@@ -127,11 +127,7 @@ def _tiled_spatial_quantile(lats: np.ndarray, lons: np.ndarray,
 
 def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
     if value is None:
-        if fallback <= 0:
-            print(f"  Note: {name} auto-set to 1.0 (all pairwise distances are 0 — static dataset)")
-            return 1.0
-        print(f"  Note: {name} auto-set to {fallback:.3f} (max pairwise distance)")
-        return float(fallback)
+        return 1.0 if fallback <= 0 else float(fallback)
     if value <= 0:
         raise ValueError(f"{name} must be > 0, got {value}")
     return float(value)
@@ -147,7 +143,6 @@ class JSDMDataset(Dataset):
         lon_col: str = "longitude",
         env_cols: Optional[List[str]] = None,
         spatial_scale_km: Optional[float] = None,
-        temporal_scale_days: Optional[float] = None,
         euclidean_coords: bool = False,
         no_time: bool = False,
     ):
@@ -212,18 +207,11 @@ class JSDMDataset(Dataset):
         self.has_time = bool(has_time)
 
         print(f"Dataset: {N} observations, {self.num_species} species, {self.num_env_vars} env vars")
-        need_max = (spatial_scale_km is None) or (has_time and temporal_scale_days is None)
-        if need_max:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"  Computing max pairwise distance (tiled, device={device})...")
-            max_sp, max_tp = _tiled_stats(self.lats, self.lons, self.times,
-                                          euclidean=self.euclidean_coords, device=device)
-        else:
-            max_sp = max_tp = 0.0
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"  Computing max pairwise distance (tiled, device={device})...")
+        max_sp, max_tp = _tiled_stats(self.lats, self.lons, self.times,
+                                      euclidean=self.euclidean_coords, device=device)
         self.spatial_scale_km = _resolve_scale(spatial_scale_km, max_sp, "spatial_scale_km")
-        self.temporal_scale_days = 1.0 if not has_time else _resolve_scale(
-            temporal_scale_days, max_tp, "temporal_scale_days"
-        )
         self._max_spatial = max_sp
         self._max_temporal = max_tp if has_time else 0.0
         
@@ -244,20 +232,55 @@ class JSDMDataset(Dataset):
         target_species = self.species_data[idx]  # (S,)
 
         sp_row, tp_row = self.site_distance_rows(idx)
-        spatial = sp_row / self.spatial_scale_km
-        temporal = tp_row / self.temporal_scale_days
-        combined_dist = np.sqrt(spatial ** 2 + temporal ** 2)
-        combined_dist[idx] = np.inf
+        sp_row = sp_row.astype(np.float32, copy=True)
+        tp_row = tp_row.astype(np.float32, copy=True)
+        sp_row[idx] = np.inf
+        tp_row[idx] = np.inf
+
+        # 1. Set of size N drawn by inverse spatial distance only.
+        inv_sp = 1.0 / (sp_row + 1e-6)
+        if self.source_pool is not None:
+            pool_cand = self.source_pool
+            w1 = inv_sp[pool_cand]
+            w1 = w1 / w1.sum()
+            pool_idx = pool_cand[np.random.choice(
+                len(pool_cand), size=N,
+                replace=(N > len(pool_cand) - 1), p=w1,
+            )]
+        else:
+            w1 = inv_sp / inv_sp.sum()
+            pool_idx = np.random.choice(
+                N_total, size=N,
+                replace=(N > N_total - 1), p=w1,
+            )
+            
+        s_sp = float(np.median(sp_row[pool_idx])) + 1e-6
+        if self.has_time:
+            s_tp = float(np.median(tp_row[pool_idx])) + 1e-6
+        else:
+            s_tp = 1.0
+
+        # 2. Final source sample via rescaled inverse distance.
+        if self.has_time:
+            combined_dist = np.sqrt((sp_row / s_sp) ** 2 + (tp_row / s_tp) ** 2)
+        else:
+            combined_dist = sp_row / s_sp
         inv_dist = 1.0 / (combined_dist + 1e-6)
 
         if self.source_pool is not None:
             pool = self.source_pool
-            p = inv_dist[pool]
-            p = p / p.sum()
-            source_idx = pool[np.random.choice(len(pool), size=N, replace=(N > len(pool) - 1), p=p)]
+            w2 = inv_dist[pool]
+            w2 = w2 / w2.sum()
+            source_idx = pool[np.random.choice(
+                len(pool), size=N,
+                replace=(N > len(pool) - 1), p=w2,
+            )]
         else:
-            probs = inv_dist / inv_dist.sum()
-            source_idx = np.random.choice(N_total, size=N, replace=(N > N_total - 1), p=probs)
+            w2 = inv_dist / inv_dist.sum()
+            source_idx = np.random.choice(
+                N_total, size=N,
+                replace=(N > N_total - 1), p=w2,
+            )
 
         source_species = np.ascontiguousarray(self.species_data[source_idx].T)
         source_env = self.env_data[source_idx]
@@ -291,7 +314,7 @@ def _spatial_blind_dists(site_lats, site_lons,
 class JSDMDataCollator:
     def __init__(self, p=0.15,
                  site_lats=None, site_lons=None, site_times=None,
-                 spatial_scale_km=1.0, temporal_scale_days=1.0,
+                 spatial_scale_km=1.0,
                  euclidean=False,
                  blind_threshold=None, mask_token_prob=1.0, seed=None):
 
@@ -306,7 +329,6 @@ class JSDMDataCollator:
         self.site_lons = _to_np(site_lons)
         self.site_times = _to_np(site_times)
         self.spatial_scale_km = float(spatial_scale_km)
-        self.temporal_scale_days = float(temporal_scale_days)
         self.euclidean = bool(euclidean)
         self.blind_threshold = blind_threshold
         self._has_coords = self.site_lats is not None and self.site_lons is not None and self.site_times is not None
@@ -408,12 +430,11 @@ class JSDMDataCollator:
 class FixedPValCollator(JSDMDataCollator):
     def __init__(self, p,
                  site_lats=None, site_lons=None, site_times=None,
-                 spatial_scale_km=1.0, temporal_scale_days=1.0, euclidean=False,
+                 spatial_scale_km=1.0, euclidean=False,
                  blind_threshold=None, base_seed=0):
         super().__init__(p=p,
                          site_lats=site_lats, site_lons=site_lons, site_times=site_times,
                          spatial_scale_km=spatial_scale_km,
-                         temporal_scale_days=temporal_scale_days,
                          euclidean=euclidean,
                          blind_threshold=blind_threshold,
                          mask_token_prob=1.0)
@@ -477,7 +498,6 @@ def build_val_loaders_fixed_p(dataset, val_indices, dist_info, p_values,
             site_lons=dist_info["site_lons"],
             site_times=dist_info["site_times"],
             spatial_scale_km=dist_info["spatial_scale_km"],
-            temporal_scale_days=dist_info["temporal_scale_days"],
             euclidean=dist_info.get("euclidean", False),
             blind_threshold=dist_info["blind_threshold"],
             base_seed=base_seed + 1000 * i,
@@ -606,7 +626,6 @@ def compute_dist_info(
         "max_spatial_dist": float(dataset._max_spatial),
         "max_temporal_dist": float(dataset._max_temporal),
         "spatial_scale_km": dataset.spatial_scale_km,
-        "temporal_scale_days": dataset.temporal_scale_days,
     }
 
 
@@ -706,7 +725,7 @@ def create_dataloaders(
     p=0.15,
     blind_percentile="auto",
     train_frac=0.8, test_frac=0.1, num_workers=0,
-    seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
+    seed=42, env_cols=None, spatial_scale_km=None,
     euclidean_coords=False, no_time=False,
     fold_method="random", resolution: Optional[int] = None,
     saved_splits: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
@@ -718,7 +737,6 @@ def create_dataloaders(
         num_source_sites=num_source_sites,
         env_cols=env_cols,
         spatial_scale_km=spatial_scale_km,
-        temporal_scale_days=temporal_scale_days,
         euclidean_coords=euclidean_coords,
         no_time=no_time,
     )
@@ -787,7 +805,6 @@ def create_dataloaders(
         site_lons=dataset.lons,
         site_times=dataset.times,
         spatial_scale_km=dataset.spatial_scale_km,
-        temporal_scale_days=dataset.temporal_scale_days,
         euclidean=dataset.euclidean_coords,
         blind_threshold=dist_info["blind_threshold"],
         seed=seed,

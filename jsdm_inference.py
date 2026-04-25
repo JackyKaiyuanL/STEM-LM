@@ -258,7 +258,6 @@ def main():
                 p=p,
                 site_lats=dataset.lats, site_lons=dataset.lons, site_times=dataset.times,
                 spatial_scale_km=dataset.spatial_scale_km,
-                temporal_scale_days=dataset.temporal_scale_days,
                 euclidean=dataset.euclidean_coords,
                 blind_threshold=dist_info["blind_threshold"],
                 base_seed=args.seed + 10_000 + 1000 * i,
@@ -329,7 +328,6 @@ def main():
             p=getattr(config, "p", 0.15),
             site_lats=dataset.lats, site_lons=dataset.lons, site_times=dataset.times,
             spatial_scale_km=dataset.spatial_scale_km,
-            temporal_scale_days=dataset.temporal_scale_days,
             euclidean=dataset.euclidean_coords,
             blind_threshold=dist_info["blind_threshold"],
         )

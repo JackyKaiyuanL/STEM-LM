@@ -203,8 +203,6 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--output_dir", type=str, default="./jsdm_output")
     parser.add_argument("--gradient_checkpointing", action="store_true")
-    parser.add_argument("--spatial_scale_km", type=float, default=None)
-    parser.add_argument("--temporal_scale_days", type=float, default=None)
     parser.add_argument("--no_time", action="store_true",
                         help="Disable temporal FIRE bias. Set automatically when all "
                              "time values in the CSV are identical (static datasets).")
@@ -329,8 +327,6 @@ def main():
         num_workers=args.num_workers,
         seed=args.seed,
         env_cols=args.env_cols,
-        spatial_scale_km=args.spatial_scale_km,
-        temporal_scale_days=args.temporal_scale_days,
         euclidean_coords=args.euclidean_coords,
         no_time=args.no_time,
         fold_method=args.fold,
@@ -574,8 +570,6 @@ def main():
                 site_lats=dist_info["site_lats"],
                 site_lons=dist_info["site_lons"],
                 site_times=dist_info["site_times"],
-                spatial_scale_km=dist_info["spatial_scale_km"],
-                temporal_scale_days=dist_info["temporal_scale_days"],
                 euclidean=dist_info.get("euclidean", False),
                 output_attentions=True,
             )
