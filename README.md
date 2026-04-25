@@ -46,7 +46,7 @@ Species values must be 0/1.
 - `--max_grad_norm` (`1.0`) — gradient clipping.
 - `--class_weighting` (`0.999`) — up-weight rare species (effective-number).
 - `--gradient_checkpointing` — trade compute for memory.
-- `--val_p_list` (default `0.25 0.5 0.75 1.0`) — fixed mask rates evaluated each epoch with deterministic per-batch seeding (`FixedPValCollator`). Per-p val AUC and AUPRC are logged to `training_log.csv` as `val_auc_p... / val_auprc_p...`; their mean AUPRC (`val_auprc_mean`) drives `best_model.pt` selection — AUPRC is preferred over AUROC because most JSDM species are rare and AUROC is inflated by the easy common-species tail. AUC is still reported as a secondary metric.
+- `--val_p_list` (default `0.25 0.5 0.75 1.0`) — fixed mask rates evaluated each epoch with deterministic per-batch seeding (`FixedPValCollator`). Per-p val AUC and AUPRC are logged to `training_log.csv` as `val_auc_p... / val_auprc_p...`; their mean AUC (`val_auc_mean`) drives `best_model.pt` selection. AUPRC is reported but not used for selection.
 
 **Ablation**
 - `jsdm_train.py --ablation {full,no_st,no_env,no_st_env}` — which cross-attention branches to keep. Param counts differ across modes. Ablated branches are not instantiated, so `no_env` / `no_st_env` have no environmental modules at all (no dead weight). Every training run writes `ablation_summary.json` alongside the checkpoint.

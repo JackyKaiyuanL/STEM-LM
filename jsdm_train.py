@@ -252,8 +252,9 @@ def main():
     parser.add_argument("--val_p_list", type=float, nargs="+",
                         default=[0.25, 0.5, 0.75, 1.0],
                         help="Fixed mask rates for val AUC (deterministic per batch). "
-                             "Mean AUC across these drives best_model.pt selection, giving "
-                             "apples-to-apples comparison across runs (default 0.25 0.5 0.75 1.0).")
+                             "Mean AUC across these drives best_model.pt selection. "
+                             "AUPRC is reported but not used for selection. "
+                             "Default 0.25 0.5 0.75 1.0.")
     parser.add_argument("--ablation", choices=["full", "no_st", "no_env", "no_st_env"],
                         default="full",
                         help="Ablation mode. 'full' uses both ST and Env cross-attention "
@@ -438,8 +439,8 @@ def main():
              "lr", "elapsed_s"]
         )
 
-    best_val_auprc_mean = -float("inf")
     best_val_auc_mean = -float("inf")
+    best_val_auprc_mean = -float("inf")
     for epoch in range(1, args.num_epochs + 1):
         t0 = time.time()
         train_loss, train_acc = train_epoch(
@@ -470,7 +471,7 @@ def main():
         logger.info(
             f"Epoch {epoch}/{args.num_epochs} | "
             f"Train loss={train_loss:.4f} acc={train_acc:.4f} | "
-            f"{per_p_str} | mean auprc={val_auprc_mean:.4f} auc={val_auc_mean:.4f} | {elapsed:.1f}s"
+            f"{per_p_str} | mean auc={val_auc_mean:.4f} auprc={val_auprc_mean:.4f} | {elapsed:.1f}s"
         )
         with open(log_csv, "a", newline="") as f:
             row = [epoch, f"{train_loss:.6f}", f"{train_acc:.6f}"]
@@ -480,11 +481,11 @@ def main():
                     f"{val_auc_mean:.6f}", f"{val_auprc_mean:.6f}",
                     f"{current_lr:.2e}", f"{elapsed:.1f}"]
             csv.writer(f).writerow(row)
-        if val_auprc_mean > best_val_auprc_mean:
-            best_val_auprc_mean = val_auprc_mean
+        if val_auc_mean > best_val_auc_mean:
             best_val_auc_mean = val_auc_mean
+            best_val_auprc_mean = val_auprc_mean
             torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
-            logger.info(f"  → Best model saved (val_auprc_mean={val_auprc_mean:.4f})")
+            logger.info(f"  → Best model saved (val_auc_mean={val_auc_mean:.4f})")
 
         if epoch % 10 == 0:
             torch.save({

@@ -71,13 +71,13 @@ def main():
         with open(out, "w") as f:
             json.dump(rows, f, indent=2)
         print(f"\n[ablation] comparison written → {out}")
-        print("\n  mode        test_auprc  test_auc   val_auprc   val_auc    num_params")
+        print("\n  mode        test_auc   test_auprc  val_auc    val_auprc   num_params")
         for r in rows:
             print(f"  {r['ablation']:10s}  "
+                  f"{r.get('test_mean_auc',   float('nan')):>8.4f}   "
                   f"{r.get('test_mean_auprc', float('nan')):>10.4f}  "
-                  f"{r.get('test_mean_auc',   float('nan')):>8.4f}  "
+                  f"{r.get('best_val_auc_mean',   float('nan')):>8.4f}   "
                   f"{r.get('best_val_auprc_mean', float('nan')):>10.4f}  "
-                  f"{r.get('best_val_auc_mean',   float('nan')):>8.4f}  "
                   f"{r['num_params']:>10,}")
 
 
