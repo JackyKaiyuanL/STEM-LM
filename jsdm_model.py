@@ -593,7 +593,8 @@ class JSDMAttention(nn.Module):
             nn.init.constant_(self.combine_gate[-1].bias, float(config.gate_init_bias))
 
         self.row_norm  = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.cross_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        if self.use_st or self.use_env:
+            self.cross_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(
         self, hidden_states, st_source_embeddings, env_embeddings,
@@ -608,11 +609,12 @@ class JSDMAttention(nn.Module):
         h = hidden_states + row_output[0].transpose(-2, -3)
 
         # 2 & 3. Shared pre-norm → ST and/or Env cross-attention → (gated) residual
-        h_normed = self.cross_norm(h)
-
         st_attn  = None
         env_attn = None
         gate_logit = None
+
+        if self.use_st or self.use_env:
+            h_normed = self.cross_norm(h)
 
         if self.use_st and self.use_env:
             st_out  = self.st_col_attention(
