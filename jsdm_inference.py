@@ -145,7 +145,7 @@ def add_common_args(p):
     p.add_argument("--euclidean_coords", action="store_true")
     p.add_argument("--splits_path",      type=str,   default=None,
                    help="Path to splits.json from training; bypasses fold recomputation.")
-    p.add_argument("--fold", choices=["random", "h3", "grid"], default="random",
+    p.add_argument("--fold", choices=["random", "h3", "grid"], default="h3",
                    help="Train/val/test split strategy. Prefer passing --splits_path to "
                         "exactly match training; otherwise use the same --fold/--resolution "
                         "as training.")

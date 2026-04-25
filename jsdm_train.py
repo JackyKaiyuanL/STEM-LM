@@ -231,13 +231,13 @@ def main():
                         help="Explicit list of env column names. If not set, columns with 'env_' "
                              "prefix are used. Useful for datasets with non-prefixed env columns "
                              "(e.g. annualtemp, annualprec).")
-    parser.add_argument("--fold", choices=["random", "h3", "grid"], default="random",
-                        help="Train/val/test split strategy. 'random': shuffled rows (default). "
-                             "'h3': spatial blocks via H3 hexagonal grid (real lat/lon only). "
-                             "'grid': spatial blocks via regular 2D grid (euclidean_coords only).")
+    parser.add_argument("--fold", choices=["random", "h3", "grid"], default="h3",
+                        help="Train/val/test split strategy. 'h3' (default): spatial blocks via "
+                             "H3 hexagonal grid (real lat/lon only). 'grid': spatial blocks via "
+                             "regular 2D grid (euclidean_coords only). 'random': shuffled rows.")
     parser.add_argument("--resolution", type=int, default=None,
                         help="Block resolution for spatial splits. For --fold h3, this is the H3 "
-                             "resolution in [0, 15] (default 3 ≈ 68 km edge). For --fold grid, "
+                             "resolution in [0, 15] (default 2 ≈ 183 km edge). For --fold grid, "
                              "this is the grid side length (default 20 → 20×20 cells). Not valid "
                              "with --fold random.")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
@@ -299,7 +299,7 @@ def main():
                 raise ValueError("--resolution is not valid with --fold random.")
         elif args.fold == "h3":
             if args.resolution is None:
-                args.resolution = 3
+                args.resolution = 2
             if not (0 <= int(args.resolution) <= 15):
                 raise ValueError("--resolution for --fold h3 must be an integer in [0, 15].")
         else:  # grid
