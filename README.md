@@ -32,6 +32,7 @@ Species values must be 0/1.
 - `--num_env_groups` (`3`) — learned environmental query groups in the environmental cross-attention.
 - `--temporal_fire_init_periods 365 180 ...` — list of init periods (days) for learnable sin/cos channels in the temporal FIRE bias. The list length is the number of periodic channels K; each ω_k is learnable so seasonality is *discovered*, not hard-coded. Omit (or pass empty) to disable periodicity and fall back to legacy monotone FIRE. Recommended values: `365 180 730 1825` (K=4: annual / semi / biennial / 5-yr) or `365 180 120 91 730 1825` (K=6: adds sub-annual for multivoltine taxa). Year-to-year phenological anomalies are handled separately by the Env head via env covariates.
 - `--fire_no_zero_init_periodic` — flag (off by default). When zero-init is on (the default), the periodic (sin/cos) weights in FIRE's MLP start at zero so the module is arithmetically identical to legacy FIRE at step 0 — the optimizer has to *earn* periodic contribution. Disable only for legacy reproducibility.
+- `--per_species_scales` — flag (off by default). Adds per-species learnable spatial and temporal scales applied to the FIRE distance input: `d_eff = d * exp(species_log_scale_s)`. Each species learns its own decay range in space and time; the relative magnitude of the two scales is the per-species space-vs-time weighting. Init at 0 → multiplier 1 → identical to legacy at step 0. Adds `2*S` parameters; registered in the no-decay group so AdamW does not drag the scalars to zero faster than the per-species gradient signal can move them.
 - `--gate_hidden_size` (default `hidden_size // 8`) — bottleneck width of the ST/Env gate MLP. Old checkpoints use the default; widen to `2 * hidden_size` (or more) for sharper per-species routing.
 - `--gate_init_bias` (default `0.0`) — initial bias of the gate MLP's final Linear. Negative values start training with the gate favoring Env (`-2.0` → `sigmoid≈0.12`), so ST has to *earn* its weight. Prevents a useless ST head from bleeding into outputs at convergence.
 - `--gate_l1` (default `0.0`) — L1 weight on `ReLU(gate_logit).mean()` added to the loss. Penalizes the positive side only; species where ST genuinely helps still push their gate up, while noise-species gates stay near the Env-biased init. Recommended: `1e-4`.
@@ -61,7 +62,7 @@ Species values must be 0/1.
           --output_dir ./ablation_out/$mode \
           --splits_path ./ablation_out/full/splits.json \
           --num_epochs 30 --hidden_size 256 --num_hidden_layers 3 \
-          --temporal_fire_freqs 4 --gate_hidden_size 512 \
+          --temporal_fire_init_periods 365 180 730 1825 --gate_hidden_size 512 \
           --gate_init_bias -2.0 --gate_l1 1e-4
   done
   ```
@@ -72,7 +73,7 @@ Species values must be 0/1.
       --output_dir ./ablation_out \
       --modes full no_st no_env no_st_env \
       --num_epochs 30 --hidden_size 256 --num_hidden_layers 3 \
-      --temporal_fire_freqs 4 --gate_hidden_size 512 \
+      --temporal_fire_init_periods 365 180 730 1825 --gate_hidden_size 512 \
       --gate_init_bias -2.0 --gate_l1 1e-4
   ```
   Writes `ablation_out/<mode>/{best_model.pt, config.json, ...}` per mode and `ablation_out/ablation_comparison.json` with test AUC, val AUC, and param count per mode.

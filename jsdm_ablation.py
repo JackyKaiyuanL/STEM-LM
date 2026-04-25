@@ -1,31 +1,3 @@
-"""
-Ablation master script for STEM-LM.
-
-Shells out to `jsdm_train.py` once per ablation mode (full / no_st / no_env /
-no_st_env), forwarding every other CLI arg unchanged. The first run creates a
-shared splits.json; subsequent runs load it via --splits_path so all modes see
-identical train/val/test partitions — a prerequisite for clean A/B comparison.
-
-After the loop, it aggregates each run's `ablation_summary.json` (written by
-jsdm_train.py when --ablation is set) into a single comparison table.
-
-Usage
------
-    # Run all four modes with the defaults
-    python jsdm_ablation.py data.csv --output_dir ./ablation_out
-
-    # Subset
-    python jsdm_ablation.py data.csv --output_dir ./ablation_out \
-        --modes full no_st
-
-    # Pass any jsdm_train.py flag (forwarded to every mode)
-    python jsdm_ablation.py data.csv --output_dir ./ablation_out \
-        --num_epochs 30 --hidden_size 256 --temporal_fire_freqs 4 \
-        --gate_init_bias -2.0 --gate_l1 1e-4
-
-The model, training loop, and all ablation branches live in `jsdm_model.py` /
-`jsdm_train.py`. This file intentionally contains no model or training code.
-"""
 import argparse
 import json
 import os
@@ -53,11 +25,11 @@ def main():
                     help="Optional: explicit splits.json to use for all modes. "
                          "If omitted, the first mode's splits.json is reused by "
                          "the rest for a self-consistent comparison.")
-    # Everything else is forwarded to jsdm_train.py verbatim.
+    
     args, passthrough = ap.parse_known_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    shared_splits = args.shared_splits_from  # None until first run writes one
+    shared_splits = args.shared_splits_from
 
     for i, mode in enumerate(args.modes):
         mode_dir = os.path.join(args.output_dir, mode)
@@ -79,8 +51,8 @@ def main():
         r = subprocess.run(cmd)
         if r.returncode != 0:
             raise SystemExit(f"[ablation] mode {mode!r} failed (exit {r.returncode})")
+            
 
-        # After the first completed run, lock in its splits for the rest.
         if shared_splits is None:
             splits_path = os.path.join(mode_dir, "splits.json")
             if os.path.exists(splits_path):
@@ -99,7 +71,6 @@ def main():
         with open(out, "w") as f:
             json.dump(rows, f, indent=2)
         print(f"\n[ablation] comparison written → {out}")
-        # Compact stdout summary
         print("\n  mode        test_auprc  test_auc   val_auprc   val_auc    num_params")
         for r in rows:
             print(f"  {r['ablation']:10s}  "

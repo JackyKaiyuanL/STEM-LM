@@ -1,7 +1,3 @@
-"""
-Training script for STEM-LM.
-"""
-
 import argparse
 import csv
 import json
@@ -26,29 +22,17 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_rate(s):
-    """argparse type: float in [0, 1] or 'rand[:lo,hi]' string (validated downstream)."""
     if isinstance(s, str) and (s == "rand" or s.startswith("rand:")):
         return s
     return float(s)
 
 
 def _parse_blind_pct(s):
-    """argparse type: float percentile in [0, 100] or the literal 'auto'."""
     if isinstance(s, str) and s.lower() == "auto":
         return "auto"
     return float(s)
 
-
-# =============================================================================
-# Shared training utilities (imported by jsdm_ablation.py to avoid drift)
-# =============================================================================
-
 def move_dist_info_to_device(dist_info, device):
-    """Return a shallow copy of dist_info with coord tensors on `device`.
-
-    Call once before the training loop so forward passes don't retransfer
-    the site coordinate vectors every batch.
-    """
     out = dict(dist_info)
     for k in ("site_lats", "site_lons", "site_times"):
         out[k] = out[k].to(device)
@@ -56,7 +40,7 @@ def move_dist_info_to_device(dist_info, device):
 
 
 def compute_class_weights(species_data, train_indices, beta=0.999):
-    """Effective-number-of-samples class weighting (Cui et al., 2019)."""
+    # Effective-number-of-samples class weighting
     if not (0.0 < beta < 1.0):
         raise ValueError(f"class_weighting_beta must be in (0, 1), got {beta}")
     n_s = species_data[train_indices].sum(axis=0).clip(min=1)
@@ -79,16 +63,12 @@ def _forward(model, batch, dist_info, loss_weight=None):
         site_lats=dist_info["site_lats"],
         site_lons=dist_info["site_lons"],
         site_times=dist_info["site_times"],
-        spatial_scale_km=dist_info["spatial_scale_km"],
-        temporal_scale_days=dist_info["temporal_scale_days"],
         euclidean=dist_info.get("euclidean", False),
     )
 
 
 def _gate_l1_penalty(output) -> Optional[torch.Tensor]:
-    """ReLU L1 on gate logits (positive side only). Encourages gate to sit at
-    its Env-biased init unless ST genuinely helps. No-op in ablated modes where
-    `gate_logits` is None or contains only Nones."""
+
     gl = getattr(output, "gate_logits", None)
     if not gl:
         return None
@@ -211,14 +191,9 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--p", type=_parse_rate, default=None,
-                        help="Per-row mask rate applied to both presences and absences. "
-                             "Float in [0,1] or 'rand[:lo,hi]' (Uniform[lo, hi] per row; "
-                             "'rand' = 'rand:0.0,1.0'). Overrides --p_pres/--p_abs if set.")
-    parser.add_argument("--p_pres", type=_parse_rate, default=0.15,
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--p_abs",  type=_parse_rate, default=0.15,
-                        help=argparse.SUPPRESS)
+    parser.add_argument("--p", type=_parse_rate, default=0.15,
+                        help="Per-row mask rate. Float in [0,1] or 'rand[:lo,hi]' "
+                             "(Uniform[lo,hi] per row; bare 'rand' = 'rand:0.0,1.0').")
     parser.add_argument("--train_frac", type=float, default=0.8)
     parser.add_argument("--test_frac", type=float, default=0.1,
                         help="Fraction of data held out as test set for final AUC. "
@@ -298,12 +273,13 @@ def main():
                              "By default the periodic (sin/cos) weights start at zero so "
                              "the module is arithmetically equivalent to legacy FIRE at step 0; "
                              "the optimizer must earn the periodic contribution.")
-    parser.add_argument("--per_species_fire_shape", action="store_true",
-                        help="Enable per-species FIRE shape head (zero-init). Lets each "
-                             "species learn a distinct distance-bias shape, not just "
-                             "amplitude. Safe: step-0 output unchanged. Recommended for "
-                             "datasets with heterogeneous phenology (birds: residents + "
-                             "migrants + multivoltines); optional for butterflies.")
+    parser.add_argument("--per_species_scales", action="store_true",
+                        help="Per-species spatial/temporal scales applied to the distance "
+                             "input of FIRE: d_eff = d * exp(species_log_scale_s). Each "
+                             "species learns its own decay range in space and time. "
+                             "Init at 0 → multiplier 1, identical to legacy at step 0. "
+                             "Adds 2*S parameters; registered no-decay so AdamW does not "
+                             "drag the scalars to zero faster than per-species gradient.")
     parser.add_argument("--gate_hidden_size", type=int, default=None,
                         help="Bottleneck width of the ST/Env combine_gate MLP. "
                              "Default: hidden_size // 8.")
@@ -317,12 +293,6 @@ def main():
                              "ST genuinely helps. 0 disables.")
     args = parser.parse_args()
 
-    # --p is a convenience that sets both p_pres and p_abs to the same rate.
-    if args.p is not None:
-        args.p_pres = args.p
-        args.p_abs = args.p
-
-    # Split arg validation/defaults (ignored when loading saved splits).
     if args.splits_path is None:
         if args.fold == "random":
             if args.resolution is not None:
@@ -343,20 +313,16 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Optional: preload saved splits (CSV row count will be sanity-checked later)
     saved_splits = None
     if args.splits_path is not None:
         logger.info(f"Loading splits from {args.splits_path}")
-        # Row-count check deferred to after dataset load via assert.
         saved_splits = load_splits(args.splits_path)
 
-    # Data
     train_loader, val_loader, test_loader, dataset, dist_info, splits = create_dataloaders(
         csv_path=args.csv_path,
         batch_size=args.batch_size,
         num_source_sites=args.num_source_sites,
-        p_pres=args.p_pres,
-        p_abs=args.p_abs,
+        p=args.p,
         blind_percentile=args.blind_percentile,
         train_frac=args.train_frac,
         test_frac=args.test_frac,
@@ -372,7 +338,6 @@ def main():
         saved_splits=saved_splits,
     )
 
-    # Persist splits for downstream scripts (inference, ablation comparisons)
     if not args.no_save_splits:
         splits_out = os.path.join(args.output_dir, "splits.json")
         save_splits(
@@ -389,7 +354,6 @@ def main():
         )
         logger.info(f"Splits saved to {splits_out}")
 
-    # Per-species loss weighting (effective number)
     loss_weight = None
     if not args.no_class_weighting:
         beta = args.class_weighting
@@ -401,12 +365,10 @@ def main():
             f"[{loss_weight.min().item():.3f}, {loss_weight.max().item():.3f}]"
         )
 
-    # use_temporal mirrors what the dataset actually did with time
     use_temporal = dist_info["max_temporal_dist"] > 0
     if not use_temporal:
         logger.info("Temporal FIRE bias disabled (no temporal variation in data)")
 
-    # Config
     config = JSDMConfig(
         num_species=dataset.num_species,
         num_source_sites=args.num_source_sites,
@@ -426,18 +388,16 @@ def main():
             if args.temporal_fire_init_periods else None
         ),
         fire_zero_init_periodic=(not args.fire_no_zero_init_periodic),
-        per_species_fire_shape=args.per_species_fire_shape,
+        per_species_scales=args.per_species_scales,
         gate_hidden_size=args.gate_hidden_size,
         gate_init_bias=args.gate_init_bias,
         ablation=args.ablation,
-        p_pres=args.p_pres,
-        p_abs=args.p_abs,
+        p=args.p,
     )
 
     with open(os.path.join(args.output_dir, "config.json"), "w") as f:
         json.dump(vars(config), f, indent=2)
 
-    # Model
     model = JSDMForMaskedSpeciesPrediction(config).to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Model: {num_params:,} parameters, {config.num_species} species")
@@ -445,8 +405,8 @@ def main():
     if args.gradient_checkpointing:
         model.model.encoder.gradient_checkpointing = True
 
-    # Exclude norms, biases, and gate MLP from weight decay.
-    no_decay_keys = ("norm", "bias", "combine_gate")
+    no_decay_keys = ("norm", "bias", "combine_gate",
+                     "species_log_spatial_scale", "species_log_temporal_scale")
     decay_params, nodecay_params = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -464,8 +424,6 @@ def main():
 
     dist_info = move_dist_info_to_device(dist_info, device)
 
-    # Fixed-p val loaders: deterministic masks so best-checkpoint selection
-    # isn't drowned in mask-rate sampling noise.
     fixed_val_loaders = build_val_loaders_fixed_p(
         dataset, splits["val"], dist_info, args.val_p_list,
         batch_size=args.batch_size, num_workers=args.num_workers, base_seed=args.seed,
@@ -484,8 +442,6 @@ def main():
              "lr", "elapsed_s"]
         )
 
-    # best_model.pt is selected on AUPRC — more sensitive than AUROC for
-    # JSDM's rare-species-heavy label distribution.
     best_val_auprc_mean = -float("inf")
     best_val_auc_mean = -float("inf")
     for epoch in range(1, args.num_epochs + 1):
@@ -543,7 +499,6 @@ def main():
                 "val_auprc_mean": val_auprc_mean,
             }, os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"))
 
-    # Per-species AUC on best model — fixed-p eval on test (or val fallback).
     logger.info("Evaluating best model on fixed-p test set...")
     model.load_state_dict(torch.load(os.path.join(args.output_dir, "best_model.pt"), map_location=device))
     eval_split   = "test" if len(splits["test"]) > 0 else "val (no test set)"
@@ -585,8 +540,6 @@ def main():
         os.path.join(args.output_dir, "per_species_auc_jsdm.csv"), index=False)
     logger.info(f"Per-species AUC/AUPRC saved to {args.output_dir}/per_species_auc_jsdm.csv")
 
-    # Standard summary consumed by the ablation master and any downstream tools.
-    # Primary metric is AUPRC; AUC retained for reference.
     summary = {
         "ablation":           config.ablation,
         "num_params":         num_params,
@@ -603,8 +556,7 @@ def main():
     }
     with open(os.path.join(args.output_dir, "ablation_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
-
-    # Extract interaction matrix
+        
     logger.info("Extracting species interaction matrix...")
     model.eval()
     interactions = []

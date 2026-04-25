@@ -1,23 +1,3 @@
-"""
-Data loading and preprocessing for STEM-LM.
-
-CSV layout: one row per (site, time) observation with columns:
-    time (optional), latitude, longitude, env_*, species_*
-
-Dataset emits per-sample dicts consumed by JSDMDataCollator:
-    target_species: (S,)     — true 0/1 at target site (becomes labels)
-    source_species: (S, N)   — 0/1 at N nearest source sites
-    source_env:     (N, E)   — env covariates at source sites
-    target_env:     (E,)     — env covariates at target site
-    target_idx:     ()       — index of target row in the full CSV
-    source_idx:     (N,)     — indices of sampled source rows
-
-Collator applies masked-species augmentation:
-    - mask target species with per-class rates p_pres and p_abs → state token 2
-      (each can be a fixed float or "rand" for Uniform[0, 1] per row)
-    - for masked species, nearby source entries are set to 2 (proximity blind)
-"""
-
 import json
 import os
 
@@ -25,7 +5,6 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from scipy.spatial.distance import cdist
 from typing import Optional, List, Dict, Any, Tuple
 
 
@@ -34,7 +13,7 @@ EARTH_RADIUS_KM = 6371.0
 
 def haversine_pairs_np(lat_a: np.ndarray, lon_a: np.ndarray,
                        lat_b: np.ndarray, lon_b: np.ndarray) -> np.ndarray:
-    """Broadcasted haversine in km. `a`, `b` are same-shape arrays (deg)."""
+                       
     lat_a = np.radians(np.asarray(lat_a, dtype=np.float64))
     lon_a = np.radians(np.asarray(lon_a, dtype=np.float64))
     lat_b = np.radians(np.asarray(lat_b, dtype=np.float64))
@@ -47,7 +26,7 @@ def haversine_pairs_np(lat_a: np.ndarray, lon_a: np.ndarray,
 
 def haversine_pairs_torch(lat_a: torch.Tensor, lon_a: torch.Tensor,
                           lat_b: torch.Tensor, lon_b: torch.Tensor) -> torch.Tensor:
-    """Torch analogue. Accepts degrees. Inputs must broadcast."""
+                          
     lat_a = torch.deg2rad(lat_a)
     lon_a = torch.deg2rad(lon_a)
     lat_b = torch.deg2rad(lat_b)
@@ -61,7 +40,6 @@ def haversine_pairs_torch(lat_a: torch.Tensor, lon_a: torch.Tensor,
 def _site_distance_rows_np(lats: np.ndarray, lons: np.ndarray,
                            times: np.ndarray, idx,
                            euclidean: bool) -> Tuple[np.ndarray, np.ndarray]:
-    """Distances from a single target row `idx` to every site. Returns (spatial_km, temporal_days)."""
     if euclidean:
         dx = lats - lats[idx]; dy = lons - lons[idx]
         spatial = np.sqrt(dx * dx + dy * dy).astype(np.float32)
@@ -73,7 +51,6 @@ def _site_distance_rows_np(lats: np.ndarray, lons: np.ndarray,
 
 def _tiled_stats(lats: np.ndarray, lons: np.ndarray, times: np.ndarray,
                  euclidean: bool, device: str = "cpu", tile: int = 4096):
-    """Max spatial and temporal pairwise distance."""
     N = len(lats)
     lats_t = torch.as_tensor(lats, dtype=torch.float64, device=device)
     lons_t = torch.as_tensor(lons, dtype=torch.float64, device=device)
@@ -99,7 +76,7 @@ def _tiled_spatial_quantile(lats: np.ndarray, lons: np.ndarray,
                             euclidean: bool,
                             device: str = "cpu", tile: int = 4096,
                             n_bins: int = 1_000_000) -> float:
-    """Quantile of normalized spatial pairwise distance, off-diagonal only."""
+                            
     N = len(lats)
     lats_t = torch.as_tensor(lats, dtype=torch.float64, device=device)
     lons_t = torch.as_tensor(lons, dtype=torch.float64, device=device)
@@ -114,7 +91,6 @@ def _tiled_spatial_quantile(lats: np.ndarray, lons: np.ndarray,
             sp = haversine_pairs_torch(la, lo_a, lb, lo_b)
         return sp / sp_scale
 
-    # Pass A: min/max, excluding zeros so the diagonal doesn't pin the low end.
     cmin = torch.tensor(float("inf"), dtype=torch.float64, device=device)
     cmax = torch.tensor(0.0, dtype=torch.float64, device=device)
     for r0 in range(0, N, tile):
@@ -126,8 +102,8 @@ def _tiled_spatial_quantile(lats: np.ndarray, lons: np.ndarray,
     cmin_v = float(cmin.item()); cmax_v = float(cmax.item())
     if not np.isfinite(cmin_v) or cmax_v <= 0:
         return 0.0
+        
 
-    # Pass B: histogram → CDF → percentile.
     hist = torch.zeros(n_bins, dtype=torch.int64, device=device)
     total = 0
     span = cmax_v - cmin_v
@@ -187,7 +163,6 @@ class JSDMDataset(Dataset):
                 + ". Please impute or drop missing values before training."
             )
 
-        # Time is optional: disabled explicitly via no_time=True, or absent from CSV
         has_time = (not no_time) and (time_col in df.columns)
         if not has_time:
             reason = "--no_time" if no_time else f"column '{time_col}' not found"
@@ -251,8 +226,7 @@ class JSDMDataset(Dataset):
         )
         self._max_spatial = max_sp
         self._max_temporal = max_tp if has_time else 0.0
-        # None = draw sources from all rows; set to train indices under
-        # h3/grid/saved-splits to prevent val/test leakage through the source pool.
+        
         self.source_pool = None
         print("Done.")
 
@@ -285,9 +259,9 @@ class JSDMDataset(Dataset):
             probs = inv_dist / inv_dist.sum()
             source_idx = np.random.choice(N_total, size=N, replace=(N > N_total - 1), p=probs)
 
-        source_species = np.ascontiguousarray(self.species_data[source_idx].T)  # (S, N)
-        source_env = self.env_data[source_idx]                                   # (N, E)
-        target_env = self.env_data[idx]                                          # (E,)
+        source_species = np.ascontiguousarray(self.species_data[source_idx].T)
+        source_env = self.env_data[source_idx]
+        target_env = self.env_data[idx]
 
         return {
             "target_species": torch.from_numpy(target_species),
@@ -315,20 +289,13 @@ def _spatial_blind_dists(site_lats, site_lons,
 
 
 class JSDMDataCollator:
-    def __init__(self, p_pres=0.15, p_abs=0.15,
+    def __init__(self, p=0.15,
                  site_lats=None, site_lons=None, site_times=None,
                  spatial_scale_km=1.0, temporal_scale_days=1.0,
                  euclidean=False,
                  blind_threshold=None, mask_token_prob=1.0, seed=None):
-        # Per-class mask rates. Each is either a float in [0, 1] or a
-        # 'rand[:lo,hi]' string → sample Uniform[lo, hi] per row.
-        # 'rand' alone is shorthand for 'rand:0.0,1.0'. Examples:
-        #   p_pres=0.15,           p_abs=0.15           → fixed 15% random mask
-        #   p_pres='rand',         p_abs='rand'         → independent per-class rates per row
-        #   p_pres='rand:0.3,1.0', p_abs=1.0            → presence-only, varying completeness in [0.3, 1]
-        #   p_pres=1.0,            p_abs=1.0            → always 100% mask
-        self.p_pres = self._canonicalize(p_pres)
-        self.p_abs  = self._canonicalize(p_abs)
+
+        self.p = self._canonicalize(p)
         def _to_np(x):
             if x is None:
                 return None
@@ -341,24 +308,14 @@ class JSDMDataCollator:
         self.spatial_scale_km = float(spatial_scale_km)
         self.temporal_scale_days = float(temporal_scale_days)
         self.euclidean = bool(euclidean)
-        self.blind_threshold = blind_threshold  # scalar float or None
+        self.blind_threshold = blind_threshold
         self._has_coords = self.site_lats is not None and self.site_lons is not None and self.site_times is not None
-        # Fraction of masked positions that get the [MASK] token (id=2); the rest
-        # keep their original value (BERT's 10% keep-original trick). Default 1.0:
-        # BERT's rationale (pretrain/finetune gap, bidirectional conditioning at
-        # non-masked positions) doesn't apply here — our train task = inference
-        # task, [MASK] marks "predict here" in both, and keep-original creates an
-        # eval leak at any mask rate < 1.
         self.mask_token_prob = mask_token_prob
-        # Private generator isolates mask sampling from model init / dropout /
-        # DataLoader shuffle, so two runs with the same seed produce byte-identical
-        # mask patterns regardless of model architecture.
         self.generator = (torch.Generator().manual_seed(int(seed))
                           if seed is not None else None)
 
     @staticmethod
     def _canonicalize(r):
-        """Return a canonical form: float in [0,1] or a 'rand:lo,hi' string."""
         if isinstance(r, str):
             if r == "rand":
                 return "rand:0.0,1.0"
@@ -382,7 +339,6 @@ class JSDMDataCollator:
 
     def _sample_row_rates(self, B, r):
         if isinstance(r, str):
-            # r is 'rand:lo,hi' (canonical form)
             lo, hi = [float(x) for x in r[len("rand:"):].split(",")]
             return torch.rand(B, generator=self.generator) * (hi - lo) + lo
         return torch.full((B,), float(r))
@@ -393,27 +349,21 @@ class JSDMDataCollator:
             for key in examples[0].keys()
         }
 
-        target_species = batch["target_species"]  # (B, S)
-        source_species = batch["source_species"]  # (B, S, N) float {0, 1}
+        target_species = batch["target_species"]
+        source_species = batch["source_species"]
         B, S = target_species.shape
         N = source_species.shape[-1]
 
         labels = target_species.clone()
 
-        # Per-row mask rates, then per-position probability picked by class.
-        p_pres_row = self._sample_row_rates(B, self.p_pres)          # (B,)
-        p_abs_row  = self._sample_row_rates(B, self.p_abs)           # (B,)
-        is_pres = target_species.bool()                               # (B, S)
-        probability_matrix = torch.where(
-            is_pres, p_pres_row[:, None], p_abs_row[:, None]
-        ).expand(B, S)
+        p_row = self._sample_row_rates(B, self.p)
+        probability_matrix = p_row[:, None].expand(B, S)
         masked_indices = torch.bernoulli(probability_matrix, generator=self.generator).bool()
         for b in range(B):
             if not masked_indices[b].any():
                 masked_indices[b, torch.randint(S, (1,), generator=self.generator)] = True
-
-        # Target token ids: 0=absent, 1=present, 2=mask
-        target_ids = target_species.long()  # (B, S)
+        
+        target_ids = target_species.long()
         if self.mask_token_prob >= 1.0:
             indices_replaced = masked_indices
         else:
@@ -422,32 +372,29 @@ class JSDMDataCollator:
                                 generator=self.generator).bool()
                 & masked_indices
             )
-        target_ids[indices_replaced] = 2  # mask_token_prob of masked → [MASK]; rest keep original
+        target_ids[indices_replaced] = 2
 
-        # Source ids: convert float {0, 1} to long {0, 1}, then blind nearby sites to 2
-        source_ids = source_species.long()  # (B, S, N)
+        source_ids = source_species.long()
         if self._has_coords and self.blind_threshold is not None:
-            source_idx = batch["source_idx"]   # (B, N)
-            target_idx = batch["target_idx"]   # (B,)
-            src_idx_np = source_idx.numpy()    # (B, N)
-            tgt_idx_np = target_idx.numpy()    # (B,)
+            source_idx = batch["source_idx"]
+            target_idx = batch["target_idx"]
+            src_idx_np = source_idx.numpy()
+            tgt_idx_np = target_idx.numpy()
             blind_dists = _spatial_blind_dists(
                 self.site_lats, self.site_lons,
                 tgt_idx_np, src_idx_np,
                 self.spatial_scale_km, euclidean=self.euclidean,
             )
-            is_blind = blind_dists <= self.blind_threshold  # (B, N)
-            # blind_mask[b, s, n] = True iff species s is masked AND source n is nearby
-            blind_mask = masked_indices[:, :, None] & is_blind[:, None, :]  # (B, S, N)
+            is_blind = blind_dists <= self.blind_threshold
+            blind_mask = masked_indices[:, :, None] & is_blind[:, None, :]
             source_ids[blind_mask] = 2
         else:
-            # No proximity info: blind all source entries for masked species
             source_ids[masked_indices[:, :, None].expand_as(source_ids)] = 2
 
         labels[~masked_indices] = -100
 
-        batch["input_ids"] = target_ids.unsqueeze(-1)   # (B, S, 1) long
-        batch["source_ids"] = source_ids                 # (B, S, N) long
+        batch["input_ids"] = target_ids.unsqueeze(-1)
+        batch["source_ids"] = source_ids
         batch["labels"] = labels.unsqueeze(-1)
         batch["env_data"] = batch.pop("source_env")
         batch["target_site_idx"] = batch.pop("target_idx").unsqueeze(-1)
@@ -459,13 +406,11 @@ class JSDMDataCollator:
 
 
 class FixedPValCollator(JSDMDataCollator):
-    """Fixed-p masking with batch-deterministic seeding (masks repeat across epochs)."""
-
     def __init__(self, p,
                  site_lats=None, site_lons=None, site_times=None,
                  spatial_scale_km=1.0, temporal_scale_days=1.0, euclidean=False,
                  blind_threshold=None, base_seed=0):
-        super().__init__(p_pres=p, p_abs=p,
+        super().__init__(p=p,
                          site_lats=site_lats, site_lons=site_lons, site_times=site_times,
                          spatial_scale_km=spatial_scale_km,
                          temporal_scale_days=temporal_scale_days,
@@ -522,12 +467,6 @@ class FixedPValCollator(JSDMDataCollator):
 
 def build_val_loaders_fixed_p(dataset, val_indices, dist_info, p_values,
                                batch_size, num_workers=0, base_seed=0):
-    """Return list of (p, DataLoader) using FixedPValCollator for each p.
-
-    Used for apples-to-apples val AUC logging and checkpoint selection:
-    mask-rate sampling noise is removed, so `best_model.pt` selection
-    reflects true model improvements rather than lucky-p epochs.
-    """
     from torch.utils.data import DataLoader, Subset
     subset = Subset(dataset, val_indices)
     loaders = []
@@ -556,16 +495,7 @@ def auto_blind_percentile(
     seed: int = 0,
     min_pairs_per_bin: int = 50,
 ) -> Tuple[float, dict]:
-    """Half-decay auto-selection of blind_percentile.
-
-    τ = (mean Jaccard in nearest bin + background Jaccard) / 2
-    d* = smallest distance at which mean Jaccard ≤ τ
-    blind_percentile = percentile rank of d* in the normalized pairwise
-    distance distribution.
-
-    Returns (percentile, diagnostics). Raises if the dataset is degenerate
-    (no resolvable autocorrelation signal).
-    """
+    
     rng = np.random.RandomState(seed)
     N = len(dataset)
     i = rng.randint(0, N, n_pairs)
@@ -584,7 +514,6 @@ def auto_blind_percentile(
         jacc = np.where(union > 0, inter / np.maximum(union, 1), 0.0)
     bg = float(jacc.mean())
 
-    # Log-spaced distance bins from the data's own range.
     d_min, d_max = max(1e-3, float(d_km.min())), float(d_km.max())
     edges = np.logspace(np.log10(max(d_min, 0.1)), np.log10(d_max), 20)
     edges = np.concatenate([[0.0], edges])
@@ -622,8 +551,6 @@ def auto_blind_percentile(
             f"sampled extent — set --blind_percentile manually."
         )
 
-    # Percentile of the *normalized spatial* distance (same space the collator
-    # applies the blind threshold in: sp_km / spatial_scale_km).
     d_norm = d_km / dataset.spatial_scale_km
     pct = float((d_norm <= d_star / dataset.spatial_scale_km).mean() * 100.0)
     diag = {
@@ -646,12 +573,7 @@ def compute_dist_info(
     tile: int = 4096,
     hist_bins: int = 1_000_000,
 ) -> dict:
-    """dist_info for collators and model.forward: coords, scales, blind threshold.
-
-    `blind_percentile` can be a float or the literal string "auto"; "auto"
-    picks the percentile via half-decay on the dataset's Jaccard(d) curve.
-    """
-    # Resolve "auto" before the quantile computation.
+    
     if isinstance(blind_percentile, str):
         if blind_percentile.lower() != "auto":
             raise ValueError(f"blind_percentile must be a float or 'auto'; got {blind_percentile!r}")
@@ -689,11 +611,7 @@ def compute_dist_info(
 
 
 def grid_block_split(x, y, n_cells=20, train_frac=0.8, test_frac=0.1, seed=42):
-    """
-    Split by a regular n_cells x n_cells grid on arbitrary 2D (x, y) coordinates.
-    For Euclidean/simulated datasets where H3 is meaningless.
-    Each cell assigned entirely to one split.
-    """
+
     x, y = np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
     xi = np.floor((x - x.min()) / (x.ptp() + 1e-9) * n_cells).clip(0, n_cells - 1).astype(int)
     yi = np.floor((y - y.min()) / (y.ptp() + 1e-9) * n_cells).clip(0, n_cells - 1).astype(int)
@@ -721,12 +639,7 @@ def grid_block_split(x, y, n_cells=20, train_frac=0.8, test_frac=0.1, seed=42):
 
 def save_splits(path: str, train_idx, val_idx, test_idx, num_rows: Optional[int] = None,
                 meta: Optional[dict] = None) -> None:
-    """Persist train/val/test row indices as JSON for reproducible reloading.
 
-    `num_rows` is stored as a sanity check — load_splits rejects the file if
-    the CSV it is being applied to has a different row count.
-    `meta` can carry fold method, resolution, seed, etc. for provenance.
-    """
     payload = {
         "num_rows": int(num_rows) if num_rows is not None else None,
         "meta":     meta or {},
@@ -741,7 +654,7 @@ def save_splits(path: str, train_idx, val_idx, test_idx, num_rows: Optional[int]
 
 def load_splits(path: str, expected_num_rows: Optional[int] = None
                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load train/val/test indices saved by `save_splits`."""
+    
     with open(path) as f:
         payload = json.load(f)
     saved_n = payload.get("num_rows")
@@ -759,11 +672,7 @@ def load_splits(path: str, expected_num_rows: Optional[int] = None
 
 
 def h3_block_split(lats, lons, resolution=2, train_frac=0.8, test_frac=0.1, seed=42):
-    """
-    Split observation indices into train/val/test by H3 spatial blocks.
-    Each H3 cell at the given resolution is assigned entirely to one split.
-    Returns (train_indices, val_indices, test_indices) as numpy arrays.
-    """
+    
     try:
         import h3 as h3lib
     except ImportError:
@@ -794,7 +703,7 @@ def h3_block_split(lats, lons, resolution=2, train_frac=0.8, test_frac=0.1, seed
 
 def create_dataloaders(
     csv_path, batch_size=32, num_source_sites=64,
-    p_pres=0.15, p_abs=0.15,
+    p=0.15,
     blind_percentile="auto",
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None, spatial_scale_km=None, temporal_scale_days=None,
@@ -803,17 +712,7 @@ def create_dataloaders(
     saved_splits: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     restrict_source_pool_with_saved_splits: bool = True,
 ):
-    """Build train/val/test dataloaders.
-
-    If `saved_splits=(train_idx, val_idx, test_idx)` is given, those indices
-    are used directly and fold_method is ignored. Source pool is restricted
-    to train indices by default (treat as blocked CV); set
-    `restrict_source_pool_with_saved_splits=False` to keep the full pool.
-
-    Returns:
-        train_loader, val_loader, test_loader, dataset, dist_info, splits
-    where `splits = {"train": np.ndarray, "val": np.ndarray, "test": np.ndarray}`.
-    """
+    
     dataset = JSDMDataset(
         csv_path=csv_path,
         num_source_sites=num_source_sites,
@@ -827,7 +726,7 @@ def create_dataloaders(
     print("Computing distance info...")
     dist_info = compute_dist_info(dataset, blind_percentile=blind_percentile)
 
-    # Split into train / val / test
+    
     if saved_splits is not None:
         train_indices, val_indices, test_indices = saved_splits
         train_indices = np.asarray(train_indices, dtype=np.int64)
@@ -861,7 +760,7 @@ def create_dataloaders(
         )
         source_pool_restricted = True
         split_origin = "grid"
-    else:  # random (default)
+    else:
         if resolution is not None:
             raise ValueError("--resolution is only valid with --fold {h3,grid}.")
         np.random.seed(seed)
@@ -883,8 +782,7 @@ def create_dataloaders(
     test_dataset  = torch.utils.data.Subset(dataset, test_indices) if len(test_indices) > 0 else None
 
     collator = JSDMDataCollator(
-        p_pres=p_pres,
-        p_abs=p_abs,
+        p=p,
         site_lats=dataset.lats,
         site_lons=dataset.lons,
         site_times=dataset.times,

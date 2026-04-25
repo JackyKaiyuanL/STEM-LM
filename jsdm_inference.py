@@ -31,24 +31,11 @@ from jsdm_data import (
 def load_model(model_dir, device):
     with open(os.path.join(model_dir, "config.json")) as f:
         config_dict = json.load(f)
-
-    # Ablation-trained checkpoints carry an 'ablation' field and need the
-    # matching AblationForMaskedSpeciesPrediction (different module tree).
-    ablation = config_dict.get("ablation", None)
-    if ablation is not None and ablation != "full":
-        from jsdm_ablation import AblationConfig, AblationForMaskedSpeciesPrediction
-        import inspect
-        cfg_params = set(inspect.signature(AblationConfig).parameters)
-        cfg_d = {k: v for k, v in config_dict.items() if k in cfg_params}
-        config = AblationConfig(**cfg_d)
-        model  = AblationForMaskedSpeciesPrediction(config)
-    else:
-        import inspect
-        cfg_params = set(inspect.signature(JSDMConfig).parameters)
-        cfg_d = {k: v for k, v in config_dict.items() if k in cfg_params}
-        config = JSDMConfig(**cfg_d)
-        model  = JSDMForMaskedSpeciesPrediction(config)
-
+    import inspect
+    cfg_params = set(inspect.signature(JSDMConfig).parameters)
+    cfg_d = {k: v for k, v in config_dict.items() if k in cfg_params}
+    config = JSDMConfig(**cfg_d)
+    model  = JSDMForMaskedSpeciesPrediction(config)
     sd = torch.load(os.path.join(model_dir, "best_model.pt"), map_location=device)
     if isinstance(sd, dict) and "model_state_dict" in sd:
         sd = sd["model_state_dict"]
@@ -70,8 +57,6 @@ def run_forward(model, batch, dist_info, device, output_attentions=False):
         site_lats=dist_info["site_lats"],
         site_lons=dist_info["site_lons"],
         site_times=dist_info["site_times"],
-        spatial_scale_km=dist_info["spatial_scale_km"],
-        temporal_scale_days=dist_info["temporal_scale_days"],
         euclidean=dist_info.get("euclidean", False),
         output_attentions=output_attentions,
     )
@@ -341,7 +326,7 @@ def main():
 
     elif args.command == "interactions":
         collator = JSDMDataCollator(
-            p_pres=config.p_pres, p_abs=config.p_abs,
+            p=getattr(config, "p", 0.15),
             site_lats=dataset.lats, site_lons=dataset.lons, site_times=dataset.times,
             spatial_scale_km=dataset.spatial_scale_km,
             temporal_scale_days=dataset.temporal_scale_days,
