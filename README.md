@@ -47,6 +47,25 @@ Species values must be 0/1.
 - `--class_weighting` (`0.999`) — up-weight rare species (effective-number).
 - `--gradient_checkpointing` — trade compute for memory.
 - `--val_p_list` (default `0.25 0.5 0.75 1.0`) — fixed mask rates evaluated each epoch with deterministic per-batch seeding (`FixedPValCollator`). Per-p val AUC and AUPRC are logged to `training_log.csv` as `val_auc_p... / val_auprc_p...`; their mean AUC (`val_auc_mean`) drives `best_model.pt` selection. AUPRC is reported but not used for selection.
+- `--mixed_precision {none,bf16,fp16}` (default `none`) — autocast region around forward/backward. `bf16` is the recommended setting on A40/L40/A100/H100: ~50% activation-memory savings, no loss-scaling needed. `fp16` runs `GradScaler` automatically (older GPUs only). State dict on disk stays fp32.
+- `--grad_accum_steps` (default `1`) — accumulate gradients across this many micro-batches before each `optimizer.step()`. Effective batch = `batch_size × grad_accum_steps × world_size`. Use to keep a target effective batch when shrinking `--batch_size` for VRAM.
+- **Distributed (multi-GPU per run):** launch with `torchrun` and the same script runs unchanged. `--batch_size` is **per-GPU** under DDP. Auto-detected from `LOCAL_RANK` / `WORLD_SIZE` env vars; without `torchrun` everything is a no-op single-process path. Every epoch rank 0 writes `latest_checkpoint.pt`; resubmitting with the same `--output_dir` resumes from the last completed epoch (preemption-safe; pair with `#SBATCH --requeue`).
+  ```bash
+  torchrun --nproc_per_node=4 jsdm_train.py data.csv \
+      --output_dir ./out --mixed_precision bf16 --gradient_checkpointing \
+      --batch_size 32 --num_epochs 100 [other args]
+  ```
+  For per-mode ablations on a 4-GPU node (run two 2-GPU jobs in parallel), set distinct `--master_port` values:
+  ```bash
+  CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=29500 \
+      jsdm_train.py data.csv --ablation full --output_dir ./run/full \
+      --mixed_precision bf16 [args] &
+  CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 --master_port=29501 \
+      jsdm_train.py data.csv --ablation no_st --output_dir ./run/no_st \
+      --mixed_precision bf16 [args] &
+  wait
+  ```
+  Validation predictions are `all_gather`-ed across ranks so AUC is computed on the full val set; only rank 0 logs and writes outputs. `find_unused_parameters=True` is set so ablation modes (whose disabled branches receive no gradient) work under DDP — costs a small per-step overhead vs. full-mode-only DDP. Before paper-quality runs, sanity-check that (a) `--mixed_precision none` still reproduces the original numbers within seed noise, (b) `--mixed_precision bf16` matches `none` within ~0.005 val AUC, and (c) `torchrun --nproc_per_node=2` matches single-GPU at the same effective batch within seed variance.
 
 **Ablation**
 - `jsdm_train.py --ablation {full,no_st,no_env,no_st_env}` — which cross-attention branches to keep. Param counts differ across modes. Ablated branches are not instantiated, so `no_env` / `no_st_env` have no environmental modules at all (no dead weight). Every training run writes `ablation_summary.json` alongside the checkpoint.
@@ -86,9 +105,10 @@ Species values must be 0/1.
 ## Outputs
 Training writes to `--output_dir`: `best_model.pt`, `config.json`, `species_names.json`,
 `splits.json` (unless `--no_save_splits`), `training_log.csv`, `per_species_auc_jsdm.csv`,
-`ablation_summary.json` (mode + test AUPRC/AUC by p + param count), `interaction_matrix.npy`, and
-periodic checkpoints. Inference writes predictions as a parquet with per-row lat/lon plus one
-column per species, and a `per_species_auc_{val,test}.csv`.
+`ablation_summary.json` (mode + test AUPRC/AUC by p + param count + `world_size` + `mixed_precision`),
+`interaction_matrix.npy`, `latest_checkpoint.pt` (rewritten every epoch for preemption resume), and
+periodic numbered checkpoints every 10 epochs. Inference writes predictions as a parquet with per-row
+lat/lon plus one column per species, and a `per_species_auc_{val,test}.csv`.
 
 The master `jsdm_ablation.py` additionally writes `ablation_comparison.json` in its `--output_dir`,
 aggregating each mode's `ablation_summary.json` into a single table for A/B comparison.

@@ -10,15 +10,103 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from sklearn.metrics import roc_auc_score, average_precision_score
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 from jsdm_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
 from jsdm_data import create_dataloaders, save_splits, load_splits, build_val_loaders_fixed_p
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# DDP utilities
+# =============================================================================
+class DistEnv:
+    """
+    Distributed environment helper. Auto-detects torchrun-style env vars.
+    If torchrun isn't used, this object reports world_size=1, rank=0 and
+    all the helpers become no-ops, so the same code runs single-GPU.
+    """
+    def __init__(self):
+        self.is_distributed = "LOCAL_RANK" in os.environ and "WORLD_SIZE" in os.environ \
+                              and int(os.environ.get("WORLD_SIZE", "1")) > 1
+        if self.is_distributed:
+            self.local_rank = int(os.environ["LOCAL_RANK"])
+            self.world_size = int(os.environ["WORLD_SIZE"])
+            self.rank = int(os.environ["RANK"])
+        else:
+            self.local_rank = 0
+            self.world_size = 1
+            self.rank = 0
+
+    def setup(self, backend: str = "nccl"):
+        if self.is_distributed and not dist.is_initialized():
+            dist.init_process_group(backend=backend)
+            torch.cuda.set_device(self.local_rank)
+
+    def cleanup(self):
+        if self.is_distributed and dist.is_initialized():
+            dist.destroy_process_group()
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
+
+    def device(self) -> torch.device:
+        if torch.cuda.is_available():
+            return torch.device(f"cuda:{self.local_rank}")
+        return torch.device("cpu")
+
+    def barrier(self):
+        if self.is_distributed:
+            dist.barrier()
+
+    def all_reduce_mean(self, tensor: torch.Tensor) -> torch.Tensor:
+        """All-reduce a tensor and divide by world_size."""
+        if not self.is_distributed:
+            return tensor
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        return tensor / self.world_size
+
+    def all_reduce_sum(self, tensor: torch.Tensor) -> torch.Tensor:
+        if not self.is_distributed:
+            return tensor
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        return tensor
+
+    def all_gather_object(self, obj):
+        """All-gather a python object from every rank into a list."""
+        if not self.is_distributed:
+            return [obj]
+        gathered = [None] * self.world_size
+        dist.all_gather_object(gathered, obj)
+        return gathered
+
+    def broadcast_object(self, obj, src: int = 0):
+        """Broadcast a python object from src rank to all ranks."""
+        if not self.is_distributed:
+            return obj
+        container = [obj] if self.rank == src else [None]
+        dist.broadcast_object_list(container, src=src)
+        return container[0]
+
+
+def log_main(env: "DistEnv", msg: str, level: int = logging.INFO):
+    """Log only from rank 0."""
+    if env.is_main:
+        logger.log(level, msg)
+
+
+# =============================================================================
+# Original helpers
+# =============================================================================
+
 
 
 def _parse_rate(s):
@@ -80,28 +168,77 @@ def _gate_l1_penalty(output) -> Optional[torch.Tensor]:
 
 def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
                 loss_weight=None, log_interval=50, max_grad_norm=1.0,
-                gate_l1: float = 0.0):
-    model.train()
-    total_loss, total_correct, total_masked, num_batches = 0, 0, 0, 0
+                gate_l1: float = 0.0, amp_dtype=None, grad_scaler=None,
+                grad_accum_steps: int = 1, env: Optional[DistEnv] = None):
+    """
+    amp_dtype: None | torch.bfloat16 | torch.float16
+    grad_scaler: torch.amp.GradScaler instance (only used for fp16)
+    grad_accum_steps: gradient accumulation steps (>=1)
+    env: DistEnv. If None, treated as single-process.
+    """
+    if env is None:
+        env = DistEnv()  # single-process default
 
+    # DistributedSampler needs set_epoch for proper shuffling
+    if env.is_distributed and hasattr(loader.sampler, "set_epoch"):
+        loader.sampler.set_epoch(epoch)
+
+    model.train()
+    total_loss, total_correct, total_masked, num_batches = 0.0, 0, 0, 0
+    use_amp = amp_dtype is not None and device.type == "cuda"
+
+    optimizer.zero_grad()
     for batch_idx, batch in enumerate(loader):
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         B = batch["input_ids"].shape[0]
         w = loss_weight[None, :].expand(B, -1).to(device) if loss_weight is not None else None
 
-        output = _forward(model, batch, dist_info, loss_weight=w)
-        loss = output.loss
-        if gate_l1 > 0.0:
-            pen = _gate_l1_penalty(output)
-            if pen is not None:
-                loss = loss + gate_l1 * pen
+        # ---- forward in autocast region ----
+        if use_amp:
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                output = _forward(model, batch, dist_info, loss_weight=w)
+                loss = output.loss
+                if gate_l1 > 0.0:
+                    pen = _gate_l1_penalty(output)
+                    if pen is not None:
+                        loss = loss + gate_l1 * pen
+        else:
+            output = _forward(model, batch, dist_info, loss_weight=w)
+            loss = output.loss
+            if gate_l1 > 0.0:
+                pen = _gate_l1_penalty(output)
+                if pen is not None:
+                    loss = loss + gate_l1 * pen
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-        optimizer.step()
-        scheduler.step()
+        loss_to_back = loss / grad_accum_steps
+
+        # ---- backward ----
+        # Skip DDP gradient sync on accumulation sub-steps for speed
+        is_accum_step = ((batch_idx + 1) % grad_accum_steps == 0) or (batch_idx + 1 == len(loader))
+        if env.is_distributed and not is_accum_step and isinstance(model, DDP):
+            with model.no_sync():
+                if grad_scaler is not None:
+                    grad_scaler.scale(loss_to_back).backward()
+                else:
+                    loss_to_back.backward()
+        else:
+            if grad_scaler is not None:
+                grad_scaler.scale(loss_to_back).backward()
+            else:
+                loss_to_back.backward()
+
+        if is_accum_step:
+            if grad_scaler is not None:
+                grad_scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
 
         total_loss += loss.item()
         num_batches += 1
@@ -113,7 +250,7 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
             total_correct += (preds == targets).sum().item()
             total_masked += mask.sum().item()
 
-        if (batch_idx + 1) % log_interval == 0:
+        if (batch_idx + 1) % log_interval == 0 and env.is_main:
             logger.info(
                 f"Epoch {epoch} | Batch {batch_idx+1}/{len(loader)} | "
                 f"Loss: {total_loss/num_batches:.4f} | "
@@ -121,32 +258,73 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
                 f"LR: {scheduler.get_last_lr()[0]:.2e}"
             )
 
+    # All-reduce metrics across ranks for accurate epoch summary
+    if env.is_distributed:
+        agg = torch.tensor(
+            [total_loss, num_batches, total_correct, total_masked],
+            dtype=torch.float64, device=device,
+        )
+        dist.all_reduce(agg, op=dist.ReduceOp.SUM)
+        total_loss, num_batches, total_correct, total_masked = agg.tolist()
+
     return total_loss / max(num_batches, 1), total_correct / max(total_masked, 1)
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, dist_info):
+def evaluate(model, loader, device, dist_info, amp_dtype=None,
+             env: Optional[DistEnv] = None):
+    """
+    Distributed-aware evaluation.
+    - Each rank processes its shard of the data via DistributedSampler.
+    - Predictions/labels are gathered to all ranks via all_gather_object.
+    - AUC/AUPRC computed on every rank (deterministic, but only logged on rank 0).
+      All-gather is needed because AUC is not a sum-reducible metric.
+    """
+    if env is None:
+        env = DistEnv()
+
     model.eval()
-    total_loss, num_batches = 0, 0
-    S = model.config.num_species
+    total_loss, num_batches = 0.0, 0
+    S = (model.module if isinstance(model, DDP) else model).config.num_species
     species_preds  = [[] for _ in range(S)]
     species_labels = [[] for _ in range(S)]
+    use_amp = amp_dtype is not None and device.type == "cuda"
 
     for batch in loader:
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        output = _forward(model, batch, dist_info)
+        if use_amp:
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                output = _forward(model, batch, dist_info)
+        else:
+            output = _forward(model, batch, dist_info)
 
         total_loss += output.loss.item()
         num_batches += 1
 
-        probs  = torch.sigmoid(output.logits).squeeze(-1).cpu().numpy()   # (B, S)
-        labels = batch["labels"].squeeze(-1).cpu().numpy()                # (B, S)
+        probs  = torch.sigmoid(output.logits).squeeze(-1).cpu().numpy()
+        labels = batch["labels"].squeeze(-1).cpu().numpy()
         mask   = labels != -100
         for s in range(S):
             b_mask = mask[:, s]
             if b_mask.any():
                 species_preds[s].extend(probs[b_mask, s].tolist())
                 species_labels[s].extend(labels[b_mask, s].tolist())
+
+    # ---- Distributed: gather per-species lists across ranks ----
+    if env.is_distributed:
+        # Reduce loss/num_batches via tensor all_reduce
+        agg = torch.tensor([total_loss, num_batches], dtype=torch.float64, device=device)
+        dist.all_reduce(agg, op=dist.ReduceOp.SUM)
+        total_loss, num_batches = agg.tolist()
+
+        # Gather per-species predictions/labels from each rank.
+        # all_gather_object can be expensive for very large datasets;
+        # for typical val sets this is fine. For massive test sets, see notes below.
+        gathered_preds  = env.all_gather_object(species_preds)
+        gathered_labels = env.all_gather_object(species_labels)
+        # Concatenate per-species across ranks
+        species_preds  = [sum((g[s] for g in gathered_preds), []) for s in range(S)]
+        species_labels = [sum((g[s] for g in gathered_labels), []) for s in range(S)]
 
     per_species_aucs = {}
     per_species_auprcs = {}
@@ -203,6 +381,22 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--output_dir", type=str, default="./jsdm_output")
     parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default="none",
+        choices=["none", "bf16", "fp16"],
+        help="Mixed-precision training mode. bf16 recommended on A40/L40/A100/H100; "
+             "halves activation memory with no loss-scaling needed. fp16 is older and "
+             "needs GradScaler. 'none' = full fp32 (highest VRAM)."
+    )
+    parser.add_argument(
+        "--grad_accum_steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps. Effective batch = batch_size * grad_accum_steps. "
+             "Use to keep large effective batch when reducing physical batch_size for VRAM."
+    )
     parser.add_argument("--no_time", action="store_true",
                         help="Disable temporal FIRE bias. Set automatically when all "
                              "time values in the CSV are identical (static datasets).")
@@ -307,10 +501,26 @@ def main():
             if int(args.resolution) < 1:
                 raise ValueError("--resolution for --fold grid must be a positive integer.")
 
+    # ---- Distributed setup (auto-detected from torchrun env vars) ----
+    env = DistEnv()
+    env.setup(backend="nccl")
+
+    # Seed: each rank gets the same seed for model init / dataloader shuffle base.
+    # DistributedSampler handles per-rank shuffling deterministically.
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.output_dir, exist_ok=True)
+    device = env.device()
+    if env.is_main:
+        os.makedirs(args.output_dir, exist_ok=True)
+    env.barrier()  # everyone waits for output_dir to exist
+
+    if env.is_distributed:
+        log_main(env,
+            f"Distributed training: world_size={env.world_size}, "
+            f"backend=nccl, device={device}"
+        )
+    else:
+        log_main(env, f"Single-process training, device={device}")
 
     saved_splits = None
     if args.splits_path is not None:
@@ -335,7 +545,33 @@ def main():
         saved_splits=saved_splits,
     )
 
-    if not args.no_save_splits:
+    # ---- Rebuild train_loader with DistributedSampler if distributed ----
+    if env.is_distributed:
+        from torch.utils.data import DataLoader
+        train_dataset_obj = train_loader.dataset  # Subset returned by create_dataloaders
+        train_collator    = train_loader.collate_fn
+        train_sampler = DistributedSampler(
+            train_dataset_obj,
+            num_replicas=env.world_size,
+            rank=env.rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=False,
+        )
+        train_loader = DataLoader(
+            train_dataset_obj,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            collate_fn=train_collator,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+        log_main(env,
+            f"Train loader sharded: per-rank batches={len(train_loader)}, "
+            f"global batches/epoch={len(train_loader) * env.world_size}"
+        )
+
+    if not args.no_save_splits and env.is_main:
         splits_out = os.path.join(args.output_dir, "splits.json")
         save_splits(
             splits_out, splits["train"], splits["val"], splits["test"],
@@ -350,6 +586,7 @@ def main():
             },
         )
         logger.info(f"Splits saved to {splits_out}")
+    env.barrier()
 
     loss_weight = None
     if not args.no_class_weighting:
@@ -357,14 +594,14 @@ def main():
         loss_weight = compute_class_weights(
             dataset.species_data, train_loader.dataset.indices, beta=beta
         )
-        logger.info(
+        log_main(env,
             f"Class weighting (beta={beta:.3f}): weight range "
             f"[{loss_weight.min().item():.3f}, {loss_weight.max().item():.3f}]"
         )
 
     use_temporal = dist_info["max_temporal_dist"] > 0
     if not use_temporal:
-        logger.info("Temporal FIRE bias disabled (no temporal variation in data)")
+        log_main(env, "Temporal FIRE bias disabled (no temporal variation in data)")
 
     config = JSDMConfig(
         num_species=dataset.num_species,
@@ -392,15 +629,56 @@ def main():
         p=args.p,
     )
 
-    with open(os.path.join(args.output_dir, "config.json"), "w") as f:
-        json.dump(vars(config), f, indent=2)
+    if env.is_main:
+        with open(os.path.join(args.output_dir, "config.json"), "w") as f:
+            json.dump(vars(config), f, indent=2)
+    env.barrier()
 
     model = JSDMForMaskedSpeciesPrediction(config).to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Model: {num_params:,} parameters, {config.num_species} species")
+    log_main(env, f"Model: {num_params:,} parameters, {config.num_species} species")
 
     if args.gradient_checkpointing:
+        # gradient_checkpointing must be set on the underlying module
+        # before DDP wrapping
         model.model.encoder.gradient_checkpointing = True
+
+    # ---- Wrap in DDP after model is fully constructed and on device ----
+    if env.is_distributed:
+        # find_unused_parameters=True is needed because ablation modes
+        # (no_st, no_env, no_st_env) disable some branches of the model
+        # whose parameters then have no gradient.
+        model = DDP(
+            model,
+            device_ids=[env.local_rank],
+            output_device=env.local_rank,
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
+        )
+        log_main(env, "Model wrapped with DistributedDataParallel")
+
+    # Helper to access the underlying model regardless of DDP wrap
+    def unwrap(m):
+        return m.module if isinstance(m, DDP) else m
+
+    # ---- Mixed precision setup ----
+    amp_dtype = None
+    grad_scaler = None
+    if args.mixed_precision == "bf16":
+        amp_dtype = torch.bfloat16
+        log_main(env, "Mixed precision: bfloat16 (no GradScaler needed)")
+    elif args.mixed_precision == "fp16":
+        amp_dtype = torch.float16
+        grad_scaler = torch.amp.GradScaler("cuda")
+        log_main(env, "Mixed precision: float16 (using GradScaler)")
+    else:
+        log_main(env, "Mixed precision: disabled (full fp32)")
+
+    if args.grad_accum_steps > 1:
+        log_main(env,
+            f"Gradient accumulation: {args.grad_accum_steps} steps "
+            f"(effective batch = {args.batch_size * args.grad_accum_steps * env.world_size})"
+        )
 
     no_decay_keys = ("norm", "bias", "combine_gate",
                      "species_log_spatial_scale", "species_log_temporal_scale")
@@ -416,11 +694,17 @@ def main():
         ],
         lr=args.learning_rate,
     )
-    total_steps = len(train_loader) * args.num_epochs
+    # Note under DDP: len(train_loader) is per-rank steps; scheduler advances
+    # once per optimizer.step(), which happens once per rank per accumulation
+    # boundary, so this is correct.
+    total_steps = (len(train_loader) // max(args.grad_accum_steps, 1)) * args.num_epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
     dist_info = move_dist_info_to_device(dist_info, device)
 
+    # Validation loaders: no DistributedSampler — every rank evaluates the full
+    # val set, then we all_gather predictions in evaluate(). Simpler than
+    # sharding val and reduces edge-case bugs around uneven shard sizes.
     fixed_val_loaders = build_val_loaders_fixed_p(
         dataset, splits["val"], dist_info, args.val_p_list,
         batch_size=args.batch_size, num_workers=args.num_workers, base_seed=args.seed,
@@ -431,26 +715,51 @@ def main():
     for p, _ in fixed_val_loaders:
         per_p_header += [f"val_loss_p{p:.2f}", f"val_acc_p{p:.2f}",
                          f"val_auc_p{p:.2f}", f"val_auprc_p{p:.2f}"]
-    with open(log_csv, "w", newline="") as f:
-        csv.writer(f).writerow(
-            ["epoch", "train_loss", "train_acc",
-             *per_p_header,
-             "val_loss_mean", "val_acc_mean", "val_auc_mean", "val_auprc_mean",
-             "lr", "elapsed_s"]
-        )
+    if env.is_main:
+        with open(log_csv, "w", newline="") as f:
+            csv.writer(f).writerow(
+                ["epoch", "train_loss", "train_acc",
+                 *per_p_header,
+                 "val_loss_mean", "val_acc_mean", "val_auc_mean", "val_auprc_mean",
+                 "lr", "elapsed_s"]
+            )
 
     best_val_auc_mean = -float("inf")
     best_val_auprc_mean = -float("inf")
-    for epoch in range(1, args.num_epochs + 1):
+    start_epoch = 1
+
+    # ---- Checkpoint resume (preemption-safe) ----
+    resume_path = os.path.join(args.output_dir, "latest_checkpoint.pt")
+    if os.path.exists(resume_path):
+        log_main(env, f"Resuming from checkpoint: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        unwrap(model).load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if grad_scaler is not None and ckpt.get("grad_scaler_state_dict") is not None:
+            grad_scaler.load_state_dict(ckpt["grad_scaler_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        best_val_auc_mean   = ckpt.get("best_val_auc_mean",   -float("inf"))
+        best_val_auprc_mean = ckpt.get("best_val_auprc_mean", -float("inf"))
+        log_main(env, f"  → resumed at epoch {start_epoch}, "
+                      f"best val_auc_mean so far={best_val_auc_mean:.4f}")
+    env.barrier()
+
+    for epoch in range(start_epoch, args.num_epochs + 1):
         t0 = time.time()
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, scheduler, device, dist_info, epoch,
             loss_weight=loss_weight, max_grad_norm=args.max_grad_norm,
             gate_l1=args.gate_l1,
+            amp_dtype=amp_dtype, grad_scaler=grad_scaler,
+            grad_accum_steps=args.grad_accum_steps,
+            env=env,
         )
         per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_nauc = [], [], [], [], []
         for p, loader in fixed_val_loaders:
-            l, a, u, ap, per_species, _ = evaluate(model, loader, device, dist_info)
+            l, a, u, ap, per_species, _ = evaluate(
+                model, loader, device, dist_info, amp_dtype=amp_dtype, env=env,
+            )
             per_p_loss.append(l)
             per_p_acc.append(a)
             per_p_auc.append(u)
@@ -462,42 +771,74 @@ def main():
         val_auprc_mean = float(np.mean(per_p_auprc)) if per_p_auprc else float("nan")
         elapsed = time.time() - t0
         current_lr = scheduler.get_last_lr()[0]
-        per_p_str = " ".join(
-            f"p{p:.2f}(loss={l:.3f},acc={a:.3f},auc={u:.3f},auprc={ap:.3f},n={n})"
-            for (p, _), l, a, u, ap, n in zip(
-                fixed_val_loaders, per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_nauc
-            )
-        )
-        logger.info(
-            f"Epoch {epoch}/{args.num_epochs} | "
-            f"Train loss={train_loss:.4f} acc={train_acc:.4f} | "
-            f"{per_p_str} | mean auc={val_auc_mean:.4f} auprc={val_auprc_mean:.4f} | {elapsed:.1f}s"
-        )
-        with open(log_csv, "a", newline="") as f:
-            row = [epoch, f"{train_loss:.6f}", f"{train_acc:.6f}"]
-            for l, a, u, ap in zip(per_p_loss, per_p_acc, per_p_auc, per_p_auprc):
-                row += [f"{l:.6f}", f"{a:.6f}", f"{u:.6f}", f"{ap:.6f}"]
-            row += [f"{val_loss_mean:.6f}", f"{val_acc_mean:.6f}",
-                    f"{val_auc_mean:.6f}", f"{val_auprc_mean:.6f}",
-                    f"{current_lr:.2e}", f"{elapsed:.1f}"]
-            csv.writer(f).writerow(row)
-        if val_auc_mean > best_val_auc_mean:
-            best_val_auc_mean = val_auc_mean
-            best_val_auprc_mean = val_auprc_mean
-            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
-            logger.info(f"  → Best model saved (val_auc_mean={val_auc_mean:.4f})")
 
-        if epoch % 10 == 0:
+        if env.is_main:
+            per_p_str = " ".join(
+                f"p{p:.2f}(loss={l:.3f},acc={a:.3f},auc={u:.3f},auprc={ap:.3f},n={n})"
+                for (p, _), l, a, u, ap, n in zip(
+                    fixed_val_loaders, per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_nauc
+                )
+            )
+            logger.info(
+                f"Epoch {epoch}/{args.num_epochs} | "
+                f"Train loss={train_loss:.4f} acc={train_acc:.4f} | "
+                f"{per_p_str} | mean auc={val_auc_mean:.4f} auprc={val_auprc_mean:.4f} | {elapsed:.1f}s"
+            )
+            with open(log_csv, "a", newline="") as f:
+                row = [epoch, f"{train_loss:.6f}", f"{train_acc:.6f}"]
+                for l, a, u, ap in zip(per_p_loss, per_p_acc, per_p_auc, per_p_auprc):
+                    row += [f"{l:.6f}", f"{a:.6f}", f"{u:.6f}", f"{ap:.6f}"]
+                row += [f"{val_loss_mean:.6f}", f"{val_acc_mean:.6f}",
+                        f"{val_auc_mean:.6f}", f"{val_auprc_mean:.6f}",
+                        f"{current_lr:.2e}", f"{elapsed:.1f}"]
+                csv.writer(f).writerow(row)
+
+            if val_auc_mean > best_val_auc_mean:
+                best_val_auc_mean = val_auc_mean
+                best_val_auprc_mean = val_auprc_mean
+                torch.save(
+                    unwrap(model).state_dict(),
+                    os.path.join(args.output_dir, "best_model.pt"),
+                )
+                logger.info(f"  → Best model saved (val_auc_mean={val_auc_mean:.4f})")
+
+            # Always-overwrite latest-checkpoint for preemption safety
             torch.save({
-                "epoch": epoch, "model_state_dict": model.state_dict(),
+                "epoch": epoch,
+                "model_state_dict": unwrap(model).state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "grad_scaler_state_dict": grad_scaler.state_dict() if grad_scaler is not None else None,
+                "best_val_auc_mean": best_val_auc_mean,
+                "best_val_auprc_mean": best_val_auprc_mean,
                 "val_loss_mean": val_loss_mean,
                 "val_auc_mean": val_auc_mean,
                 "val_auprc_mean": val_auprc_mean,
-            }, os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"))
+            }, resume_path)
 
-    logger.info("Evaluating best model on fixed-p test set...")
-    model.load_state_dict(torch.load(os.path.join(args.output_dir, "best_model.pt"), map_location=device))
+            # Periodic numbered checkpoints
+            if epoch % 10 == 0:
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": unwrap(model).state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss_mean": val_loss_mean,
+                    "val_auc_mean": val_auc_mean,
+                    "val_auprc_mean": val_auprc_mean,
+                }, os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"))
+
+        # Sync best_val_auc/auprc across ranks for consistent state
+        if env.is_distributed:
+            best_state = torch.tensor([best_val_auc_mean, best_val_auprc_mean],
+                                      dtype=torch.float64, device=device)
+            dist.broadcast(best_state, src=0)
+            best_val_auc_mean, best_val_auprc_mean = best_state.tolist()
+        env.barrier()
+
+    log_main(env, "Evaluating best model on fixed-p test set...")
+    # Load best model into the underlying module on every rank
+    best_state = torch.load(os.path.join(args.output_dir, "best_model.pt"), map_location=device)
+    unwrap(model).load_state_dict(best_state)
     eval_split   = "test" if len(splits["test"]) > 0 else "val (no test set)"
     eval_indices = splits["test"] if len(splits["test"]) > 0 else splits["val"]
     eval_loaders = build_val_loaders_fixed_p(
@@ -510,79 +851,93 @@ def main():
     per_p_per_species_auc   = {}
     per_p_per_species_auprc = {}
     for p, loader in eval_loaders:
-        _, _, m_auc, m_auprc, per_sp_auc, per_sp_auprc = evaluate(model, loader, device, dist_info)
+        _, _, m_auc, m_auprc, per_sp_auc, per_sp_auprc = evaluate(
+            model, loader, device, dist_info, amp_dtype=amp_dtype, env=env,
+        )
         per_p_auc[p]   = m_auc
         per_p_auprc[p] = m_auprc
         per_p_per_species_auc[p]   = per_sp_auc
         per_p_per_species_auprc[p] = per_sp_auprc
-        logger.info(f"{eval_split} p={p:.2f}  mean AUPRC = {m_auprc:.4f}  AUC = {m_auc:.4f}  "
-                    f"(species n={len(per_sp_auc)})")
+        log_main(env,
+            f"{eval_split} p={p:.2f}  mean AUPRC = {m_auprc:.4f}  AUC = {m_auc:.4f}  "
+            f"(species n={len(per_sp_auc)})"
+        )
     best_mean_auc   = float(np.mean(list(per_p_auc.values())))
     best_mean_auprc = float(np.mean(list(per_p_auprc.values())))
-    logger.info(f"{eval_split} mean over p={list(per_p_auc.keys())}: "
-                f"AUPRC={best_mean_auprc:.4f}  AUC={best_mean_auc:.4f}")
+    log_main(env,
+        f"{eval_split} mean over p={list(per_p_auc.keys())}: "
+        f"AUPRC={best_mean_auprc:.4f}  AUC={best_mean_auc:.4f}"
+    )
 
-    import pandas as pd
-    all_species = sorted({s for per_sp in per_p_per_species_auc.values() for s in per_sp})
-    rows = []
-    for s in all_species:
-        row = {"species": dataset.species_cols[s]}
-        for p in per_p_auc:
-            row[f"auc_p{p:.2f}"]   = per_p_per_species_auc[p].get(s, float("nan"))
-            row[f"auprc_p{p:.2f}"] = per_p_per_species_auprc[p].get(s, float("nan"))
-        row["auc_mean"]   = float(np.nanmean([row[f"auc_p{p:.2f}"]   for p in per_p_auc]))
-        row["auprc_mean"] = float(np.nanmean([row[f"auprc_p{p:.2f}"] for p in per_p_auc]))
-        rows.append(row)
-    pd.DataFrame(rows).to_csv(
-        os.path.join(args.output_dir, "per_species_auc_jsdm.csv"), index=False)
-    logger.info(f"Per-species AUC/AUPRC saved to {args.output_dir}/per_species_auc_jsdm.csv")
+    if env.is_main:
+        import pandas as pd
+        all_species = sorted({s for per_sp in per_p_per_species_auc.values() for s in per_sp})
+        rows = []
+        for s in all_species:
+            row = {"species": dataset.species_cols[s]}
+            for p in per_p_auc:
+                row[f"auc_p{p:.2f}"]   = per_p_per_species_auc[p].get(s, float("nan"))
+                row[f"auprc_p{p:.2f}"] = per_p_per_species_auprc[p].get(s, float("nan"))
+            row["auc_mean"]   = float(np.nanmean([row[f"auc_p{p:.2f}"]   for p in per_p_auc]))
+            row["auprc_mean"] = float(np.nanmean([row[f"auprc_p{p:.2f}"] for p in per_p_auc]))
+            rows.append(row)
+        pd.DataFrame(rows).to_csv(
+            os.path.join(args.output_dir, "per_species_auc_jsdm.csv"), index=False)
+        logger.info(f"Per-species AUC/AUPRC saved to {args.output_dir}/per_species_auc_jsdm.csv")
 
-    summary = {
-        "ablation":           config.ablation,
-        "num_params":         num_params,
-        "best_val_auprc_mean": best_val_auprc_mean,
-        "best_val_auc_mean":   best_val_auc_mean,
-        "test_mean_auprc":    best_mean_auprc,
-        "test_mean_auc":      best_mean_auc,
-        "test_auprc_by_p":    {f"{p:.2f}": per_p_auprc[p] for p in per_p_auprc},
-        "test_auc_by_p":      {f"{p:.2f}": per_p_auc[p]   for p in per_p_auc},
-        "eval_split":         eval_split,
-        "num_species":        config.num_species,
-        "num_epochs":         args.num_epochs,
-        "seed":               args.seed,
-    }
-    with open(os.path.join(args.output_dir, "ablation_summary.json"), "w") as f:
-        json.dump(summary, f, indent=2)
-        
-    logger.info("Extracting species interaction matrix...")
-    model.eval()
-    interactions = []
-    with torch.no_grad():
-        for i, batch in enumerate(val_loader):
-            if i >= args.interaction_extract_batches:
-                break
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            output = model(
-                input_ids=batch["input_ids"], source_ids=batch["source_ids"],
-                source_idx=batch["source_idx"],
-                target_site_idx=batch["target_site_idx"], env_data=batch["env_data"],
-                target_env=batch["target_env"],
-                labels=batch["labels"],
-                site_lats=dist_info["site_lats"],
-                site_lons=dist_info["site_lons"],
-                site_times=dist_info["site_times"],
-                euclidean=dist_info.get("euclidean", False),
-                output_attentions=True,
-            )
-            interactions.append(extract_interaction_matrix(output).cpu())
+        summary = {
+            "ablation":           config.ablation,
+            "num_params":         num_params,
+            "best_val_auprc_mean": best_val_auprc_mean,
+            "best_val_auc_mean":   best_val_auc_mean,
+            "test_mean_auprc":    best_mean_auprc,
+            "test_mean_auc":      best_mean_auc,
+            "test_auprc_by_p":    {f"{p:.2f}": per_p_auprc[p] for p in per_p_auprc},
+            "test_auc_by_p":      {f"{p:.2f}": per_p_auc[p]   for p in per_p_auc},
+            "eval_split":         eval_split,
+            "num_species":        config.num_species,
+            "num_epochs":         args.num_epochs,
+            "seed":               args.seed,
+            "world_size":         env.world_size,
+            "mixed_precision":    args.mixed_precision,
+        }
+        with open(os.path.join(args.output_dir, "ablation_summary.json"), "w") as f:
+            json.dump(summary, f, indent=2)
 
-    interaction_matrix = torch.cat(interactions, dim=0).mean(dim=0).numpy()
-    np.save(os.path.join(args.output_dir, "interaction_matrix.npy"), interaction_matrix)
+    # ---- Interaction matrix extraction (rank 0 only) ----
+    if env.is_main:
+        logger.info("Extracting species interaction matrix...")
+        unwrap(model).eval()
+        interactions = []
+        with torch.no_grad():
+            for i, batch in enumerate(val_loader):
+                if i >= args.interaction_extract_batches:
+                    break
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                output = unwrap(model)(
+                    input_ids=batch["input_ids"], source_ids=batch["source_ids"],
+                    source_idx=batch["source_idx"],
+                    target_site_idx=batch["target_site_idx"], env_data=batch["env_data"],
+                    target_env=batch["target_env"],
+                    labels=batch["labels"],
+                    site_lats=dist_info["site_lats"],
+                    site_lons=dist_info["site_lons"],
+                    site_times=dist_info["site_times"],
+                    euclidean=dist_info.get("euclidean", False),
+                    output_attentions=True,
+                )
+                interactions.append(extract_interaction_matrix(output).cpu())
 
-    with open(os.path.join(args.output_dir, "species_names.json"), "w") as f:
-        json.dump(dataset.species_cols, f)
+        interaction_matrix = torch.cat(interactions, dim=0).mean(dim=0).numpy()
+        np.save(os.path.join(args.output_dir, "interaction_matrix.npy"), interaction_matrix)
 
-    logger.info(f"Done. Output: {args.output_dir}")
+        with open(os.path.join(args.output_dir, "species_names.json"), "w") as f:
+            json.dump(dataset.species_cols, f)
+
+        logger.info(f"Done. Output: {args.output_dir}")
+
+    env.barrier()
+    env.cleanup()
 
 
 if __name__ == "__main__":
