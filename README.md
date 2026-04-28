@@ -30,8 +30,8 @@ Species values must be 0/1.
 **Model** (train only)
 - `--hidden_size` (`256`), `--num_attention_heads` (`8`, must be even), `--num_hidden_layers` (`4`), `--intermediate_size` (`512`), `--dropout` (`0.1`).
 - `--num_env_groups` (`3`) — learned environmental query groups in the environmental cross-attention.
-- `--temporal_fire_init_periods 365 180 ...` — list of init periods (days) for learnable sin/cos channels in the temporal FIRE bias. The list length is the number of periodic channels K; each ω_k is learnable so seasonality is *discovered*, not hard-coded. Omit (or pass empty) to disable periodicity and fall back to legacy monotone FIRE. Recommended values: `365 180 730 1825` (K=4: annual / semi / biennial / 5-yr) or `365 180 120 91 730 1825` (K=6: adds sub-annual for multivoltine taxa). Year-to-year phenological anomalies are handled separately by the Env head via env covariates.
-- `--fire_no_zero_init_periodic` — flag (off by default). When zero-init is on (the default), the periodic (sin/cos) weights in FIRE's MLP start at zero so the module is arithmetically identical to legacy FIRE at step 0 — the optimizer has to *earn* periodic contribution. Disable only for legacy reproducibility.
+- `--target_doy_init_periods 365 182 ...` — init periods (days) for a learnable Fourier embedding of the observation's day-of-year. A single shared encoder is applied to both target and source on **two** paths: (a) concatenated to env vectors before they enter the env modules (so env tokens carry calendar phase); (b) added (via a small linear `species_doy_proj`) to species tokens at both target and each source site (so ST cross-attention's Q·K naturally yields `cos(ω_k · Δt)`, RoPE-style). Frequencies `ω_k` are learnable; init periods just seed them. Recommended for citizen-science data with strong seasonality (e.g., eButterfly): `365 182` (annual + semi-annual). FIRE's spatial and temporal distance biases are now monotone-only (`log(c·d+1)/log(c·d_max+1)`); periodic structure lives entirely in the doy encoder. Omit (default) to disable.
+- `--target_doy_no_zero_init` — flag (off by default). When zero-init is on (the default), both the doy-feature columns of the env-projection weights AND the `species_doy_proj` weights start at zero so the encoder contributes nothing at step 0 and periodicity must be earned from gradient signal. Disable only for legacy reproducibility.
 - `--per_species_scales` — flag (off by default). Adds per-species learnable spatial and temporal scales applied to the FIRE distance input: `d_eff = d * exp(species_log_scale_s)`. Each species learns its own decay range in space and time; the relative magnitude of the two scales is the per-species space-vs-time weighting. Init at 0 → multiplier 1 → identical to legacy at step 0. Adds `2*S` parameters; registered in the no-decay group so AdamW does not drag the scalars to zero faster than the per-species gradient signal can move them.
 - `--gate_hidden_size` (default `hidden_size // 8`) — bottleneck width of the ST/Env gate MLP. Old checkpoints use the default; widen to `2 * hidden_size` (or more) for sharper per-species routing.
 - `--gate_init_bias` (default `0.0`) — initial bias of the gate MLP's final Linear. Negative values start training with the gate favoring Env (`-2.0` → `sigmoid≈0.12`), so ST has to *earn* its weight. Prevents a useless ST head from bleeding into outputs at convergence.
@@ -81,7 +81,7 @@ Species values must be 0/1.
           --output_dir ./ablation_out/$mode \
           --splits_path ./ablation_out/full/splits.json \
           --num_epochs 30 --hidden_size 256 --num_hidden_layers 3 \
-          --temporal_fire_init_periods 365 180 730 1825 --gate_hidden_size 512 \
+          --target_doy_init_periods 365 182 --gate_hidden_size 512 \
           --gate_init_bias -2.0 --gate_l1 1e-4
   done
   ```

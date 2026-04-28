@@ -58,6 +58,8 @@ def run_forward(model, batch, dist_info, device, output_attentions=False):
         site_lons=dist_info["site_lons"],
         site_times=dist_info["site_times"],
         euclidean=dist_info.get("euclidean", False),
+        target_doy=batch.get("target_doy"),
+        source_doy=batch.get("source_doy"),
         output_attentions=output_attentions,
     )
 

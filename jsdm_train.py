@@ -152,6 +152,8 @@ def _forward(model, batch, dist_info, loss_weight=None):
         site_lons=dist_info["site_lons"],
         site_times=dist_info["site_times"],
         euclidean=dist_info.get("euclidean", False),
+        target_doy=batch.get("target_doy"),
+        source_doy=batch.get("source_doy"),
     )
 
 
@@ -453,19 +455,16 @@ def main():
                         default="full",
                         help="Ablation mode. 'full' uses both ST and Env cross-attention "
                              "with a gated combination; the others disable one or both.")
-    parser.add_argument("--temporal_fire_init_periods", type=float, nargs="+", default=None,
-                        help="Init periods (days) for learnable sin/cos channels in the "
-                             "temporal FIRE bias. The length of this list is the number of "
-                             "periodic channels K; each ω_k is learnable. Omit or pass empty "
-                             "to disable periodicity (legacy monotone FIRE). "
-                             "Recommended: '365 180 730 1825' (annual / semi / biennial / "
-                             "5-yr) or '365 180 120 91 730 1825' (+ sub-annual for "
-                             "multivoltine insects).")
-    parser.add_argument("--fire_no_zero_init_periodic", action="store_true",
-                        help="Disable zero-init of periodic channels in FIRE's MLP. "
-                             "By default the periodic (sin/cos) weights start at zero so "
-                             "the module is arithmetically equivalent to legacy FIRE at step 0; "
-                             "the optimizer must earn the periodic contribution.")
+    parser.add_argument("--target_doy_init_periods", type=float, nargs="+", default=None,
+                        help="Init periods (days) for learnable sin/cos channels of the "
+                             "absolute-time positional encoder applied to target and source "
+                             "doy. Encoder is shared so attention's Q·K yields cos(ω·Δt). "
+                             "Omit to disable; recommended for cyclic-phenology data: "
+                             "'365 182' (annual + semi-annual).")
+    parser.add_argument("--target_doy_no_zero_init", action="store_true",
+                        help="Disable zero-init of the doy slice of env-module weights. "
+                             "By default those weights start at zero so periodic contribution "
+                             "is earned from gradient signal.")
     parser.add_argument("--per_species_scales", action="store_true",
                         help="Per-species spatial/temporal scales applied to the distance "
                              "input of FIRE: d_eff = d * exp(species_log_scale_s). Each "
@@ -617,11 +616,11 @@ def main():
         intermediate_size=args.intermediate_size,
         hidden_dropout_prob=args.dropout,
         attention_probs_dropout_prob=args.dropout,
-        temporal_fire_init_periods=(
-            tuple(args.temporal_fire_init_periods)
-            if args.temporal_fire_init_periods else None
+        target_doy_init_periods=(
+            tuple(args.target_doy_init_periods)
+            if args.target_doy_init_periods else None
         ),
-        fire_zero_init_periodic=(not args.fire_no_zero_init_periodic),
+        target_doy_zero_init=(not args.target_doy_no_zero_init),
         per_species_scales=args.per_species_scales,
         gate_hidden_size=args.gate_hidden_size,
         gate_init_bias=args.gate_init_bias,
@@ -924,6 +923,8 @@ def main():
                     site_lons=dist_info["site_lons"],
                     site_times=dist_info["site_times"],
                     euclidean=dist_info.get("euclidean", False),
+                    target_doy=batch.get("target_doy"),
+                    source_doy=batch.get("source_doy"),
                     output_attentions=True,
                 )
                 interactions.append(extract_interaction_matrix(output).cpu())
