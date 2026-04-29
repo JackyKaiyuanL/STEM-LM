@@ -11,7 +11,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-from sklearn.metrics import roc_auc_score, average_precision_score
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -19,6 +18,11 @@ from torch.utils.data.distributed import DistributedSampler
 
 from STEMLM_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
 from STEMLM_data import create_dataloaders, save_splits, load_splits, build_val_loaders_fixed_p
+from STEMLM_metric import (
+    compute_per_species_metrics,
+    summarize_per_species_metrics,
+    bagged_evaluate_at_p,
+)
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -255,11 +259,12 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
 def evaluate(model, loader, device, dist_info, amp_dtype=None,
              env: Optional[DistEnv] = None):
     """
-    Distributed-aware evaluation.
+    Distributed-aware single-pass evaluation. Used for per-epoch val.
     - Each rank processes its shard of the data via DistributedSampler.
-    - Predictions/labels are gathered to all ranks via all_gather_object.
-    - AUC/AUPRC computed on every rank (deterministic, but only logged on rank 0).
-      All-gather is needed because AUC is not a sum-reducible metric.
+    - Per-species (probs, labels) arrays are gathered, then metrics are
+      computed once via STEMLM_metric.compute_per_species_metrics.
+    - Returns (loss, acc, summary, per_species), where summary has
+      mean_auc_roc / mean_auc_pr / median_auc_pr_lift / mean_cbi / n_species.
     """
     if env is None:
         env = DistEnv()
@@ -291,45 +296,43 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
                 species_preds[s].extend(probs[b_mask, s].tolist())
                 species_labels[s].extend(labels[b_mask, s].tolist())
 
-    # ---- Distributed: gather per-species lists across ranks ----
     if env.is_distributed:
-        # Reduce loss/num_batches via tensor all_reduce
         agg = torch.tensor([total_loss, num_batches], dtype=torch.float64, device=device)
         dist.all_reduce(agg, op=dist.ReduceOp.SUM)
         total_loss, num_batches = agg.tolist()
 
-        # Gather per-species predictions/labels from each rank.
-        # all_gather_object can be expensive for very large datasets;
-        # for typical val sets this is fine. For massive test sets, see notes below.
         gathered_preds  = env.all_gather_object(species_preds)
         gathered_labels = env.all_gather_object(species_labels)
-        # Concatenate per-species across ranks
         species_preds  = [sum((g[s] for g in gathered_preds), []) for s in range(S)]
         species_labels = [sum((g[s] for g in gathered_labels), []) for s in range(S)]
 
-    per_species_aucs = {}
-    per_species_auprcs = {}
+    # Pad ragged per-species rows into (max_n, S) arrays with -100 for missing labels;
+    # compute_per_species_metrics filters by label==-100 per species.
+    max_n = max((len(species_labels[s]) for s in range(S)), default=0)
+    if max_n == 0:
+        empty = {"mean_auc_roc": float("nan"), "mean_auc_pr": float("nan"),
+                 "median_auc_pr_lift": float("nan"), "mean_cbi": float("nan"),
+                 "n_species": 0}
+        return total_loss / max(num_batches, 1), 0.0, empty, {}
+    probs_arr  = np.full((max_n, S), 0.0, dtype=np.float64)
+    labels_arr = np.full((max_n, S), -100, dtype=np.int64)
     total_correct, total_masked = 0, 0
-    aucs, auprcs = [], []
     for s in range(S):
-        if len(species_labels[s]) > 0:
-            arr_p = np.array(species_preds[s])
-            arr_l = np.array(species_labels[s])
-            total_correct += ((arr_p > 0.5) == arr_l).sum()
-            total_masked  += len(arr_l)
-            if len(set(species_labels[s])) == 2 and not np.isnan(arr_p).any():
-                auc_s   = roc_auc_score(arr_l, arr_p)
-                auprc_s = average_precision_score(arr_l, arr_p)
-                aucs.append(auc_s); auprcs.append(auprc_s)
-                per_species_aucs[s]   = auc_s
-                per_species_auprcs[s] = auprc_s
-    mean_auc   = float(np.mean(aucs))   if aucs   else float("nan")
-    mean_auprc = float(np.mean(auprcs)) if auprcs else float("nan")
+        n_s = len(species_labels[s])
+        if n_s == 0:
+            continue
+        arr_p = np.asarray(species_preds[s],  dtype=np.float64)
+        arr_l = np.asarray(species_labels[s], dtype=np.int64)
+        probs_arr[:n_s, s]  = arr_p
+        labels_arr[:n_s, s] = arr_l
+        total_correct += int(((arr_p > 0.5) == arr_l).sum())
+        total_masked  += n_s
+
+    per_sp = compute_per_species_metrics(probs_arr, labels_arr)
+    summary = summarize_per_species_metrics(per_sp)
     acc = total_correct / max(total_masked, 1)
 
-    return (total_loss / max(num_batches, 1), acc,
-            mean_auc, mean_auprc,
-            per_species_aucs, per_species_auprcs)
+    return total_loss / max(num_batches, 1), acc, summary, per_sp
 
 
 def main():
@@ -446,6 +449,12 @@ def main():
     parser.add_argument("--gate_hidden_size", type=int, default=None,
                         help="Bottleneck width of the ST/Env combine_gate MLP. "
                              "Default: hidden_size // 8.")
+    parser.add_argument("--test_bag_K", type=int, default=10,
+                        help="K-pass bagging for the final test eval after the best checkpoint "
+                             "is loaded. Each pass re-seeds source-pool sampling; sigmoid(logits) "
+                             "are averaged across passes per row before metrics are computed. "
+                             "Default 10 (collapses ±0.015 single-pass source-sampling noise). "
+                             "Set to 1 for plain single-pass eval (legacy behavior).")
     args = parser.parse_args()
 
     if args.splits_path is None:
@@ -716,14 +725,14 @@ def main():
         )
         per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_nauc = [], [], [], [], []
         for p, loader in fixed_val_loaders:
-            l, a, u, ap, per_species, _ = evaluate(
+            l, a, summary, per_sp = evaluate(
                 model, loader, device, dist_info, amp_dtype=amp_dtype, env=env,
             )
             per_p_loss.append(l)
             per_p_acc.append(a)
-            per_p_auc.append(u)
-            per_p_auprc.append(ap)
-            per_p_nauc.append(len(per_species))
+            per_p_auc.append(summary["mean_auc_roc"])
+            per_p_auprc.append(summary["mean_auc_pr"])
+            per_p_nauc.append(summary["n_species"])
         val_loss_mean  = float(np.mean(per_p_loss))  if per_p_loss  else float("nan")
         val_acc_mean   = float(np.mean(per_p_acc))   if per_p_acc   else float("nan")
         val_auc_mean   = float(np.mean(per_p_auc))   if per_p_auc   else float("nan")
@@ -794,65 +803,90 @@ def main():
             best_val_auc_mean, best_val_auprc_mean = best_state.tolist()
         env.barrier()
 
-    log_main(env, "Evaluating best model on fixed-p test set...")
+    log_main(env,
+        f"Evaluating best model on fixed-p test set "
+        f"(K={args.test_bag_K} bagging passes per p)..."
+    )
     # Load best model into the underlying module on every rank
     best_state = torch.load(os.path.join(args.output_dir, "best_model.pt"), map_location=device)
     unwrap(model).load_state_dict(best_state)
     eval_split   = "test" if len(splits["test"]) > 0 else "val (no test set)"
     eval_indices = splits["test"] if len(splits["test"]) > 0 else splits["val"]
-    eval_loaders = build_val_loaders_fixed_p(
-        dataset, eval_indices, dist_info, args.val_p_list,
-        batch_size=args.batch_size, num_workers=args.num_workers,
-        base_seed=args.seed + 10_000,
-    )
+
     per_p_auc = {}
     per_p_auprc = {}
-    per_p_per_species_auc   = {}
-    per_p_per_species_auprc = {}
-    for p, loader in eval_loaders:
-        _, _, m_auc, m_auprc, per_sp_auc, per_sp_auprc = evaluate(
-            model, loader, device, dist_info, amp_dtype=amp_dtype, env=env,
+    per_p_lift = {}
+    per_p_cbi = {}
+    per_p_per_species: dict = {}
+    per_p_single_auc = {}
+    for p in args.val_p_list:
+        result = bagged_evaluate_at_p(
+            unwrap(model), dataset, eval_indices, dist_info,
+            p_value=p, bag_K=args.test_bag_K,
+            batch_size=args.batch_size, device=device,
+            num_workers=args.num_workers,
+            base_seed=args.seed + 10_000,
+            amp_dtype=amp_dtype,
+            distributed_sampler=env.is_distributed,
         )
-        per_p_auc[p]   = m_auc
-        per_p_auprc[p] = m_auprc
-        per_p_per_species_auc[p]   = per_sp_auc
-        per_p_per_species_auprc[p] = per_sp_auprc
+        s = result["summary"]
+        sg = result["single_pass_summary"]
+        per_p_auc[p]    = s["mean_auc_roc"]
+        per_p_auprc[p]  = s["mean_auc_pr"]
+        per_p_lift[p]   = s["median_auc_pr_lift"]
+        per_p_cbi[p]    = s["mean_cbi"]
+        per_p_per_species[p] = result["per_species"]
+        per_p_single_auc[p]  = sg["mean_auc_roc"]
         log_main(env,
-            f"{eval_split} p={p:.2f}  mean AUPRC = {m_auprc:.4f}  AUC = {m_auc:.4f}  "
-            f"(species n={len(per_sp_auc)})"
+            f"{eval_split} p={p:.2f}  bag(K={args.test_bag_K}) "
+            f"AUC={s['mean_auc_roc']:.4f}  AUPRC={s['mean_auc_pr']:.4f}  "
+            f"PR-lift(med)={s['median_auc_pr_lift']:.2f}  CBI={s['mean_cbi']:.3f}  "
+            f"(n={s['n_species']}; single-pass AUC={sg['mean_auc_roc']:.4f}, "
+            f"Δ={s['mean_auc_roc'] - sg['mean_auc_roc']:+.4f})"
         )
     best_mean_auc   = float(np.mean(list(per_p_auc.values())))
     best_mean_auprc = float(np.mean(list(per_p_auprc.values())))
+    best_mean_cbi   = float(np.nanmean(list(per_p_cbi.values()))) if per_p_cbi else float("nan")
     log_main(env,
         f"{eval_split} mean over p={list(per_p_auc.keys())}: "
-        f"AUPRC={best_mean_auprc:.4f}  AUC={best_mean_auc:.4f}"
+        f"AUC={best_mean_auc:.4f}  AUPRC={best_mean_auprc:.4f}  CBI={best_mean_cbi:.3f}"
     )
 
     if env.is_main:
         import pandas as pd
-        all_species = sorted({s for per_sp in per_p_per_species_auc.values() for s in per_sp})
+        all_species = sorted({
+            s for ps in per_p_per_species.values() for s in ps.get("auc_roc", {})
+        })
         rows = []
-        for s in all_species:
-            row = {"species": dataset.species_cols[s]}
-            for p in per_p_auc:
-                row[f"auc_p{p:.2f}"]   = per_p_per_species_auc[p].get(s, float("nan"))
-                row[f"auprc_p{p:.2f}"] = per_p_per_species_auprc[p].get(s, float("nan"))
-            row["auc_mean"]   = float(np.nanmean([row[f"auc_p{p:.2f}"]   for p in per_p_auc]))
-            row["auprc_mean"] = float(np.nanmean([row[f"auprc_p{p:.2f}"] for p in per_p_auc]))
+        for sp in all_species:
+            row = {"species": dataset.species_cols[sp]}
+            for p in args.val_p_list:
+                ps = per_p_per_species[p]
+                row[f"auc_p{p:.2f}"]      = ps.get("auc_roc",     {}).get(sp, float("nan"))
+                row[f"auprc_p{p:.2f}"]    = ps.get("auc_pr",      {}).get(sp, float("nan"))
+                row[f"prlift_p{p:.2f}"]   = ps.get("auc_pr_lift", {}).get(sp, float("nan"))
+                row[f"cbi_p{p:.2f}"]      = ps.get("cbi",         {}).get(sp, float("nan"))
+            row["auc_mean"]   = float(np.nanmean([row[f"auc_p{p:.2f}"]   for p in args.val_p_list]))
+            row["auprc_mean"] = float(np.nanmean([row[f"auprc_p{p:.2f}"] for p in args.val_p_list]))
             rows.append(row)
         pd.DataFrame(rows).to_csv(
             os.path.join(args.output_dir, "per_species_auc.csv"), index=False)
-        logger.info(f"Per-species AUC/AUPRC saved to {args.output_dir}/per_species_auc.csv")
+        logger.info(f"Per-species metrics saved to {args.output_dir}/per_species_auc.csv")
 
         summary = {
             "ablation":           config.ablation,
             "num_params":         num_params,
             "best_val_auprc_mean": best_val_auprc_mean,
             "best_val_auc_mean":   best_val_auc_mean,
+            "test_bag_K":         int(args.test_bag_K),
             "test_mean_auprc":    best_mean_auprc,
             "test_mean_auc":      best_mean_auc,
+            "test_mean_cbi":      best_mean_cbi,
             "test_auprc_by_p":    {f"{p:.2f}": per_p_auprc[p] for p in per_p_auprc},
             "test_auc_by_p":      {f"{p:.2f}": per_p_auc[p]   for p in per_p_auc},
+            "test_cbi_by_p":      {f"{p:.2f}": per_p_cbi[p]   for p in per_p_cbi},
+            "test_pr_lift_median_by_p": {f"{p:.2f}": per_p_lift[p] for p in per_p_lift},
+            "test_single_pass_auc_by_p": {f"{p:.2f}": per_p_single_auc[p] for p in per_p_single_auc},
             "eval_split":         eval_split,
             "num_species":        config.num_species,
             "num_epochs":         args.num_epochs,
