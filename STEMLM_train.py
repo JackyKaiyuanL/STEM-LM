@@ -114,7 +114,7 @@ def log_main(env: "DistEnv", msg: str, level: int = logging.INFO):
 
 
 def _parse_rate(s):
-    if isinstance(s, str) and (s == "rand" or s.startswith("rand:")):
+    if isinstance(s, str) and (s == "unif" or s.startswith("unif:") or s.startswith("beta:")):
         return s
     return float(s)
 
@@ -344,18 +344,20 @@ def main():
                              "blind radius. Default 'auto': picked via the half-decay rule on "
                              "the dataset's Jaccard(d) curve. Pass a float to override.")
     parser.add_argument("--hidden_size", type=int, default=256)
-    parser.add_argument("--num_attention_heads", type=int, default=8)
-    parser.add_argument("--num_hidden_layers", type=int, default=4)
-    parser.add_argument("--intermediate_size", type=int, default=512)
-    parser.add_argument("--num_env_groups", type=int, default=3)
+    parser.add_argument("--num_attention_heads", type=int, default=4)
+    parser.add_argument("--num_hidden_layers", type=int, default=3)
+    parser.add_argument("--intermediate_size", type=int, default=1024)
+    parser.add_argument("--num_env_groups", type=int, default=5)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--p", type=_parse_rate, default=0.15,
-                        help="Per-row mask rate. Float in [0,1] or 'rand[:lo,hi]' "
-                             "(Uniform[lo,hi] per row; bare 'rand' = 'rand:0.0,1.0').")
+                        help="Per-row mask rate. Float in [0,1], 'unif[:lo,hi]' "
+                             "(Uniform[lo,hi] per row; bare 'unif' = 'unif:0.0,1.0'), or "
+                             "'beta:alpha,beta' (Beta(alpha, beta) per row; e.g. "
+                             "'beta:2,1' biases toward p=1, 'beta:0.5,0.5' is U-shaped).")
     parser.add_argument("--train_frac", type=float, default=0.8)
     parser.add_argument("--test_frac", type=float, default=0.1,
                         help="Fraction of data held out as test set for final AUC. "
@@ -436,7 +438,7 @@ def main():
     parser.add_argument("--ablation", choices=["full", "no_st", "no_env", "no_st_env"],
                         default="full",
                         help="Ablation mode. 'full' uses both ST and Env cross-attention "
-                             "with a gated combination; the others disable one or both.")
+                             "(summed residual); the others disable one or both.")
     parser.add_argument("--temporal_fire_init_periods", type=float, nargs="+", default=None,
                         help="Init periods (days) for learnable sin/cos channels added to "
                              "FIRE temporal distance bias on ST attention scores. "
@@ -446,15 +448,17 @@ def main():
                         help="Disable zero-init of the periodic columns of FIRE's input "
                              "linear. By default the periodic contribution starts at zero "
                              "so the monotone bias is unaffected at step 0.")
-    parser.add_argument("--gate_hidden_size", type=int, default=None,
-                        help="Bottleneck width of the ST/Env combine_gate MLP. "
-                             "Default: hidden_size // 8.")
+    parser.add_argument("--per_species_env_rank", type=int, default=0,
+                        help="Rank of the parallel per-species env head bolted in "
+                             "alongside the shared env encoder. Reads raw target_env "
+                             "via low-rank A∈(E,r)·B∈(r,S) (A zero-init, monotone safe) "
+                             "+ per-species bias. Active in full / no_st ablations; "
+                             "silent in no_env / no_st_env. Default 0 (disabled).")
     parser.add_argument("--test_bag_K", type=int, default=10,
-                        help="K-pass bagging for the final test eval after the best checkpoint "
-                             "is loaded. Each pass re-seeds source-pool sampling; sigmoid(logits) "
-                             "are averaged across passes per row before metrics are computed. "
-                             "Default 10 (collapses ±0.015 single-pass source-sampling noise). "
-                             "Set to 1 for plain single-pass eval (legacy behavior).")
+                        help="K-pass test-time eval. Each pass uses the SAME mask pattern (the "
+                             "FixedPValCollator base_seed is held fixed) and re-seeds only "
+                             "source-pool sampling, so bagging averages source-resample variance "
+                             "without inflating numbers via mask-pattern ensembling. K=1 disables.")
     args = parser.parse_args()
 
     if args.splits_path is None:
@@ -593,9 +597,9 @@ def main():
             if args.temporal_fire_init_periods else None
         ),
         fire_zero_init_periodic=(not args.fire_no_zero_init_periodic),
-        gate_hidden_size=args.gate_hidden_size,
         ablation=args.ablation,
         p=args.p,
+        per_species_env_rank=args.per_species_env_rank,
     )
 
     if env.is_main:
@@ -649,7 +653,7 @@ def main():
             f"(effective batch = {args.batch_size * args.grad_accum_steps * env.world_size})"
         )
 
-    no_decay_keys = ("norm", "bias", "combine_gate",
+    no_decay_keys = ("norm", "bias",
                      "species_spatial_log_scale", "species_temporal_log_scale")
     decay_params, nodecay_params = [], []
     for n, p in model.named_parameters():
@@ -818,7 +822,6 @@ def main():
     per_p_lift = {}
     per_p_cbi = {}
     per_p_per_species: dict = {}
-    per_p_single_auc = {}
     for p in args.val_p_list:
         result = bagged_evaluate_at_p(
             unwrap(model), dataset, eval_indices, dist_info,
@@ -830,19 +833,16 @@ def main():
             distributed_sampler=env.is_distributed,
         )
         s = result["summary"]
-        sg = result["single_pass_summary"]
         per_p_auc[p]    = s["mean_auc_roc"]
         per_p_auprc[p]  = s["mean_auc_pr"]
         per_p_lift[p]   = s["median_auc_pr_lift"]
         per_p_cbi[p]    = s["mean_cbi"]
         per_p_per_species[p] = result["per_species"]
-        per_p_single_auc[p]  = sg["mean_auc_roc"]
         log_main(env,
             f"{eval_split} p={p:.2f}  bag(K={args.test_bag_K}) "
             f"AUC={s['mean_auc_roc']:.4f}  AUPRC={s['mean_auc_pr']:.4f}  "
             f"PR-lift(med)={s['median_auc_pr_lift']:.2f}  CBI={s['mean_cbi']:.3f}  "
-            f"(n={s['n_species']}; single-pass AUC={sg['mean_auc_roc']:.4f}, "
-            f"Δ={s['mean_auc_roc'] - sg['mean_auc_roc']:+.4f})"
+            f"(n={s['n_species']})"
         )
     best_mean_auc   = float(np.mean(list(per_p_auc.values())))
     best_mean_auprc = float(np.mean(list(per_p_auprc.values())))
@@ -886,7 +886,6 @@ def main():
             "test_auc_by_p":      {f"{p:.2f}": per_p_auc[p]   for p in per_p_auc},
             "test_cbi_by_p":      {f"{p:.2f}": per_p_cbi[p]   for p in per_p_cbi},
             "test_pr_lift_median_by_p": {f"{p:.2f}": per_p_lift[p] for p in per_p_lift},
-            "test_single_pass_auc_by_p": {f"{p:.2f}": per_p_single_auc[p] for p in per_p_single_auc},
             "eval_split":         eval_split,
             "num_species":        config.num_species,
             "num_epochs":         args.num_epochs,

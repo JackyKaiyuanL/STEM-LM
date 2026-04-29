@@ -31,14 +31,10 @@ Species values must be 0/1.
 - `--num_env_groups` (`3`) — learned environmental query groups in the environmental cross-attention.
 - `--temporal_fire_init_periods 365 182 ...` — init periods (days) for `K` learnable sin/cos channels added to FIRE's temporal distance bias on ST attention scores. Periodic features are evaluated on Δt directly (`cos(ω_k·Δt)`, `sin(ω_k·Δt)`) and concatenated with the monotone log-distance feature, then mapped through FIRE's MLP to a scalar bias. Recommended for cyclic phenology (e.g., eButterfly): `365 182` (annual + semi-annual). Omit (default) to disable.
 - `--fire_no_zero_init_periodic` — flag (off by default). With zero-init on, FIRE's input-linear columns for the periodic features start at zero so the monotone bias is unaffected at step 0. Disable only for legacy reproducibility.
-- `--gate_hidden_size` (default `hidden_size // 8`) — bottleneck width of the ST/Env gate MLP. Old checkpoints use the default; widen to `2 * hidden_size` (or more) for sharper per-species routing.
 
 **Training**
 - `--batch_size` (`32`), `--num_epochs` (`50`), `--learning_rate` (`1e-4`), `--weight_decay` (`0.01`).
-- `--p` (default `0.15`) — per-row mask rate applied to both presences and absences. Accepts a float in `[0, 1]` or a `rand[:lo,hi]` string (sample `Uniform[lo, hi]` per row; bare `rand` = `rand:0.0,1.0`). Example regimes:
-  - `--p 0.15` — fixed 15% random masking (classical JSDM, current default).
-  - `--p rand` — sample a single mask rate per row from `Uniform[0, 1]`; covers the full range in training.
-  - `--p 1.0` — always 100% mask (matches the `predict` deployment regime).
+- `--p` (default `0.15`) — per-row mask rate applied to both presences and absences. Accepts a float in `[0, 1]`, a `unif[:lo,hi]` string (sample `Uniform[lo, hi]` per row; bare `unif` = `unif:0.0,1.0`), or a `beta:alpha,beta` string (sample `Beta(alpha, beta)` per row).
 - `--max_grad_norm` (`1.0`) — gradient clipping.
 - `--class_weighting` (`0.999`) — up-weight rare species (effective-number).
 - `--gradient_checkpointing` — trade compute for memory.
@@ -74,7 +70,7 @@ Species values must be 0/1.
           --output_dir ./ablation_out/$mode \
           --splits_path ./ablation_out/full/splits.json \
           --num_epochs 30 --hidden_size 256 --num_hidden_layers 3 \
-          --temporal_fire_init_periods 365 182 --gate_hidden_size 512
+          --temporal_fire_init_periods 365 182
   done
   ```
 

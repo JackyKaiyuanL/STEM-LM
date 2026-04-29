@@ -52,9 +52,9 @@ class JSDMConfig:
 
     ablation: str = "full"  # full | no_st | no_env | no_st_env
 
-    gate_hidden_size: Optional[int] = None
+    per_species_env_rank: int = 0
 
-    # Training — per-row mask rate (float in [0,1] or "rand[:lo,hi]" for per-row Uniform sampling).
+    # Training — per-row mask rate (float in [0,1], "unif[:lo,hi]" for Uniform, or "beta:a,b" for Beta).
     p: "float | str" = 0.15
 
     def __post_init__(self):
@@ -68,9 +68,6 @@ class JSDMConfig:
                 f"hidden_size ({self.hidden_size}) must be divisible by "
                 f"num_attention_heads ({self.num_attention_heads})."
             )
-        if self.gate_hidden_size is None:
-            self.gate_hidden_size = self.hidden_size // 8
-        
         if self.ablation not in ("full", "no_st", "no_env", "no_st_env"):
             raise ValueError(
                 f"ablation must be one of full/no_st/no_env/no_st_env; got {self.ablation!r}"
@@ -429,14 +426,14 @@ class STColAttention(nn.Module):
     ):
         st_dist_bias = None
         if st_dist is not None:
-            spatial_bias = self.fire_spatial(st_dist[..., 0])
+            d_sp = st_dist[..., 0]
             s_scale = F.softplus(self.species_spatial_log_scale) + 1e-4
-            st_dist_bias = spatial_bias[:, None, :, :] * s_scale[None, :, None, None]
+            st_dist_bias = self.fire_spatial(d_sp[:, None, :, :] * s_scale[None, :, None, None])
 
             if self.use_temporal:
-                temporal_bias = self.fire_temporal(st_dist[..., 1])
+                d_tp = st_dist[..., 1]
                 t_scale = F.softplus(self.species_temporal_log_scale) + 1e-4
-                st_dist_bias = st_dist_bias + temporal_bias[:, None, :, :] * t_scale[None, :, None, None]
+                st_dist_bias = st_dist_bias + self.fire_temporal(d_tp[:, None, :, :] * t_scale[None, :, None, None])
 
             st_dist_bias = st_dist_bias[:, :, None, :, :]
 
@@ -531,7 +528,7 @@ class EnvColAttention(nn.Module):
 # =============================================================================
 # Combined Attention
 #
-# row_attention → (st_col ⊕ env_col) → gate combine
+# row_attention → (st_col + env_col) sum residual
 # =============================================================================
 
 class JSDMAttention(nn.Module):
@@ -546,15 +543,6 @@ class JSDMAttention(nn.Module):
             self.st_col_attention = STColAttention(config)
         if self.use_env:
             self.env_col_attention = EnvColAttention(config)
-
-        # Gate is only meaningful when both branches exist.
-        self.use_gate = (config.ablation == "full")
-        if self.use_gate:
-            self.combine_gate = nn.Sequential(
-                nn.Linear(config.hidden_size, config.gate_hidden_size),
-                nn.SiLU(),
-                nn.Linear(config.gate_hidden_size, 1),
-            )
 
         self.row_norm  = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         if self.use_st or self.use_env:
@@ -572,10 +560,9 @@ class JSDMAttention(nn.Module):
         )
         h = hidden_states + row_output[0].transpose(-2, -3)
 
-        # 2 & 3. Shared pre-norm → ST and/or Env cross-attention → (gated) residual
+        # 2 & 3. Shared pre-norm → ST and/or Env cross-attention → summed residual
         st_attn  = None
         env_attn = None
-        gate_logit = None
 
         if self.use_st or self.use_env:
             h_normed = self.cross_norm(h)
@@ -585,9 +572,7 @@ class JSDMAttention(nn.Module):
                 h_normed, st_source_embeddings, st_attention_mask, st_dist, output_attentions,
             )
             env_out = self.env_col_attention(h_normed, env_embeddings, output_attentions)
-            gate_logit = self.combine_gate(h_normed)
-            gate = torch.sigmoid(gate_logit)
-            h = h + gate * st_out[0] + (1 - gate) * env_out[0]
+            h = h + st_out[0] + env_out[0]
             if output_attentions:
                 st_attn, env_attn = st_out[1], env_out[1]
         elif self.use_st:
@@ -608,9 +593,7 @@ class JSDMAttention(nn.Module):
         if output_attentions:
             out = out + (row_output[1] if len(row_output) > 1 else None,
                          st_attn, env_attn)
-        # gate_logit is always appended as the last element (None if no gate),
-        # regardless of output_attentions, so callers can collect it for L1.
-        return out + (gate_logit,)
+        return out
 
 
 # =============================================================================
@@ -673,7 +656,6 @@ class JSDMEncoder(nn.Module):
         all_sp_attn = () if output_attentions else None
         all_st_attn = () if output_attentions else None
         all_env_attn = () if output_attentions else None
-        all_gate_logits = []
 
         for layer in self.layers:
             if output_hidden_states:
@@ -690,8 +672,7 @@ class JSDMEncoder(nn.Module):
                     st_attention_mask, st_dist, output_attentions,
                 )
             hidden_states = layer_outputs[0]
-            
-            all_gate_logits.append(layer_outputs[-1])
+
             if output_attentions:
                 all_sp_attn = all_sp_attn + (layer_outputs[1],)
                 all_st_attn = all_st_attn + (layer_outputs[2],)
@@ -706,7 +687,6 @@ class JSDMEncoder(nn.Module):
             species_attentions=all_sp_attn,
             st_attentions=all_st_attn,
             env_attentions=all_env_attn,
-            gate_logits=tuple(all_gate_logits),
         )
 
 
@@ -717,7 +697,6 @@ class JSDMEncoderOutput(ModelOutput):
     species_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     st_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     env_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
-    gate_logits: Optional[Tuple[Optional[torch.FloatTensor], ...]] = None
 
 
 # =============================================================================
@@ -797,7 +776,18 @@ class JSDMOutput(ModelOutput):
     species_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     st_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     env_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
-    gate_logits: Optional[Tuple[Optional[torch.FloatTensor], ...]] = None
+
+
+class PerSpeciesEnvHead(nn.Module):
+    def __init__(self, num_env_vars: int, num_species: int, rank: int):
+        super().__init__()
+        self.A = nn.Parameter(torch.zeros(num_env_vars, rank))
+        self.B = nn.Parameter(torch.empty(rank, num_species))
+        nn.init.normal_(self.B, mean=0.0, std=0.02)
+        self.bias = nn.Parameter(torch.zeros(num_species))
+
+    def forward(self, target_env: torch.Tensor) -> torch.Tensor:
+        return target_env @ self.A @ self.B + self.bias
 
 
 class JSDMPredictionHead(nn.Module):
@@ -820,10 +810,21 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
         self.config = config
         self.model = JSDMModel(config)
         self.cls = JSDMPredictionHead(config)
+        if config.per_species_env_rank > 0 and config.ablation in ("full", "no_st"):
+            self.per_species_env_head = PerSpeciesEnvHead(
+                num_env_vars=config.num_env_vars,
+                num_species=config.num_species,
+                rank=config.per_species_env_rank,
+            )
+        else:
+            self.per_species_env_head = None
 
     def forward(self, labels=None, loss_weight=None, output_attentions=False, **kwargs):
+        target_env = kwargs.get("target_env", None)
         encoder_out = self.model(output_attentions=output_attentions, **kwargs)
         logits = self.cls(encoder_out.last_hidden_state)  # (B, S, T)
+        if self.per_species_env_head is not None and target_env is not None:
+            logits = logits + self.per_species_env_head(target_env).unsqueeze(-1)
 
         loss = None
         if labels is not None:
@@ -846,7 +847,6 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
             species_attentions=encoder_out.species_attentions,
             st_attentions=encoder_out.st_attentions,
             env_attentions=encoder_out.env_attentions,
-            gate_logits=encoder_out.gate_logits,
         )
 
 

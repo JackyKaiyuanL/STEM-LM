@@ -62,7 +62,7 @@ def safe_cbi(labels: np.ndarray, preds: np.ndarray,
         p_frac = ((pres_preds >= lo) & (pres_preds <= hi)).sum() / max(pres_preds.size, 1)
         pe[i] = p_frac / e_frac
     ok = np.isfinite(pe)
-    if ok.sum() < 3:
+    if ok.sum() < 3 or np.unique(pe[ok]).size < 2:
         return float("nan")
     try:
         rho = spearmanr(centers[ok], pe[ok]).statistic
@@ -162,7 +162,7 @@ def evaluate_loader(model, loader, device, dist_info, amp_dtype=None):
         probs = torch.sigmoid(out.logits.squeeze(-1)).cpu().numpy()
         labels = batch["labels"].squeeze(-1).cpu().numpy() if "labels" in batch \
                  else np.full_like(probs, fill_value=-100, dtype=np.int64)
-        target_idx = batch["target_idx"].cpu().numpy()
+        target_idx = batch["target_site_idx"].squeeze(-1).cpu().numpy()
 
         mask_arr = labels != -100
         total_correct += int(((probs > 0.5) == labels)[mask_arr].sum())
@@ -201,22 +201,22 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
 
     is_distributed = bool(distributed_sampler) and torch.distributed.is_initialized()
 
-    for k in range(bag_K):
-        seed = base_seed + 7919 * k + int(round(p_value * 1000))
-        np.random.seed(seed)
-        torch.manual_seed(seed)
+    mask_seed = base_seed + int(round(p_value * 1000))
+    collator = FixedPValCollator(
+        p=p_value,
+        site_lats=dist_info["site_lats"],
+        site_lons=dist_info["site_lons"],
+        site_times=dist_info["site_times"],
+        spatial_scale_km=dist_info["spatial_scale_km"],
+        euclidean=dist_info.get("euclidean", False),
+        blind_threshold=dist_info["blind_threshold"],
+        base_seed=mask_seed,
+    )
+    subset = Subset(dataset, eval_indices)
 
-        collator = FixedPValCollator(
-            p=p_value,
-            site_lats=dist_info["site_lats"],
-            site_lons=dist_info["site_lons"],
-            site_times=dist_info["site_times"],
-            spatial_scale_km=dist_info["spatial_scale_km"],
-            euclidean=dist_info.get("euclidean", False),
-            blind_threshold=dist_info["blind_threshold"],
-            base_seed=seed,
-        )
-        subset = Subset(dataset, eval_indices)
+    for k in range(bag_K):
+        np.random.seed(mask_seed + 7919 * k)
+        torch.manual_seed(mask_seed + 7919 * k)
         if is_distributed:
             sampler = DistributedSampler(subset, shuffle=False)
             loader = DataLoader(subset, batch_size=batch_size, sampler=sampler,
@@ -233,7 +233,7 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
                 out = run_forward(model, batch, dist_info_dev, device)
             probs = torch.sigmoid(out.logits.squeeze(-1)).cpu().numpy()
             labels = batch["labels"].squeeze(-1).cpu().numpy()
-            target_idx = batch["target_idx"].cpu().numpy()
+            target_idx = batch["target_site_idx"].squeeze(-1).cpu().numpy()
             for b, ti in enumerate(target_idx):
                 ti = int(ti)
                 if ti not in sum_probs:
