@@ -9,8 +9,8 @@ Species values must be 0/1.
 |---|---|
 | `STEMLM_model.py` | Model (species self-attn, ST + env cross-attn, FIRE distance bias). Single `JSDMConfig.ablation` field selects `full`, `no_st`, `no_env`, or `no_st_env` — ablated branches are not instantiated. |
 | `STEMLM_data.py` | Dataset, collator, H3 / grid block CV splits. Pairwise distances are never materialized; `|Δt|` and haversine are computed on-the-fly from stored site coords. |
-| `STEMLM_train.py` | Training; also hosts shared `train_epoch` / `evaluate` helpers and the final fixed-p test eval. Takes `--ablation` directly. |
-| `STEMLM_inference.py` | `predict` (per-p fixed-mask AUC) and `interactions` (species × species attention matrix). |
+| `STEMLM_train.py` | Training; per-epoch val and the final K-pass-bagged test eval. Takes `--ablation` directly. |
+| `STEMLM_metric.py` | Library: AUC-ROC / AUC-PR / AUC-PR-lift / CBI primitives, per-species + summary aggregation, single-pass `evaluate_loader`, and K-pass `bagged_evaluate_at_p`. No CLI — train + any inference script imports from here so all metric definitions live in one place. |
 
 ## Options (shared across scripts unless noted)
 
@@ -42,7 +42,8 @@ Species values must be 0/1.
 - `--max_grad_norm` (`1.0`) — gradient clipping.
 - `--class_weighting` (`0.999`) — up-weight rare species (effective-number).
 - `--gradient_checkpointing` — trade compute for memory.
-- `--val_p_list` (default `0.25 0.5 0.75 1.0`) — fixed mask rates evaluated each epoch with deterministic per-batch seeding (`FixedPValCollator`). Per-p val AUC and AUPRC are logged to `training_log.csv` as `val_auc_p... / val_auprc_p...`; their mean AUC (`val_auc_mean`) drives `best_model.pt` selection. AUPRC is reported but not used for selection.
+- `--val_p_list` (default `0.25 0.5 0.75 1.0`) — fixed mask rates evaluated each epoch with deterministic per-batch seeding (`FixedPValCollator`). Per-p val AUC and AUPRC are logged to `training_log.csv` as `val_auc_p... / val_auprc_p...`; their mean AUC (`val_auc_mean`) drives `best_model.pt` selection. AUPRC is reported but not used for selection. Per-epoch val is single-pass (bagging would dominate epoch time); the final test eval is K-pass-bagged.
+- `--test_bag_K` (default `10`) — K-pass test-time bagging applied once after training, only for the final test eval on `best_model.pt`. Each pass re-seeds source-pool sampling and the FixedPValCollator; sigmoid(logits) are averaged across K passes per row before metrics are computed. Set to `1` to disable (matches legacy single-pass eval). The default of 10 collapses the ±0.015 per-pass source-sampling variance to ~SEM 0.003 — differences of <±0.01 between single-pass runs are RNG noise, not signal. `ablation_summary.json` reports both bagged and single-pass numbers per p.
 - `--mixed_precision {none,bf16,fp16}` (default `none`) — autocast region around forward/backward. `bf16` is the recommended setting on A40/L40/A100/H100: ~50% activation-memory savings, no loss-scaling needed. `fp16` runs `GradScaler` automatically (older GPUs only). State dict on disk stays fp32.
 - `--grad_accum_steps` (default `1`) — accumulate gradients across this many micro-batches before each `optimizer.step()`. Effective batch = `batch_size × grad_accum_steps × world_size`. Use to keep a target effective batch when shrinking `--batch_size` for VRAM.
 - **Distributed (multi-GPU per run):** launch with `torchrun` and the same script runs unchanged. `--batch_size` is **per-GPU** under DDP. Auto-detected from `LOCAL_RANK` / `WORLD_SIZE` env vars; without `torchrun` everything is a no-op single-process path. Every epoch rank 0 writes `latest_checkpoint.pt`; resubmitting with the same `--output_dir` resumes from the last completed epoch (preemption-safe; pair with `#SBATCH --requeue`).
@@ -78,15 +79,14 @@ Species values must be 0/1.
   ```
 
 **Inference**
-- `predict` subcommand flags: `--eval_split {val,test}` (default `test`), plus the data/split flags above. Pass `--splits_path <model_dir>/splits.json` to reuse the exact train/val/test partition from training; otherwise supply matching `--fold`/`--resolution`/`--train_frac`/`--test_frac`/`--seed` so the split is reproduced.
-- `interactions` subcommand also accepts `--splits_path` to restrict the source pool to the original training rows.
-- Species ordering in the CSV must match the trained model's `species_names.json`; the script asserts this and errors on mismatch.
+- `STEMLM_metric.py` is a library, not a CLI. Build a master script that imports `bagged_evaluate_at_p` / `compute_per_species_metrics` / `summarize_per_species_metrics` for predict / interactions / cross-dataset eval. Always pass `--splits_path <model_dir>/splits.json` (when reusing training splits) so source-pool == training rows; species ordering must match the trained model's `species_names.json`.
 
 ## Outputs
 Training writes to `--output_dir`: `best_model.pt`, `config.json`, `species_names.json`,
-`splits.json` (unless `--no_save_splits`), `training_log.csv`, `per_species_auc.csv`,
-`ablation_summary.json` (mode + test AUPRC/AUC by p + param count + `world_size` + `mixed_precision`),
-`interaction_matrix.npy`, `latest_checkpoint.pt` (rewritten every epoch for preemption resume), and
-periodic numbered checkpoints every 10 epochs. Inference writes predictions as a parquet with per-row
-lat/lon plus one column per species, and a `per_species_auc_{val,test}.csv`.
+`splits.json` (unless `--no_save_splits`), `training_log.csv`, `per_species_auc.csv` (bagged
+AUC / AUPRC / PR-lift / CBI per p with `auc_mean` and `auprc_mean` columns),
+`ablation_summary.json` (mode + bagged test AUC/AUPRC/CBI/PR-lift by p + single-pass AUC by p + `test_bag_K`
++ param count + `world_size` + `mixed_precision`), `interaction_matrix.npy`,
+`latest_checkpoint.pt` (rewritten every epoch for preemption resume), and periodic numbered
+checkpoints every 10 epochs.
 
