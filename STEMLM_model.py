@@ -426,14 +426,14 @@ class STColAttention(nn.Module):
     ):
         st_dist_bias = None
         if st_dist is not None:
-            d_sp = st_dist[..., 0]
+            spatial_bias = self.fire_spatial(st_dist[..., 0])
             s_scale = F.softplus(self.species_spatial_log_scale) + 1e-4
-            st_dist_bias = self.fire_spatial(d_sp[:, None, :, :] * s_scale[None, :, None, None])
+            st_dist_bias = spatial_bias[:, None, :, :] * s_scale[None, :, None, None]
 
             if self.use_temporal:
-                d_tp = st_dist[..., 1]
+                temporal_bias = self.fire_temporal(st_dist[..., 1])
                 t_scale = F.softplus(self.species_temporal_log_scale) + 1e-4
-                st_dist_bias = st_dist_bias + self.fire_temporal(d_tp[:, None, :, :] * t_scale[None, :, None, None])
+                st_dist_bias = st_dist_bias + temporal_bias[:, None, :, :] * t_scale[None, :, None, None]
 
             st_dist_bias = st_dist_bias[:, :, None, :, :]
 

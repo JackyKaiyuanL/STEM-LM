@@ -807,15 +807,15 @@ def main():
             best_val_auc_mean, best_val_auprc_mean = best_state.tolist()
         env.barrier()
 
+    eval_split   = "test" if len(splits["test"]) > 0 else "val (no test set)"
+    eval_indices = splits["test"] if len(splits["test"]) > 0 else splits["val"]
     log_main(env,
-        f"Evaluating best model on fixed-p test set "
+        f"Evaluating best model on fixed-p {eval_split} set "
         f"(K={args.test_bag_K} bagging passes per p)..."
     )
     # Load best model into the underlying module on every rank
     best_state = torch.load(os.path.join(args.output_dir, "best_model.pt"), map_location=device)
     unwrap(model).load_state_dict(best_state)
-    eval_split   = "test" if len(splits["test"]) > 0 else "val (no test set)"
-    eval_indices = splits["test"] if len(splits["test"]) > 0 else splits["val"]
 
     per_p_auc = {}
     per_p_auprc = {}
