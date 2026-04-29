@@ -152,8 +152,6 @@ def _forward(model, batch, dist_info, loss_weight=None):
         site_lons=dist_info["site_lons"],
         site_times=dist_info["site_times"],
         euclidean=dist_info.get("euclidean", False),
-        target_doy=batch.get("target_doy"),
-        source_doy=batch.get("source_doy"),
     )
 
 
@@ -455,30 +453,18 @@ def main():
                         default="full",
                         help="Ablation mode. 'full' uses both ST and Env cross-attention "
                              "with a gated combination; the others disable one or both.")
-    parser.add_argument("--target_doy_init_periods", type=float, nargs="+", default=None,
-                        help="Init periods (days) for learnable sin/cos channels of the "
-                             "absolute-time positional encoder applied to target and source "
-                             "doy. Encoder is shared so attention's Q·K yields cos(ω·Δt). "
-                             "Omit to disable; recommended for cyclic-phenology data: "
-                             "'365 182' (annual + semi-annual).")
-    parser.add_argument("--target_doy_no_zero_init", action="store_true",
-                        help="Disable zero-init of the doy slice of env-module weights. "
-                             "By default those weights start at zero so periodic contribution "
-                             "is earned from gradient signal.")
-    parser.add_argument("--per_species_scales", action="store_true",
-                        help="Per-species spatial/temporal scales applied to the distance "
-                             "input of FIRE: d_eff = d * exp(species_log_scale_s). Each "
-                             "species learns its own decay range in space and time. "
-                             "Init at 0 → multiplier 1, identical to legacy at step 0. "
-                             "Adds 2*S parameters; registered no-decay so AdamW does not "
-                             "drag the scalars to zero faster than per-species gradient.")
+    parser.add_argument("--temporal_fire_init_periods", type=float, nargs="+", default=None,
+                        help="Init periods (days) for learnable sin/cos channels added to "
+                             "FIRE temporal distance bias on ST attention scores. "
+                             "Periodic on Δt directly; per-species scales (if enabled) "
+                             "rescale Δt before the cos/sin. Omit to disable.")
+    parser.add_argument("--fire_no_zero_init_periodic", action="store_true",
+                        help="Disable zero-init of the periodic columns of FIRE's input "
+                             "linear. By default the periodic contribution starts at zero "
+                             "so the monotone bias is unaffected at step 0.")
     parser.add_argument("--gate_hidden_size", type=int, default=None,
                         help="Bottleneck width of the ST/Env combine_gate MLP. "
                              "Default: hidden_size // 8.")
-    parser.add_argument("--gate_init_bias", type=float, default=0.0,
-                        help="Initial bias of combine_gate's final Linear. Negative values "
-                             "(e.g. -2.0 → sigmoid≈0.12) start training with the gate "
-                             "favoring Env, so ST must earn its weight.")
     parser.add_argument("--gate_l1", type=float, default=0.0,
                         help="L1 penalty weight on ReLU(gate_logit) (positive side only). "
                              "Encourages gate to remain near its Env-biased init unless "
@@ -570,18 +556,18 @@ def main():
             f"global batches/epoch={len(train_loader) * env.world_size}"
         )
 
-    if not args.no_save_splits and env.is_main:
+    if saved_splits is None and not args.no_save_splits and env.is_main:
         splits_out = os.path.join(args.output_dir, "splits.json")
         save_splits(
             splits_out, splits["train"], splits["val"], splits["test"],
             num_rows=len(dataset),
             meta={
-                "fold":          args.fold if saved_splits is None else "loaded",
+                "fold":          args.fold,
                 "resolution":    args.resolution,
                 "train_frac":    args.train_frac,
                 "test_frac":     args.test_frac,
                 "seed":          args.seed,
-                "source":        args.splits_path if saved_splits is not None else None,
+                "source":        None,
             },
         )
         logger.info(f"Splits saved to {splits_out}")
@@ -616,14 +602,12 @@ def main():
         intermediate_size=args.intermediate_size,
         hidden_dropout_prob=args.dropout,
         attention_probs_dropout_prob=args.dropout,
-        target_doy_init_periods=(
-            tuple(args.target_doy_init_periods)
-            if args.target_doy_init_periods else None
+        temporal_fire_init_periods=(
+            tuple(args.temporal_fire_init_periods)
+            if args.temporal_fire_init_periods else None
         ),
-        target_doy_zero_init=(not args.target_doy_no_zero_init),
-        per_species_scales=args.per_species_scales,
+        fire_zero_init_periodic=(not args.fire_no_zero_init_periodic),
         gate_hidden_size=args.gate_hidden_size,
-        gate_init_bias=args.gate_init_bias,
         ablation=args.ablation,
         p=args.p,
     )
@@ -680,7 +664,7 @@ def main():
         )
 
     no_decay_keys = ("norm", "bias", "combine_gate",
-                     "species_log_spatial_scale", "species_log_temporal_scale")
+                     "species_spatial_log_scale", "species_temporal_log_scale")
     decay_params, nodecay_params = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -923,8 +907,6 @@ def main():
                     site_lons=dist_info["site_lons"],
                     site_times=dist_info["site_times"],
                     euclidean=dist_info.get("euclidean", False),
-                    target_doy=batch.get("target_doy"),
-                    source_doy=batch.get("source_doy"),
                     output_attentions=True,
                 )
                 interactions.append(extract_interaction_matrix(output).cpu())

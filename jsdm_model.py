@@ -47,15 +47,12 @@ class JSDMConfig:
 
     fire_hidden_size: int = 32
 
-    target_doy_init_periods: Optional[Tuple[float, ...]] = None
-    target_doy_zero_init: bool = True
+    temporal_fire_init_periods: Optional[Tuple[float, ...]] = None
+    fire_zero_init_periodic: bool = True
 
     ablation: str = "full"  # full | no_st | no_env | no_st_env
 
     gate_hidden_size: Optional[int] = None
-    gate_init_bias: float = 0.0
-
-    per_species_scales: bool = False
 
     # Training — per-row mask rate (float in [0,1] or "rand[:lo,hi]" for per-row Uniform sampling).
     p: "float | str" = 0.15
@@ -79,18 +76,14 @@ class JSDMConfig:
                 f"ablation must be one of full/no_st/no_env/no_st_env; got {self.ablation!r}"
             )
         
-        doy_periods = self.target_doy_init_periods
-        if doy_periods is not None:
-            doy_periods = tuple(float(p) for p in doy_periods) or None
-            self.target_doy_init_periods = doy_periods
+        tfp = self.temporal_fire_init_periods
+        if tfp is not None:
+            tfp = tuple(float(p) for p in tfp) or None
+            self.temporal_fire_init_periods = tfp
 
     @property
-    def n_doy_freqs(self) -> int:
-        return len(self.target_doy_init_periods) if self.target_doy_init_periods else 0
-
-    @property
-    def effective_num_env_vars(self) -> int:
-        return self.num_env_vars + 2 * self.n_doy_freqs
+    def n_temporal_fire_freqs(self) -> int:
+        return len(self.temporal_fire_init_periods) if self.temporal_fire_init_periods else 0
 
 
 # =============================================================================
@@ -99,22 +92,45 @@ class JSDMConfig:
 
 class FIREDistanceBias(nn.Module):
 
-    def __init__(self, max_dist: float, fire_hidden_size: int = 32):
+    def __init__(self, max_dist: float, fire_hidden_size: int = 32,
+                 n_frequencies: int = 0,
+                 freq_init_periods: Optional[Tuple[float, ...]] = None,
+                 zero_init_periodic: bool = True):
         super().__init__()
         self.log_c = nn.Parameter(torch.tensor(0.0))
         self.max_dist = max_dist
+        self.n_frequencies = int(n_frequencies)
+        in_dim = 1 + 2 * self.n_frequencies
         self.mlp = nn.Sequential(
-            nn.Linear(1, fire_hidden_size, bias=False),
+            nn.Linear(in_dim, fire_hidden_size, bias=False),
             nn.SiLU(),
             nn.Linear(fire_hidden_size, 1, bias=False),
         )
+        if self.n_frequencies > 0:
+            if freq_init_periods is None or len(freq_init_periods) != self.n_frequencies:
+                raise ValueError(
+                    f"freq_init_periods must have exactly n_frequencies={self.n_frequencies} entries."
+                )
+            periods = torch.tensor([float(p) for p in freq_init_periods], dtype=torch.float32)
+            if (periods <= 0).any():
+                raise ValueError("all freq_init_periods must be > 0.")
+            self.log_omega = nn.Parameter(torch.log(2.0 * math.pi / periods))
+            if zero_init_periodic:
+                with torch.no_grad():
+                    self.mlp[0].weight[:, 1:].zero_()
 
     def forward(self, dist: torch.Tensor):
         d = dist.unsqueeze(-1).float()
         c = F.softplus(self.log_c) + 1e-4
         denom = torch.log1p(c * self.max_dist)
         base = torch.log1p(c * d) / denom
-        return self.mlp(base).squeeze(-1)
+        if self.n_frequencies > 0:
+            omega = torch.exp(self.log_omega)
+            phase = d * omega
+            feats = torch.cat([base, torch.cos(phase), torch.sin(phase)], dim=-1)
+        else:
+            feats = base
+        return self.mlp(feats).squeeze(-1)
 
 
 
@@ -169,37 +185,15 @@ class TargetInput(nn.Module):
 # Projects target site's own env vars into a single token appended to env_emb.
 # =============================================================================
 
-class AbsolutePeriodicEncoder(nn.Module):
-    """[cos(ω_k·t), sin(ω_k·t)] with K learnable frequencies. Shared by target
-    and source so attention Q·K yields cos(ω·Δt) (RoPE-style)."""
-    def __init__(self, init_periods: Tuple[float, ...]):
-        super().__init__()
-        periods = torch.tensor([float(p) for p in init_periods], dtype=torch.float32)
-        self.log_omega = nn.Parameter(torch.log(2.0 * math.pi / periods))
-        self.n_freqs = len(init_periods)
-
-    @property
-    def out_dim(self) -> int:
-        return 2 * self.n_freqs
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        omega = torch.exp(self.log_omega)
-        phase = t.unsqueeze(-1).float() * omega
-        return torch.cat([torch.cos(phase), torch.sin(phase)], dim=-1)
-
-
 class TargetEnvModule(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
-        E = config.effective_num_env_vars
+        E = config.num_env_vars
         self.env_norm = nn.LayerNorm(E)
         self.proj1    = nn.Linear(E, config.hidden_size)
         self.act      = nn.SiLU()
         self.proj2    = nn.Linear(config.hidden_size, config.hidden_size)
         self.out_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
-        if config.target_doy_zero_init and config.n_doy_freqs > 0:
-            with torch.no_grad():
-                self.proj1.weight[:, config.num_env_vars:].zero_()
 
     def forward(self, target_env: torch.Tensor) -> torch.Tensor:
         x = self.proj1(self.env_norm(target_env))
@@ -219,7 +213,7 @@ class EnvSourceModule(nn.Module):
 
     def __init__(self, config: JSDMConfig):
         super().__init__()
-        E = config.effective_num_env_vars
+        E = config.num_env_vars
         self.num_env_groups = config.num_env_groups
         self.env_norm = nn.LayerNorm(E)
         self.proj = nn.Linear(E, config.hidden_size)
@@ -230,9 +224,6 @@ class EnvSourceModule(nn.Module):
         self.value_proj = nn.Linear(config.hidden_size, config.hidden_size)
         self.out_proj = nn.Linear(config.hidden_size, config.hidden_size)
         self.layer_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
-        if config.target_doy_zero_init and config.n_doy_freqs > 0:
-            with torch.no_grad():
-                self.proj.weight[:, config.num_env_vars:].zero_()
 
     def forward(self, env_data: torch.Tensor) -> torch.Tensor:
         """
@@ -418,17 +409,19 @@ class STColAttention(nn.Module):
         self.output = STCrossOutput(config)
         self.use_temporal = config.use_temporal
         self.fire_spatial = FIREDistanceBias(
-            config.max_spatial_dist, config.fire_hidden_size,
+            config.max_spatial_dist, config.fire_hidden_size, n_frequencies=0,
         )
         if self.use_temporal:
+            periods = config.temporal_fire_init_periods
             self.fire_temporal = FIREDistanceBias(
                 config.max_temporal_dist, config.fire_hidden_size,
+                n_frequencies=len(periods) if periods else 0,
+                freq_init_periods=periods,
+                zero_init_periodic=config.fire_zero_init_periodic,
             )
-        self.per_species_scales = bool(config.per_species_scales)
-        if self.per_species_scales:
-            self.species_log_spatial_scale = nn.Parameter(torch.zeros(config.num_species))
-            if self.use_temporal:
-                self.species_log_temporal_scale = nn.Parameter(torch.zeros(config.num_species))
+        self.species_spatial_log_scale = nn.Parameter(torch.zeros(config.num_species))
+        if self.use_temporal:
+            self.species_temporal_log_scale = nn.Parameter(torch.zeros(config.num_species))
 
     def forward(
         self, hidden_states, source_embeddings,
@@ -436,23 +429,14 @@ class STColAttention(nn.Module):
     ):
         st_dist_bias = None
         if st_dist is not None:
-            d_sp = st_dist[..., 0]
-            if self.per_species_scales:
-                a_sp = torch.exp(self.species_log_spatial_scale)
-                d_sp = d_sp[:, None, :, :] * a_sp[None, :, None, None]
-            st_dist_bias = self.fire_spatial(d_sp)
-            if not self.per_species_scales:
-                st_dist_bias = st_dist_bias[:, None, :, :]
+            spatial_bias = self.fire_spatial(st_dist[..., 0])
+            s_scale = F.softplus(self.species_spatial_log_scale) + 1e-4
+            st_dist_bias = spatial_bias[:, None, :, :] * s_scale[None, :, None, None]
 
             if self.use_temporal:
-                d_tp = st_dist[..., 1]
-                if self.per_species_scales:
-                    a_tp = torch.exp(self.species_log_temporal_scale)
-                    d_tp = d_tp[:, None, :, :] * a_tp[None, :, None, None]
-                temporal = self.fire_temporal(d_tp)
-                if not self.per_species_scales:
-                    temporal = temporal[:, None, :, :]
-                st_dist_bias = st_dist_bias + temporal
+                temporal_bias = self.fire_temporal(st_dist[..., 1])
+                t_scale = F.softplus(self.species_temporal_log_scale) + 1e-4
+                st_dist_bias = st_dist_bias + temporal_bias[:, None, :, :] * t_scale[None, :, None, None]
 
             st_dist_bias = st_dist_bias[:, :, None, :, :]
 
@@ -571,7 +555,6 @@ class JSDMAttention(nn.Module):
                 nn.SiLU(),
                 nn.Linear(config.gate_hidden_size, 1),
             )
-            nn.init.constant_(self.combine_gate[-1].bias, float(config.gate_init_bias))
 
         self.row_norm  = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         if self.use_st or self.use_env:
@@ -750,16 +733,6 @@ class JSDMModel(nn.Module):
         if self.use_env:
             self.target_env_module = TargetEnvModule(config)
             self.env_source_module = EnvSourceModule(config)
-        self.doy_encoder = (
-            AbsolutePeriodicEncoder(config.target_doy_init_periods)
-            if config.n_doy_freqs > 0 else None
-        )
-        if self.doy_encoder is not None:
-            self.species_doy_proj = nn.Linear(2 * config.n_doy_freqs,
-                                              config.hidden_size, bias=False)
-            if config.target_doy_zero_init:
-                with torch.no_grad():
-                    self.species_doy_proj.weight.zero_()
         self.encoder = JSDMEncoder(config)
 
     def forward(
@@ -774,8 +747,6 @@ class JSDMModel(nn.Module):
         site_lons,       # (N_total,) deg
         site_times,      # (N_total,) days
         euclidean=False,
-        target_doy=None, # (B,)   — required iff config.target_doy_init_periods set
-        source_doy=None, # (B, N) — required iff config.target_doy_init_periods set
         output_attentions=False,
         output_hidden_states=False,
     ):
@@ -784,18 +755,7 @@ class JSDMModel(nn.Module):
         species_emb = self.target_input.species_embedding.weight
         source_emb = self.target_input.embedding(source_ids) + species_emb[None, :, None, :]
 
-        if self.doy_encoder is not None:
-            if target_doy is None or source_doy is None:
-                raise ValueError("target_doy and source_doy required when target_doy_init_periods is set")
-            tgt_doy_feat = self.species_doy_proj(self.doy_encoder(target_doy))  # (B, H)
-            src_doy_feat = self.species_doy_proj(self.doy_encoder(source_doy))  # (B, N, H)
-            hidden_states = hidden_states + tgt_doy_feat[:, None, None, :]
-            source_emb    = source_emb    + src_doy_feat[:, None, :, :]
-
         if self.use_env:
-            if self.doy_encoder is not None:
-                target_env = torch.cat([target_env, self.doy_encoder(target_doy)], dim=-1)
-                env_data   = torch.cat([env_data,   self.doy_encoder(source_doy)], dim=-1)
             env_emb = torch.cat([
                 self.env_source_module(env_data),
                 self.target_env_module(target_env),

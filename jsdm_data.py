@@ -163,7 +163,6 @@ class JSDMDataset(Dataset):
             reason = "--no_time" if no_time else f"column '{time_col}' not found"
             print(f"  Time ignored ({reason}) — purely spatial model")
 
-        doys_arr = None
         if has_time:
             col = df[time_col]
             is_stringlike = (col.dtype == "object"
@@ -172,7 +171,6 @@ class JSDMDataset(Dataset):
             if is_stringlike:
                 dt = pd.to_datetime(col)
                 df[time_col] = (dt - dt.min()).dt.days.astype(float)
-                doys_arr = dt.dt.dayofyear.values.astype(np.float32)
             else:
                 df[time_col] = df[time_col].astype(float)
 
@@ -204,9 +202,6 @@ class JSDMDataset(Dataset):
             df[env_cols].values.astype(np.float32) if env_cols
             else np.zeros((N, 1), dtype=np.float32)
         )
-        self.doys = doys_arr if doys_arr is not None else np.zeros(N, dtype=np.float32)
-        self.has_doy = doys_arr is not None
-
         self.euclidean_coords = bool(euclidean_coords)
         self.has_time = bool(has_time)
 
@@ -297,8 +292,6 @@ class JSDMDataset(Dataset):
             "target_env":     torch.from_numpy(target_env),
             "target_idx":     torch.tensor(idx, dtype=torch.long),
             "source_idx":     torch.from_numpy(source_idx.astype(np.int64)),
-            "target_doy":     torch.tensor(self.doys[idx], dtype=torch.float32),
-            "source_doy":     torch.from_numpy(self.doys[source_idx].astype(np.float32)),
         }
 
 
