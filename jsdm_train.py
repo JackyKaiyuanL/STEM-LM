@@ -155,20 +155,9 @@ def _forward(model, batch, dist_info, loss_weight=None):
     )
 
 
-def _gate_l1_penalty(output) -> Optional[torch.Tensor]:
-
-    gl = getattr(output, "gate_logits", None)
-    if not gl:
-        return None
-    per_layer = [F.relu(g).mean() for g in gl if g is not None]
-    if not per_layer:
-        return None
-    return torch.stack(per_layer).mean()
-
-
 def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
                 loss_weight=None, log_interval=50, max_grad_norm=1.0,
-                gate_l1: float = 0.0, amp_dtype=None, grad_scaler=None,
+                amp_dtype=None, grad_scaler=None,
                 grad_accum_steps: int = 1, env: Optional[DistEnv] = None):
     """
     amp_dtype: None | torch.bfloat16 | torch.float16
@@ -199,17 +188,9 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 output = _forward(model, batch, dist_info, loss_weight=w)
                 loss = output.loss
-                if gate_l1 > 0.0:
-                    pen = _gate_l1_penalty(output)
-                    if pen is not None:
-                        loss = loss + gate_l1 * pen
         else:
             output = _forward(model, batch, dist_info, loss_weight=w)
             loss = output.loss
-            if gate_l1 > 0.0:
-                pen = _gate_l1_penalty(output)
-                if pen is not None:
-                    loss = loss + gate_l1 * pen
 
         loss_to_back = loss / grad_accum_steps
 
@@ -465,10 +446,6 @@ def main():
     parser.add_argument("--gate_hidden_size", type=int, default=None,
                         help="Bottleneck width of the ST/Env combine_gate MLP. "
                              "Default: hidden_size // 8.")
-    parser.add_argument("--gate_l1", type=float, default=0.0,
-                        help="L1 penalty weight on ReLU(gate_logit) (positive side only). "
-                             "Encourages gate to remain near its Env-biased init unless "
-                             "ST genuinely helps. 0 disables.")
     args = parser.parse_args()
 
     if args.splits_path is None:
@@ -733,7 +710,6 @@ def main():
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, scheduler, device, dist_info, epoch,
             loss_weight=loss_weight, max_grad_norm=args.max_grad_norm,
-            gate_l1=args.gate_l1,
             amp_dtype=amp_dtype, grad_scaler=grad_scaler,
             grad_accum_steps=args.grad_accum_steps,
             env=env,
