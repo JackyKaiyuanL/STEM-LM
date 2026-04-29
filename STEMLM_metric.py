@@ -9,12 +9,6 @@ from torch.utils.data.distributed import DistributedSampler
 
 from STEMLM_data import FixedPValCollator
 
-
-# ============================================================================
-# Metric primitives — per-species single-array inputs.
-# Each returns NaN when undefined. Mirror bench/fiona_benchmark_rev R functions.
-# ============================================================================
-
 def safe_auc_roc(labels: np.ndarray, preds: np.ndarray) -> float:
     if labels.size == 0 or len(set(labels.tolist())) < 2:
         return float("nan")
@@ -39,7 +33,6 @@ def safe_auc_pr(labels: np.ndarray, preds: np.ndarray) -> float:
 
 def auc_pr_lift(labels: np.ndarray, preds: np.ndarray,
                 prevalence: Optional[float] = None) -> float:
-    """AUC-PR / base-rate. Comparable across species with different prevalences."""
     if prevalence is None:
         prevalence = float(labels.mean()) if labels.size > 0 else 0.0
     if prevalence <= 0.0:
@@ -50,9 +43,6 @@ def auc_pr_lift(labels: np.ndarray, preds: np.ndarray,
 
 def safe_cbi(labels: np.ndarray, preds: np.ndarray,
              n_windows: int = 101, width: float = 0.1) -> float:
-    """Continuous Boyce Index (Hirzel et al. 2006). Spearman correlation
-    between window centers in [0, 1] and predicted-vs-expected presence ratio.
-    CBI = 1 perfect calibration; 0 random; -1 inverse."""
     if labels.size == 0 or labels.sum() == 0:
         return float("nan")
     if np.isnan(preds).any():
@@ -83,8 +73,6 @@ def safe_cbi(labels: np.ndarray, preds: np.ndarray,
 
 def compute_per_species_metrics(probs: np.ndarray,
                                 labels: np.ndarray) -> Dict[str, Dict[int, float]]:
-    """probs, labels: (N, S). Labels with -100 are ignored. Returns
-    {metric: {species_id: value}} for species with valid data."""
     if probs.shape != labels.shape:
         raise ValueError(f"probs {probs.shape} != labels {labels.shape}")
     S = probs.shape[1]
@@ -123,11 +111,6 @@ def summarize_per_species_metrics(per_sp: Dict[str, Dict[int, float]]) -> Dict[s
         "n_species":          len(aucs),
     }
 
-
-# ============================================================================
-# Forward + evaluation loops
-# ============================================================================
-
 def run_forward(model, batch, dist_info, device, output_attentions=False):
     batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
     return model(
@@ -156,10 +139,6 @@ def _move_dist_info(dist_info, device):
 
 @torch.no_grad()
 def evaluate_loader(model, loader, device, dist_info, amp_dtype=None):
-    """Single-pass eval over a pre-built loader. Used by per-epoch val
-    (single pass, fast) and as the inner loop of bagged_evaluate_at_p.
-    Returns (avg_loss, accuracy, summary, per_species, probs_by_idx, labels_by_idx).
-    """
     model.eval()
     use_amp = amp_dtype is not None and device.type == "cuda"
     dist_info_dev = _move_dist_info(dist_info, device)
@@ -212,14 +191,6 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
                          bag_K: int, batch_size: int, device,
                          num_workers: int = 0, base_seed: int = 0,
                          amp_dtype=None, distributed_sampler: bool = False) -> Dict:
-    """K-pass bagged eval at a fixed mask rate p. Each pass re-seeds source
-    sampling RNG; sigmoid(logits) are averaged across passes per row before
-    metrics are computed. Returns:
-        {"p", "K", "summary", "per_species", "single_pass_summary"}.
-
-    The model and dist_info tensors should already be on `device` for best
-    perf — dist_info is moved each call so passing CPU tensors also works.
-    """
     model.eval()
     use_amp = amp_dtype is not None and device.type == "cuda"
     dist_info_dev = _move_dist_info(dist_info, device)
