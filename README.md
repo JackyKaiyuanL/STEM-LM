@@ -7,11 +7,10 @@ Species values must be 0/1.
 ## Files
 | File | Purpose |
 |---|---|
-| `jsdm_model.py` | Model (species self-attn, ST + env cross-attn, FIRE distance bias). Single `JSDMConfig.ablation` field selects `full`, `no_st`, `no_env`, or `no_st_env` — ablated branches are not instantiated. |
-| `jsdm_data.py` | Dataset, collator, H3 / grid block CV splits. Pairwise distances are never materialized; `|Δt|` and haversine are computed on-the-fly from stored site coords. |
-| `jsdm_train.py` | Training; also hosts shared `train_epoch` / `evaluate` helpers and the final fixed-p test eval. Takes `--ablation` directly. |
-| `jsdm_ablation.py` | Thin master: shells out to `jsdm_train.py` once per mode, shares splits across modes, aggregates `ablation_summary.json` files into `ablation_comparison.json`. No model or training code. |
-| `jsdm_inference.py` | `predict` (per-p fixed-mask AUC) and `interactions` (species × species attention matrix). |
+| `STEMLM_model.py` | Model (species self-attn, ST + env cross-attn, FIRE distance bias). Single `JSDMConfig.ablation` field selects `full`, `no_st`, `no_env`, or `no_st_env` — ablated branches are not instantiated. |
+| `STEMLM_data.py` | Dataset, collator, H3 / grid block CV splits. Pairwise distances are never materialized; `|Δt|` and haversine are computed on-the-fly from stored site coords. |
+| `STEMLM_train.py` | Training; also hosts shared `train_epoch` / `evaluate` helpers and the final fixed-p test eval. Takes `--ablation` directly. |
+| `STEMLM_inference.py` | `predict` (per-p fixed-mask AUC) and `interactions` (species × species attention matrix). |
 
 ## Options (shared across scripts unless noted)
 
@@ -48,32 +47,28 @@ Species values must be 0/1.
 - `--grad_accum_steps` (default `1`) — accumulate gradients across this many micro-batches before each `optimizer.step()`. Effective batch = `batch_size × grad_accum_steps × world_size`. Use to keep a target effective batch when shrinking `--batch_size` for VRAM.
 - **Distributed (multi-GPU per run):** launch with `torchrun` and the same script runs unchanged. `--batch_size` is **per-GPU** under DDP. Auto-detected from `LOCAL_RANK` / `WORLD_SIZE` env vars; without `torchrun` everything is a no-op single-process path. Every epoch rank 0 writes `latest_checkpoint.pt`; resubmitting with the same `--output_dir` resumes from the last completed epoch (preemption-safe; pair with `#SBATCH --requeue`).
   ```bash
-  torchrun --nproc_per_node=4 jsdm_train.py data.csv \
+  torchrun --nproc_per_node=4 STEMLM_train.py data.csv \
       --output_dir ./out --mixed_precision bf16 --gradient_checkpointing \
       --batch_size 32 --num_epochs 100 [other args]
   ```
   For per-mode ablations on a 4-GPU node (run two 2-GPU jobs in parallel), set distinct `--master_port` values:
   ```bash
   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=29500 \
-      jsdm_train.py data.csv --ablation full --output_dir ./run/full \
+      STEMLM_train.py data.csv --ablation full --output_dir ./run/full \
       --mixed_precision bf16 [args] &
   CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 --master_port=29501 \
-      jsdm_train.py data.csv --ablation no_st --output_dir ./run/no_st \
+      STEMLM_train.py data.csv --ablation no_st --output_dir ./run/no_st \
       --mixed_precision bf16 [args] &
   wait
   ```
   Validation predictions are `all_gather`-ed across ranks so AUC is computed on the full val set; only rank 0 logs and writes outputs. `find_unused_parameters=True` is set so ablation modes (whose disabled branches receive no gradient) work under DDP — costs a small per-step overhead vs. full-mode-only DDP. Before paper-quality runs, sanity-check that (a) `--mixed_precision none` still reproduces the original numbers within seed noise, (b) `--mixed_precision bf16` matches `none` within ~0.005 val AUC, and (c) `torchrun --nproc_per_node=2` matches single-GPU at the same effective batch within seed variance.
 
 **Ablation**
-- `jsdm_train.py --ablation {full,no_st,no_env,no_st_env}` — which cross-attention branches to keep. Param counts differ across modes. Ablated branches are not instantiated, so `no_env` / `no_st_env` have no environmental modules at all (no dead weight). Every training run writes `ablation_summary.json` alongside the checkpoint.
-- `jsdm_ablation.py` is a master script that calls `jsdm_train.py` once per mode, shares splits across modes automatically, and aggregates results:
-  - `--modes full no_st no_env no_st_env` (default = all four) — subset of modes to run.
-  - `--shared_splits_from path/to/splits.json` — optional; otherwise the first completed mode's `splits.json` is reused by the remaining modes.
-  - All other flags are passed through verbatim to `jsdm_train.py` (everything in the **Data / split**, **Model**, **Training** sections above). The master auto-injects `--ablation $mode` and `--output_dir <parent>/<mode>/` per run, so **do not** pass either of those in the passthrough section.
-- Usage pattern A — direct per-mode (gives you a loop-level handle, streams logs cleanly):
+- `STEMLM_train.py --ablation {full,no_st,no_env,no_st_env}` — which cross-attention branches to keep. Param counts differ across modes. Ablated branches are not instantiated, so `no_env` / `no_st_env` have no environmental modules at all (no dead weight). Every training run writes `ablation_summary.json` alongside the checkpoint.
+- Per-mode loop (run `full` first *without* `--splits_path` so it produces the shared splits, then reuse it for the rest):
   ```bash
   for mode in full no_st no_env no_st_env; do
-      python jsdm_train.py data.csv \
+      python STEMLM_train.py data.csv \
           --ablation $mode \
           --output_dir ./ablation_out/$mode \
           --splits_path ./ablation_out/full/splits.json \
@@ -81,16 +76,6 @@ Species values must be 0/1.
           --temporal_fire_init_periods 365 182 --gate_hidden_size 512
   done
   ```
-  (Run `full` first *without* `--splits_path` so it produces the shared splits, then reuse it for the rest.)
-- Usage pattern B — master-driven (auto splits, auto aggregation, single invocation):
-  ```bash
-  python jsdm_ablation.py data.csv \
-      --output_dir ./ablation_out \
-      --modes full no_st no_env no_st_env \
-      --num_epochs 30 --hidden_size 256 --num_hidden_layers 3 \
-      --temporal_fire_init_periods 365 180 730 1825 --gate_hidden_size 512
-  ```
-  Writes `ablation_out/<mode>/{best_model.pt, config.json, ...}` per mode and `ablation_out/ablation_comparison.json` with test AUC, val AUC, and param count per mode.
 
 **Inference**
 - `predict` subcommand flags: `--eval_split {val,test}` (default `test`), plus the data/split flags above. Pass `--splits_path <model_dir>/splits.json` to reuse the exact train/val/test partition from training; otherwise supply matching `--fold`/`--resolution`/`--train_frac`/`--test_frac`/`--seed` so the split is reproduced.
@@ -99,11 +84,9 @@ Species values must be 0/1.
 
 ## Outputs
 Training writes to `--output_dir`: `best_model.pt`, `config.json`, `species_names.json`,
-`splits.json` (unless `--no_save_splits`), `training_log.csv`, `per_species_auc_jsdm.csv`,
+`splits.json` (unless `--no_save_splits`), `training_log.csv`, `per_species_auc.csv`,
 `ablation_summary.json` (mode + test AUPRC/AUC by p + param count + `world_size` + `mixed_precision`),
 `interaction_matrix.npy`, `latest_checkpoint.pt` (rewritten every epoch for preemption resume), and
 periodic numbered checkpoints every 10 epochs. Inference writes predictions as a parquet with per-row
 lat/lon plus one column per species, and a `per_species_auc_{val,test}.csv`.
 
-The master `jsdm_ablation.py` additionally writes `ablation_comparison.json` in its `--output_dir`,
-aggregating each mode's `ablation_summary.json` into a single table for A/B comparison.

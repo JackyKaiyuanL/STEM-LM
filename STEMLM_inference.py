@@ -16,8 +16,8 @@ import torch
 from sklearn.metrics import roc_auc_score, average_precision_score
 from torch.utils.data import DataLoader, Subset
 
-from jsdm_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
-from jsdm_data import (
+from STEMLM_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
+from STEMLM_data import (
     JSDMDataset,
     JSDMDataCollator,
     FixedPValCollator,

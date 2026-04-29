@@ -17,8 +17,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-from jsdm_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
-from jsdm_data import create_dataloaders, save_splits, load_splits, build_val_loaders_fixed_p
+from STEMLM_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
+from STEMLM_data import create_dataloaders, save_splits, load_splits, build_val_loaders_fixed_p
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -360,7 +360,7 @@ def main():
                              "(final AUC reported on val, same as early-stopping set).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--output_dir", type=str, default="./jsdm_output")
+    parser.add_argument("--output_dir", type=str, default="./STEMLM_output")
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument(
         "--mixed_precision",
@@ -841,8 +841,8 @@ def main():
             row["auprc_mean"] = float(np.nanmean([row[f"auprc_p{p:.2f}"] for p in per_p_auc]))
             rows.append(row)
         pd.DataFrame(rows).to_csv(
-            os.path.join(args.output_dir, "per_species_auc_jsdm.csv"), index=False)
-        logger.info(f"Per-species AUC/AUPRC saved to {args.output_dir}/per_species_auc_jsdm.csv")
+            os.path.join(args.output_dir, "per_species_auc.csv"), index=False)
+        logger.info(f"Per-species AUC/AUPRC saved to {args.output_dir}/per_species_auc.csv")
 
         summary = {
             "ablation":           config.ablation,
