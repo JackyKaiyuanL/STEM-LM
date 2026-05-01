@@ -88,7 +88,6 @@ class DistEnv:
         return tensor
 
     def all_gather_object(self, obj):
-        """All-gather a python object from every rank into a list."""
         if not self.is_distributed:
             return [obj]
         gathered = [None] * self.world_size
@@ -96,7 +95,6 @@ class DistEnv:
         return gathered
 
     def broadcast_object(self, obj, src: int = 0):
-        """Broadcast a python object from src rank to all ranks."""
         if not self.is_distributed:
             return obj
         container = [obj] if self.rank == src else [None]
@@ -105,15 +103,8 @@ class DistEnv:
 
 
 def log_main(env: "DistEnv", msg: str, level: int = logging.INFO):
-    """Log only from rank 0."""
     if env.is_main:
         logger.log(level, msg)
-
-
-# =============================================================================
-# Original helpers
-# =============================================================================
-
 
 
 def _parse_rate(s):
@@ -135,7 +126,6 @@ def move_dist_info_to_device(dist_info, device):
 
 
 def compute_class_weights(species_data, train_indices, beta=0.999):
-    # Effective-number-of-samples class weighting
     if not (0.0 < beta < 1.0):
         raise ValueError(f"class_weighting_beta must be in (0, 1), got {beta}")
     n_s = species_data[train_indices].sum(axis=0).clip(min=1)
@@ -180,9 +170,8 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
     env: DistEnv. If None, treated as single-process.
     """
     if env is None:
-        env = DistEnv()  # single-process default
+        env = DistEnv()
 
-    # DistributedSampler needs set_epoch for proper shuffling
     if env.is_distributed and hasattr(loader.sampler, "set_epoch"):
         loader.sampler.set_epoch(epoch)
 
@@ -197,7 +186,6 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
         B = batch["input_ids"].shape[0]
         w = loss_weight[None, :].expand(B, -1).to(device) if loss_weight is not None else None
 
-        # ---- forward in autocast region ----
         if use_amp:
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 output = _forward(model, batch, dist_info, loss_weight=w,
@@ -212,8 +200,6 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
 
         loss_to_back = loss / grad_accum_steps
 
-        # ---- backward ----
-        # Skip DDP gradient sync on accumulation sub-steps for speed
         is_accum_step = ((batch_idx + 1) % grad_accum_steps == 0) or (batch_idx + 1 == len(loader))
         if env.is_distributed and not is_accum_step and isinstance(model, DDP):
             with model.no_sync():
@@ -257,7 +243,6 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
                 f"LR: {scheduler.get_last_lr()[0]:.2e}"
             )
 
-    # All-reduce metrics across ranks for accurate epoch summary
     if env.is_distributed:
         agg = torch.tensor(
             [total_loss, num_batches, total_correct, total_masked],
@@ -274,14 +259,7 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
              env: Optional[DistEnv] = None,
              loss_type: str = "bce",
              focal_alpha: float = 0.25, focal_gamma: float = 2.0):
-    """
-    Distributed-aware single-pass evaluation. Used for per-epoch val.
-    - Each rank processes its shard of the data via DistributedSampler.
-    - Per-species (probs, labels) arrays are gathered, then metrics are
-      computed once via STEMLM_metric.compute_per_species_metrics.
-    - Returns (loss, acc, summary, per_species), where summary has
-      mean_auc_roc / mean_auc_pr / median_auc_pr_lift / mean_cbi / n_species.
-    """
+
     if env is None:
         env = DistEnv()
 
@@ -326,8 +304,6 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
         species_preds  = [sum((g[s] for g in gathered_preds), []) for s in range(S)]
         species_labels = [sum((g[s] for g in gathered_labels), []) for s in range(S)]
 
-    # Pad ragged per-species rows into (max_n, S) arrays with -100 for missing labels;
-    # compute_per_species_metrics filters by label==-100 per species.
     max_n = max((len(species_labels[s]) for s in range(S)), default=0)
     if max_n == 0:
         empty = {"mean_auc_roc": float("nan"), "mean_auc_pr": float("nan"),
@@ -417,16 +393,11 @@ def main():
         type=float,
         nargs="?",
         const=0.999,
-        default=0.999,
-        help="Effective-number class weighting beta in (0,1). "
-             "Default 0.999 (enabled even if not provided). "
-             "Pass e.g. '--class_weighting 0.99' to reduce weighting. "
-             "Use --no_class_weighting to disable.",
-    )
-    parser.add_argument(
-        "--no_class_weighting",
-        action="store_true",
-        help="Disable per-species loss weighting (overrides --class_weighting).",
+        default=None,
+        help="Effective-number class weighting beta in (0,1). Off by default; "
+             "pass '--class_weighting' (alone, uses beta=0.999) or "
+             "'--class_weighting 0.99' to enable. Recommended for BCE only; "
+             "with focal it's redundant and hurts AUC.",
     )
     parser.add_argument("--env_cols", nargs="+", default=None,
                         help="Explicit list of env column names. If not set, columns with 'env_' "
@@ -492,9 +463,12 @@ def main():
                              "weighted BCE. Ignored when --loss_type=bce. "
                              "Default 2.0 (RetinaNet).")
     parser.add_argument("--absence_mask_eval", action="store_true",
-                        help="Run a second test block: mask all absences + p "
-                             "fraction of presences (presence-only data "
-                             "scenario).")
+                        help="(Default ON; this flag is a no-op kept for "
+                             "backward compat.) Run absence-mask test block "
+                             "(mask all absences + p presences; presence-only "
+                             "scenario). Use --no_absence_mask_eval to skip.")
+    parser.add_argument("--no_absence_mask_eval", action="store_true",
+                        help="Skip the absence-mask test block.")
     parser.add_argument("--absence_mask_p_list", type=float, nargs="+",
                         default=[0.25, 0.5, 0.75, 1.0],
                         help="Presence-mask rates for absence-mask eval.")
@@ -520,18 +494,15 @@ def main():
             if int(args.resolution) < 1:
                 raise ValueError("--resolution for --fold grid must be a positive integer.")
 
-    # ---- Distributed setup (auto-detected from torchrun env vars) ----
     env = DistEnv()
     env.setup(backend="nccl")
 
-    # Seed: each rank gets the same seed for model init / dataloader shuffle base.
-    # DistributedSampler handles per-rank shuffling deterministically.
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = env.device()
     if env.is_main:
         os.makedirs(args.output_dir, exist_ok=True)
-    env.barrier()  # everyone waits for output_dir to exist
+    env.barrier()
 
     if env.is_distributed:
         log_main(env,
@@ -564,10 +535,9 @@ def main():
         saved_splits=saved_splits,
     )
 
-    # ---- Rebuild train_loader with DistributedSampler if distributed ----
     if env.is_distributed:
         from torch.utils.data import DataLoader
-        train_dataset_obj = train_loader.dataset  # Subset returned by create_dataloaders
+        train_dataset_obj = train_loader.dataset
         train_collator    = train_loader.collate_fn
         train_sampler = DistributedSampler(
             train_dataset_obj,
@@ -608,7 +578,7 @@ def main():
     env.barrier()
 
     loss_weight = None
-    if not args.no_class_weighting:
+    if args.class_weighting is not None:
         beta = args.class_weighting
         loss_weight = compute_class_weights(
             dataset.species_data, train_loader.dataset.indices, beta=beta
@@ -663,15 +633,9 @@ def main():
     log_main(env, f"Model: {num_params:,} parameters, {config.num_species} species")
 
     if args.gradient_checkpointing:
-        # gradient_checkpointing must be set on the underlying module
-        # before DDP wrapping
         model.model.encoder.gradient_checkpointing = True
 
-    # ---- Wrap in DDP after model is fully constructed and on device ----
     if env.is_distributed:
-        # find_unused_parameters=True is needed because ablation modes
-        # (no_st, no_env, no_st_env) disable some branches of the model
-        # whose parameters then have no gradient.
         model = DDP(
             model,
             device_ids=[env.local_rank],
@@ -681,11 +645,9 @@ def main():
         )
         log_main(env, "Model wrapped with DistributedDataParallel")
 
-    # Helper to access the underlying model regardless of DDP wrap
     def unwrap(m):
         return m.module if isinstance(m, DDP) else m
 
-    # ---- Mixed precision setup ----
     amp_dtype = None
     grad_scaler = None
     if args.mixed_precision == "bf16":
@@ -718,17 +680,12 @@ def main():
         ],
         lr=args.learning_rate,
     )
-    # Note under DDP: len(train_loader) is per-rank steps; scheduler advances
-    # once per optimizer.step(), which happens once per rank per accumulation
-    # boundary, so this is correct.
+    
     total_steps = (len(train_loader) // max(args.grad_accum_steps, 1)) * args.num_epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
     dist_info = move_dist_info_to_device(dist_info, device)
 
-    # Validation loaders: no DistributedSampler — every rank evaluates the full
-    # val set, then we all_gather predictions in evaluate(). Simpler than
-    # sharding val and reduces edge-case bugs around uneven shard sizes.
     fixed_val_loaders = build_val_loaders_fixed_p(
         dataset, splits["val"], dist_info, args.val_p_list,
         batch_size=args.batch_size, num_workers=args.num_workers, base_seed=args.seed,
@@ -754,7 +711,6 @@ def main():
     best_val_cbi_mean = -float("inf")
     start_epoch = 1
 
-    # ---- Checkpoint resume (preemption-safe) ----
     resume_path = os.path.join(args.output_dir, "latest_checkpoint.pt")
     if os.path.exists(resume_path):
         log_main(env, f"Resuming from checkpoint: {resume_path}")
@@ -843,7 +799,6 @@ def main():
                 )
                 logger.info(f"  → Best-by-CBI model saved (val_cbi_mean={val_cbi_mean:.4f})")
 
-            # Always-overwrite latest-checkpoint for preemption safety
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": unwrap(model).state_dict(),
@@ -859,7 +814,6 @@ def main():
                 "val_cbi_mean": val_cbi_mean,
             }, resume_path)
 
-            # Periodic numbered checkpoints
             if epoch % 10 == 0:
                 torch.save({
                     "epoch": epoch,
@@ -870,7 +824,6 @@ def main():
                     "val_auprc_mean": val_auprc_mean,
                 }, os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"))
 
-        # Sync best_val_auc/auprc across ranks for consistent state
         if env.is_distributed:
             best_state = torch.tensor([best_val_auc_mean, best_val_auprc_mean],
                                       dtype=torch.float64, device=device)
@@ -884,7 +837,7 @@ def main():
         f"Evaluating best model on fixed-p {eval_split} set "
         f"(K={args.test_bag_K} bagging passes per p)..."
     )
-    # Load best model into the underlying module on every rank
+
     best_state = torch.load(os.path.join(args.output_dir, "best_model.pt"), map_location=device)
     unwrap(model).load_state_dict(best_state)
 
@@ -989,13 +942,25 @@ def main():
     absmask_mean_auc = float("nan")
     absmask_mean_auprc = float("nan")
     absmask_mean_cbi = float("nan")
-    if args.absence_mask_eval:
+    if not args.no_absence_mask_eval:
         from STEMLM_data import AbsenceMaskCollator
         log_main(env,
             f"Absence-mask eval on {eval_split} (mask all absences + p "
             f"presences, K={args.test_bag_K})..."
         )
         for p in args.absence_mask_p_list:
+            if p == 1.0 and 1.0 in per_p_auc:
+                absmask_per_p_auc[p]   = per_p_auc[p]
+                absmask_per_p_auprc[p] = per_p_auprc[p]
+                absmask_per_p_lift[p]  = per_p_lift[p]
+                absmask_per_p_cbi[p]   = per_p_cbi[p]
+                absmask_per_p_brier[p] = per_p_brier[p]
+                absmask_per_p_ece[p]   = per_p_ece[p]
+                absmask_per_p_q25[p]   = per_p_q25[p]
+                absmask_per_p_q50[p]   = per_p_q50[p]
+                absmask_per_p_q75[p]   = per_p_q75[p]
+                log_main(env, f"absmask p={p:.2f}  (= uniform p=1.00, reused)")
+                continue
             result = bagged_evaluate_at_p(
                 unwrap(model), dataset, eval_indices, dist_info,
                 p_value=p, bag_K=args.test_bag_K,
@@ -1148,8 +1113,7 @@ def main():
         }
         with open(os.path.join(args.output_dir, "ablation_summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
-
-    # ---- Interaction matrix extraction (rank 0 only) ----
+            
     if env.is_main:
         logger.info("Extracting species interaction matrix...")
         unwrap(model).eval()

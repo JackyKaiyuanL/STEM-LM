@@ -65,9 +65,7 @@ def safe_ece(labels: np.ndarray, preds: np.ndarray, n_bins: int = 15) -> float:
 def safe_cbi(labels: np.ndarray, preds: np.ndarray,
              n_windows: int = 101, width: float = 0.1,
              min_per_window: int = 10) -> float:
-    """Continuous Boyce Index (Hirzel et al. 2006). P/E with background-only
-    denominator; sparse windows (<min_per_window obs) are dropped to suppress
-    small-N noise."""
+    # Continuous Boyce Index (Hirzel et al. 2006)
     if labels.size == 0 or labels.sum() == 0 or labels.sum() == labels.size:
         return float("nan")
     if np.isnan(preds).any():
@@ -126,8 +124,7 @@ def compute_per_species_metrics(probs: np.ndarray,
 
 
 def summarize_per_species_metrics(per_sp: Dict[str, Dict[int, float]]) -> Dict[str, float]:
-    """Mean/median across species. Returns mean_auc_roc, mean_auc_pr,
-    median_auc_pr_lift, mean_cbi, n_species."""
+    # mean_auc_roc, mean_auc_pr, median_auc_pr_lift, mean_cbi, n_species
     def _clean(d):
         return [v for v in d.values() if np.isfinite(v)]
     aucs = _clean(per_sp.get("auc_roc", {}))

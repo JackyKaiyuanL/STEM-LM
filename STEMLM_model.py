@@ -223,12 +223,6 @@ class EnvSourceModule(nn.Module):
         self.layer_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, env_data: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            env_data: (B, N, E) environmental covariates at N source sites
-        Returns:
-            env_embeddings: (B, C_env, H)
-        """
         B = env_data.size(0)
         site_emb = self.proj(self.env_norm(env_data))  # (B, N, H)
         k = self.key_proj(site_emb)

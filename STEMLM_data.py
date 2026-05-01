@@ -298,7 +298,6 @@ class JSDMDataset(Dataset):
 def _spatial_blind_dists(site_lats, site_lons,
                          tgt_idx_np, src_idx_np,
                          spatial_scale_km, euclidean=False):
-    """(B, N) normalized spatial target→source distances for blinding."""
     la_t = site_lats[tgt_idx_np][:, None]
     lo_t = site_lons[tgt_idx_np][:, None]
     la_s = site_lats[src_idx_np]
@@ -697,7 +696,6 @@ def compute_dist_info(
     print(f"  Blind threshold: {blind_threshold:.4f} ({blind_percentile:.3f}th percentile)")
 
     return {
-        # Coord arrays — torch tensors so `.to(device)` moves them uniformly.
         "site_lats":  torch.as_tensor(dataset.lats,  dtype=torch.float32),
         "site_lons":  torch.as_tensor(dataset.lons,  dtype=torch.float32),
         "site_times": torch.as_tensor(dataset.times, dtype=torch.float32),
