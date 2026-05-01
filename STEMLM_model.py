@@ -819,7 +819,10 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
         else:
             self.per_species_env_head = None
 
-    def forward(self, labels=None, loss_weight=None, output_attentions=False, **kwargs):
+    def forward(self, labels=None, loss_weight=None,
+                loss_type: str = "bce",
+                focal_alpha: float = 0.25, focal_gamma: float = 2.0,
+                output_attentions=False, **kwargs):
         target_env = kwargs.get("target_env", None)
         encoder_out = self.model(output_attentions=output_attentions, **kwargs)
         logits = self.cls(encoder_out.last_hidden_state)  # (B, S, T)
@@ -830,16 +833,41 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
         if labels is not None:
             mask = labels != -100
             if mask.any():
-                if loss_weight is None:
-                    loss = F.binary_cross_entropy_with_logits(
-                        logits[mask].float(), labels[mask].float()
-                    )
+                if loss_type == "bce":
+                    if loss_weight is None:
+                        loss = F.binary_cross_entropy_with_logits(
+                            logits[mask].float(), labels[mask].float()
+                        )
+                    else:
+                        per_el = F.binary_cross_entropy_with_logits(
+                            logits[mask].float(), labels[mask].float(), reduction="none"
+                        )
+                        w = loss_weight.unsqueeze(-1).expand_as(labels)[mask]
+                        loss = (per_el * w).sum() / w.sum()
+                elif loss_type == "focal":
+                    # Sigmoid focal loss (Lin et al. 2017, RetinaNet form):
+                    #   FL = -alpha_t * (1 - p_t)^gamma * log(p_t)
+                    #   p_t     = p if y==1 else 1-p
+                    #   alpha_t = alpha if y==1 else 1-alpha   (alpha<0 disables alpha)
+                    x = logits[mask].float()
+                    y = labels[mask].float()
+                    ce = F.binary_cross_entropy_with_logits(x, y, reduction="none")
+                    p = torch.sigmoid(x)
+                    p_t = p * y + (1.0 - p) * (1.0 - y)
+                    modulator = (1.0 - p_t).clamp(min=0.0) ** focal_gamma
+                    if 0.0 <= focal_alpha <= 1.0:
+                        alpha_t = focal_alpha * y + (1.0 - focal_alpha) * (1.0 - y)
+                        per_el = alpha_t * modulator * ce
+                    else:
+                        per_el = modulator * ce
+                    if loss_weight is None:
+                        loss = per_el.mean()
+                    else:
+                        w = loss_weight.unsqueeze(-1).expand_as(labels)[mask]
+                        loss = (per_el * w).sum() / w.sum()
                 else:
-                    per_el = F.binary_cross_entropy_with_logits(
-                        logits[mask].float(), labels[mask].float(), reduction="none"
-                    )
-                    w = loss_weight.unsqueeze(-1).expand_as(labels)[mask]
-                    loss = (per_el * w).sum() / w.sum()
+                    raise ValueError(f"Unknown loss_type: {loss_type!r} "
+                                     f"(expected 'bce' or 'focal')")
 
         return JSDMOutput(
             loss=loss, logits=logits,

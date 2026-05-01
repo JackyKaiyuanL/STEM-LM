@@ -3,7 +3,10 @@ import csv
 import json
 import logging
 import os
+import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from typing import Optional
 
@@ -142,7 +145,9 @@ def compute_class_weights(species_data, train_indices, beta=0.999):
     return torch.tensor(w, dtype=torch.float32)
 
 
-def _forward(model, batch, dist_info, loss_weight=None):
+def _forward(model, batch, dist_info, loss_weight=None,
+             loss_type: str = "bce",
+             focal_alpha: float = 0.25, focal_gamma: float = 2.0):
     return model(
         input_ids=batch["input_ids"],
         source_ids=batch["source_ids"],
@@ -152,6 +157,9 @@ def _forward(model, batch, dist_info, loss_weight=None):
         target_env=batch["target_env"],
         labels=batch["labels"],
         loss_weight=loss_weight,
+        loss_type=loss_type,
+        focal_alpha=focal_alpha,
+        focal_gamma=focal_gamma,
         site_lats=dist_info["site_lats"],
         site_lons=dist_info["site_lons"],
         site_times=dist_info["site_times"],
@@ -162,7 +170,9 @@ def _forward(model, batch, dist_info, loss_weight=None):
 def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
                 loss_weight=None, log_interval=50, max_grad_norm=1.0,
                 amp_dtype=None, grad_scaler=None,
-                grad_accum_steps: int = 1, env: Optional[DistEnv] = None):
+                grad_accum_steps: int = 1, env: Optional[DistEnv] = None,
+                loss_type: str = "bce",
+                focal_alpha: float = 0.25, focal_gamma: float = 2.0):
     """
     amp_dtype: None | torch.bfloat16 | torch.float16
     grad_scaler: torch.amp.GradScaler instance (only used for fp16)
@@ -190,10 +200,14 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
         # ---- forward in autocast region ----
         if use_amp:
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                output = _forward(model, batch, dist_info, loss_weight=w)
+                output = _forward(model, batch, dist_info, loss_weight=w,
+                                  loss_type=loss_type,
+                                  focal_alpha=focal_alpha, focal_gamma=focal_gamma)
                 loss = output.loss
         else:
-            output = _forward(model, batch, dist_info, loss_weight=w)
+            output = _forward(model, batch, dist_info, loss_weight=w,
+                              loss_type=loss_type,
+                              focal_alpha=focal_alpha, focal_gamma=focal_gamma)
             loss = output.loss
 
         loss_to_back = loss / grad_accum_steps
@@ -257,7 +271,9 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
 
 @torch.no_grad()
 def evaluate(model, loader, device, dist_info, amp_dtype=None,
-             env: Optional[DistEnv] = None):
+             env: Optional[DistEnv] = None,
+             loss_type: str = "bce",
+             focal_alpha: float = 0.25, focal_gamma: float = 2.0):
     """
     Distributed-aware single-pass evaluation. Used for per-epoch val.
     - Each rank processes its shard of the data via DistributedSampler.
@@ -280,9 +296,13 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         if use_amp:
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                output = _forward(model, batch, dist_info)
+                output = _forward(model, batch, dist_info,
+                                  loss_type=loss_type,
+                                  focal_alpha=focal_alpha, focal_gamma=focal_gamma)
         else:
-            output = _forward(model, batch, dist_info)
+            output = _forward(model, batch, dist_info,
+                              loss_type=loss_type,
+                              focal_alpha=focal_alpha, focal_gamma=focal_gamma)
 
         total_loss += output.loss.item()
         num_batches += 1
@@ -312,6 +332,9 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
     if max_n == 0:
         empty = {"mean_auc_roc": float("nan"), "mean_auc_pr": float("nan"),
                  "median_auc_pr_lift": float("nan"), "mean_cbi": float("nan"),
+                 "mean_brier": float("nan"), "mean_ece": float("nan"),
+                 "auc_roc_q25": float("nan"), "auc_roc_q50": float("nan"),
+                 "auc_roc_q75": float("nan"),
                  "n_species": 0}
         return total_loss / max(num_batches, 1), 0.0, empty, {}
     probs_arr  = np.full((max_n, S), 0.0, dtype=np.float64)
@@ -454,6 +477,32 @@ def main():
                              "via low-rank A∈(E,r)·B∈(r,S) (A zero-init, monotone safe) "
                              "+ per-species bias. Active in full / no_st ablations; "
                              "silent in no_env / no_st_env. Default 0 (disabled).")
+    parser.add_argument("--loss_type", choices=["bce", "focal"], default="bce",
+                        help="Loss function. 'bce' = sigmoid BCE (default, "
+                             "backward-compatible). 'focal' = sigmoid focal loss "
+                             "(Lin et al. 2017). Focal trades AUC for CBI: on "
+                             "eButterfly, BCE p13 vs focal: AUC 0.882->0.857, "
+                             "CBI 0.298->0.638.")
+    parser.add_argument("--focal_alpha", type=float, default=0.25,
+                        help="Focal loss alpha (positive-class weight). Set <0 "
+                             "to disable alpha-balancing. Ignored when "
+                             "--loss_type=bce. Default 0.25 (RetinaNet).")
+    parser.add_argument("--focal_gamma", type=float, default=2.0,
+                        help="Focal loss focusing parameter. 0 reduces to "
+                             "weighted BCE. Ignored when --loss_type=bce. "
+                             "Default 2.0 (RetinaNet).")
+    parser.add_argument("--save_best_by_cbi", action="store_true",
+                        help="Also save best_model_by_cbi.pt (best-by-val-CBI) "
+                             "alongside best_model.pt (best-by-val-AUC). At "
+                             "end-of-training both are evaluated on test and "
+                             "reported under test_by_selection.")
+    parser.add_argument("--absence_mask_eval", action="store_true",
+                        help="Run a second test block: mask all absences + p "
+                             "fraction of presences (presence-only data "
+                             "scenario).")
+    parser.add_argument("--absence_mask_p_list", type=float, nargs="+",
+                        default=[0.25, 0.5, 0.75, 1.0],
+                        help="Presence-mask rates for absence-mask eval.")
     parser.add_argument("--test_bag_K", type=int, default=10,
                         help="K-pass test-time eval. Each pass uses the SAME mask pattern (the "
                              "FixedPValCollator base_seed is held fixed) and re-seeds only "
@@ -574,6 +623,13 @@ def main():
             f"[{loss_weight.min().item():.3f}, {loss_weight.max().item():.3f}]"
         )
 
+    if args.loss_type == "focal":
+        log_main(env,
+            f"Loss: focal (alpha={args.focal_alpha}, gamma={args.focal_gamma})"
+        )
+    else:
+        log_main(env, "Loss: bce")
+
     use_temporal = dist_info["max_temporal_dist"] > 0
     if not use_temporal:
         log_main(env, "Temporal FIRE bias disabled (no temporal variation in data)")
@@ -687,18 +743,20 @@ def main():
     per_p_header = []
     for p, _ in fixed_val_loaders:
         per_p_header += [f"val_loss_p{p:.2f}", f"val_acc_p{p:.2f}",
-                         f"val_auc_p{p:.2f}", f"val_auprc_p{p:.2f}"]
+                         f"val_auc_p{p:.2f}", f"val_auprc_p{p:.2f}",
+                         f"val_cbi_p{p:.2f}"]
     if env.is_main:
         with open(log_csv, "w", newline="") as f:
             csv.writer(f).writerow(
                 ["epoch", "train_loss", "train_acc",
                  *per_p_header,
                  "val_loss_mean", "val_acc_mean", "val_auc_mean", "val_auprc_mean",
-                 "lr", "elapsed_s"]
+                 "val_cbi_mean", "lr", "elapsed_s"]
             )
 
     best_val_auc_mean = -float("inf")
     best_val_auprc_mean = -float("inf")
+    best_val_cbi_mean = -float("inf")
     start_epoch = 1
 
     # ---- Checkpoint resume (preemption-safe) ----
@@ -714,6 +772,7 @@ def main():
         start_epoch = ckpt["epoch"] + 1
         best_val_auc_mean   = ckpt.get("best_val_auc_mean",   -float("inf"))
         best_val_auprc_mean = ckpt.get("best_val_auprc_mean", -float("inf"))
+        best_val_cbi_mean   = ckpt.get("best_val_cbi_mean",   -float("inf"))
         log_main(env, f"  → resumed at epoch {start_epoch}, "
                       f"best val_auc_mean so far={best_val_auc_mean:.4f}")
     env.barrier()
@@ -726,42 +785,49 @@ def main():
             amp_dtype=amp_dtype, grad_scaler=grad_scaler,
             grad_accum_steps=args.grad_accum_steps,
             env=env,
+            loss_type=args.loss_type,
+            focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
         )
-        per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_nauc = [], [], [], [], []
+        per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_cbi, per_p_nauc = [], [], [], [], [], []
         for p, loader in fixed_val_loaders:
             l, a, summary, per_sp = evaluate(
                 model, loader, device, dist_info, amp_dtype=amp_dtype, env=env,
+                loss_type=args.loss_type,
+                focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
             )
             per_p_loss.append(l)
             per_p_acc.append(a)
             per_p_auc.append(summary["mean_auc_roc"])
             per_p_auprc.append(summary["mean_auc_pr"])
+            per_p_cbi.append(summary.get("mean_cbi", float("nan")))
             per_p_nauc.append(summary["n_species"])
         val_loss_mean  = float(np.mean(per_p_loss))  if per_p_loss  else float("nan")
         val_acc_mean   = float(np.mean(per_p_acc))   if per_p_acc   else float("nan")
         val_auc_mean   = float(np.mean(per_p_auc))   if per_p_auc   else float("nan")
         val_auprc_mean = float(np.mean(per_p_auprc)) if per_p_auprc else float("nan")
+        val_cbi_mean   = float(np.nanmean(per_p_cbi)) if per_p_cbi  else float("nan")
         elapsed = time.time() - t0
         current_lr = scheduler.get_last_lr()[0]
 
         if env.is_main:
             per_p_str = " ".join(
-                f"p{p:.2f}(loss={l:.3f},acc={a:.3f},auc={u:.3f},auprc={ap:.3f},n={n})"
-                for (p, _), l, a, u, ap, n in zip(
-                    fixed_val_loaders, per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_nauc
+                f"p{p:.2f}(loss={l:.3f},acc={a:.3f},auc={u:.3f},auprc={ap:.3f},cbi={c:.3f},n={n})"
+                for (p, _), l, a, u, ap, c, n in zip(
+                    fixed_val_loaders, per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_cbi, per_p_nauc
                 )
             )
             logger.info(
                 f"Epoch {epoch}/{args.num_epochs} | "
                 f"Train loss={train_loss:.4f} acc={train_acc:.4f} | "
-                f"{per_p_str} | mean auc={val_auc_mean:.4f} auprc={val_auprc_mean:.4f} | {elapsed:.1f}s"
+                f"{per_p_str} | mean auc={val_auc_mean:.4f} auprc={val_auprc_mean:.4f} cbi={val_cbi_mean:.4f} | {elapsed:.1f}s"
             )
             with open(log_csv, "a", newline="") as f:
                 row = [epoch, f"{train_loss:.6f}", f"{train_acc:.6f}"]
-                for l, a, u, ap in zip(per_p_loss, per_p_acc, per_p_auc, per_p_auprc):
-                    row += [f"{l:.6f}", f"{a:.6f}", f"{u:.6f}", f"{ap:.6f}"]
+                for l, a, u, ap, c in zip(per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_cbi):
+                    row += [f"{l:.6f}", f"{a:.6f}", f"{u:.6f}", f"{ap:.6f}", f"{c:.6f}"]
                 row += [f"{val_loss_mean:.6f}", f"{val_acc_mean:.6f}",
                         f"{val_auc_mean:.6f}", f"{val_auprc_mean:.6f}",
+                        f"{val_cbi_mean:.6f}",
                         f"{current_lr:.2e}", f"{elapsed:.1f}"]
                 csv.writer(f).writerow(row)
 
@@ -774,6 +840,14 @@ def main():
                 )
                 logger.info(f"  → Best model saved (val_auc_mean={val_auc_mean:.4f})")
 
+            if args.save_best_by_cbi and np.isfinite(val_cbi_mean) and val_cbi_mean > best_val_cbi_mean:
+                best_val_cbi_mean = val_cbi_mean
+                torch.save(
+                    unwrap(model).state_dict(),
+                    os.path.join(args.output_dir, "best_model_by_cbi.pt"),
+                )
+                logger.info(f"  → Best-by-CBI model saved (val_cbi_mean={val_cbi_mean:.4f})")
+
             # Always-overwrite latest-checkpoint for preemption safety
             torch.save({
                 "epoch": epoch,
@@ -783,9 +857,11 @@ def main():
                 "grad_scaler_state_dict": grad_scaler.state_dict() if grad_scaler is not None else None,
                 "best_val_auc_mean": best_val_auc_mean,
                 "best_val_auprc_mean": best_val_auprc_mean,
+                "best_val_cbi_mean": best_val_cbi_mean,
                 "val_loss_mean": val_loss_mean,
                 "val_auc_mean": val_auc_mean,
                 "val_auprc_mean": val_auprc_mean,
+                "val_cbi_mean": val_cbi_mean,
             }, resume_path)
 
             # Periodic numbered checkpoints
@@ -821,6 +897,11 @@ def main():
     per_p_auprc = {}
     per_p_lift = {}
     per_p_cbi = {}
+    per_p_brier = {}
+    per_p_ece = {}
+    per_p_q25 = {}
+    per_p_q50 = {}
+    per_p_q75 = {}
     per_p_per_species: dict = {}
     for p in args.val_p_list:
         result = bagged_evaluate_at_p(
@@ -837,11 +918,18 @@ def main():
         per_p_auprc[p]  = s["mean_auc_pr"]
         per_p_lift[p]   = s["median_auc_pr_lift"]
         per_p_cbi[p]    = s["mean_cbi"]
+        per_p_brier[p]  = s.get("mean_brier", float("nan"))
+        per_p_ece[p]    = s.get("mean_ece", float("nan"))
+        per_p_q25[p]    = s.get("auc_roc_q25", float("nan"))
+        per_p_q50[p]    = s.get("auc_roc_q50", float("nan"))
+        per_p_q75[p]    = s.get("auc_roc_q75", float("nan"))
         per_p_per_species[p] = result["per_species"]
         log_main(env,
             f"{eval_split} p={p:.2f}  bag(K={args.test_bag_K}) "
             f"AUC={s['mean_auc_roc']:.4f}  AUPRC={s['mean_auc_pr']:.4f}  "
             f"PR-lift(med)={s['median_auc_pr_lift']:.2f}  CBI={s['mean_cbi']:.3f}  "
+            f"Brier={per_p_brier[p]:.4f}  ECE={per_p_ece[p]:.4f}  "
+            f"AUCq25/50/75={per_p_q25[p]:.3f}/{per_p_q50[p]:.3f}/{per_p_q75[p]:.3f}  "
             f"(n={s['n_species']})"
         )
     best_mean_auc   = float(np.mean(list(per_p_auc.values())))
@@ -851,6 +939,105 @@ def main():
         f"{eval_split} mean over p={list(per_p_auc.keys())}: "
         f"AUC={best_mean_auc:.4f}  AUPRC={best_mean_auprc:.4f}  CBI={best_mean_cbi:.3f}"
     )
+
+    cbi_sel_per_p_auc = {}
+    cbi_sel_per_p_auprc = {}
+    cbi_sel_per_p_cbi = {}
+    cbi_sel_per_p_ece = {}
+    cbi_sel_mean_auc = float("nan")
+    cbi_sel_mean_auprc = float("nan")
+    cbi_sel_mean_cbi = float("nan")
+    cbi_ckpt_path = os.path.join(args.output_dir, "best_model_by_cbi.pt")
+    if args.save_best_by_cbi and os.path.exists(cbi_ckpt_path):
+        log_main(env, f"Evaluating CBI-selected model on {eval_split} (K={args.test_bag_K})...")
+        unwrap(model).load_state_dict(torch.load(cbi_ckpt_path, map_location=device))
+        for p in args.val_p_list:
+            result = bagged_evaluate_at_p(
+                unwrap(model), dataset, eval_indices, dist_info,
+                p_value=p, bag_K=args.test_bag_K,
+                batch_size=args.batch_size, device=device,
+                num_workers=args.num_workers,
+                base_seed=args.seed + 10_000,
+                amp_dtype=amp_dtype,
+                distributed_sampler=env.is_distributed,
+            )
+            s = result["summary"]
+            cbi_sel_per_p_auc[p]   = s["mean_auc_roc"]
+            cbi_sel_per_p_auprc[p] = s["mean_auc_pr"]
+            cbi_sel_per_p_cbi[p]   = s["mean_cbi"]
+            cbi_sel_per_p_ece[p]   = s.get("mean_ece", float("nan"))
+            log_main(env,
+                f"[cbi-sel] p={p:.2f}  AUC={s['mean_auc_roc']:.4f}  "
+                f"AUPRC={s['mean_auc_pr']:.4f}  CBI={s['mean_cbi']:.3f}  "
+                f"ECE={cbi_sel_per_p_ece[p]:.4f}"
+            )
+        cbi_sel_mean_auc   = float(np.mean(list(cbi_sel_per_p_auc.values())))
+        cbi_sel_mean_auprc = float(np.mean(list(cbi_sel_per_p_auprc.values())))
+        cbi_sel_mean_cbi   = float(np.nanmean(list(cbi_sel_per_p_cbi.values())))
+        log_main(env,
+            f"[cbi-sel] mean: AUC={cbi_sel_mean_auc:.4f}  AUPRC={cbi_sel_mean_auprc:.4f}  "
+            f"CBI={cbi_sel_mean_cbi:.3f}"
+        )
+        unwrap(model).load_state_dict(torch.load(
+            os.path.join(args.output_dir, "best_model.pt"), map_location=device
+        ))
+
+    absmask_per_p_auc = {}
+    absmask_per_p_auprc = {}
+    absmask_per_p_lift = {}
+    absmask_per_p_cbi = {}
+    absmask_per_p_brier = {}
+    absmask_per_p_ece = {}
+    absmask_per_p_q25 = {}
+    absmask_per_p_q50 = {}
+    absmask_per_p_q75 = {}
+    absmask_mean_auc = float("nan")
+    absmask_mean_auprc = float("nan")
+    absmask_mean_cbi = float("nan")
+    if args.absence_mask_eval:
+        from STEMLM_data import AbsenceMaskCollator
+        log_main(env,
+            f"Absence-mask eval on {eval_split} (mask all absences + p "
+            f"presences, K={args.test_bag_K})..."
+        )
+        for p in args.absence_mask_p_list:
+            result = bagged_evaluate_at_p(
+                unwrap(model), dataset, eval_indices, dist_info,
+                p_value=p, bag_K=args.test_bag_K,
+                batch_size=args.batch_size, device=device,
+                num_workers=args.num_workers,
+                base_seed=args.seed + 20_000,
+                amp_dtype=amp_dtype,
+                distributed_sampler=env.is_distributed,
+                collator_cls=AbsenceMaskCollator,
+            )
+            s = result["summary"]
+            absmask_per_p_auc[p]   = s["mean_auc_roc"]
+            absmask_per_p_auprc[p] = s["mean_auc_pr"]
+            absmask_per_p_lift[p]  = s["median_auc_pr_lift"]
+            absmask_per_p_cbi[p]   = s["mean_cbi"]
+            absmask_per_p_brier[p] = s.get("mean_brier", float("nan"))
+            absmask_per_p_ece[p]   = s.get("mean_ece", float("nan"))
+            absmask_per_p_q25[p]   = s.get("auc_roc_q25", float("nan"))
+            absmask_per_p_q50[p]   = s.get("auc_roc_q50", float("nan"))
+            absmask_per_p_q75[p]   = s.get("auc_roc_q75", float("nan"))
+            log_main(env,
+                f"absmask p={p:.2f}  bag(K={args.test_bag_K}) "
+                f"AUC={s['mean_auc_roc']:.4f}  AUPRC={s['mean_auc_pr']:.4f}  "
+                f"PR-lift(med)={s['median_auc_pr_lift']:.2f}  CBI={s['mean_cbi']:.3f}  "
+                f"Brier={absmask_per_p_brier[p]:.4f}  ECE={absmask_per_p_ece[p]:.4f}  "
+                f"AUCq25/50/75={absmask_per_p_q25[p]:.3f}/{absmask_per_p_q50[p]:.3f}/{absmask_per_p_q75[p]:.3f}  "
+                f"(n={s['n_species']})"
+            )
+        if absmask_per_p_auc:
+            absmask_mean_auc   = float(np.mean(list(absmask_per_p_auc.values())))
+            absmask_mean_auprc = float(np.mean(list(absmask_per_p_auprc.values())))
+            absmask_mean_cbi   = float(np.nanmean(list(absmask_per_p_cbi.values())))
+            log_main(env,
+                f"absmask mean over p={list(absmask_per_p_auc.keys())}: "
+                f"AUC={absmask_mean_auc:.4f}  AUPRC={absmask_mean_auprc:.4f}  "
+                f"CBI={absmask_mean_cbi:.3f}"
+            )
 
     if env.is_main:
         import pandas as pd
@@ -873,6 +1060,38 @@ def main():
             os.path.join(args.output_dir, "per_species_auc.csv"), index=False)
         logger.info(f"Per-species metrics saved to {args.output_dir}/per_species_auc.csv")
 
+        test_rows = []
+        for p in args.val_p_list:
+            test_rows.append({
+                "mask_scheme": "uniform", "p": p,
+                "auc": per_p_auc.get(p, float("nan")),
+                "auprc": per_p_auprc.get(p, float("nan")),
+                "pr_lift_median": per_p_lift.get(p, float("nan")),
+                "cbi": per_p_cbi.get(p, float("nan")),
+                "brier": per_p_brier.get(p, float("nan")),
+                "ece": per_p_ece.get(p, float("nan")),
+                "auc_q25": per_p_q25.get(p, float("nan")),
+                "auc_q50": per_p_q50.get(p, float("nan")),
+                "auc_q75": per_p_q75.get(p, float("nan")),
+            })
+        if args.absence_mask_eval:
+            for p in args.absence_mask_p_list:
+                test_rows.append({
+                    "mask_scheme": "absence_mask", "p": p,
+                    "auc": absmask_per_p_auc.get(p, float("nan")),
+                    "auprc": absmask_per_p_auprc.get(p, float("nan")),
+                    "pr_lift_median": absmask_per_p_lift.get(p, float("nan")),
+                    "cbi": absmask_per_p_cbi.get(p, float("nan")),
+                    "brier": absmask_per_p_brier.get(p, float("nan")),
+                    "ece": absmask_per_p_ece.get(p, float("nan")),
+                    "auc_q25": absmask_per_p_q25.get(p, float("nan")),
+                    "auc_q50": absmask_per_p_q50.get(p, float("nan")),
+                    "auc_q75": absmask_per_p_q75.get(p, float("nan")),
+                })
+        pd.DataFrame(test_rows).to_csv(
+            os.path.join(args.output_dir, "test_results.csv"), index=False)
+        logger.info(f"Test results saved to {args.output_dir}/test_results.csv")
+
         summary = {
             "ablation":           config.ablation,
             "num_params":         num_params,
@@ -885,6 +1104,11 @@ def main():
             "test_auprc_by_p":    {f"{p:.2f}": per_p_auprc[p] for p in per_p_auprc},
             "test_auc_by_p":      {f"{p:.2f}": per_p_auc[p]   for p in per_p_auc},
             "test_cbi_by_p":      {f"{p:.2f}": per_p_cbi[p]   for p in per_p_cbi},
+            "test_brier_by_p":    {f"{p:.2f}": per_p_brier[p] for p in per_p_brier},
+            "test_ece_by_p":      {f"{p:.2f}": per_p_ece[p]   for p in per_p_ece},
+            "test_auc_q25_by_p":  {f"{p:.2f}": per_p_q25[p]   for p in per_p_q25},
+            "test_auc_q50_by_p":  {f"{p:.2f}": per_p_q50[p]   for p in per_p_q50},
+            "test_auc_q75_by_p":  {f"{p:.2f}": per_p_q75[p]   for p in per_p_q75},
             "test_pr_lift_median_by_p": {f"{p:.2f}": per_p_lift[p] for p in per_p_lift},
             "eval_split":         eval_split,
             "num_species":        config.num_species,
@@ -892,6 +1116,40 @@ def main():
             "seed":               args.seed,
             "world_size":         env.world_size,
             "mixed_precision":    args.mixed_precision,
+            "loss_type":          args.loss_type,
+            "focal_alpha":        args.focal_alpha if args.loss_type == "focal" else None,
+            "focal_gamma":        args.focal_gamma if args.loss_type == "focal" else None,
+            "best_val_cbi_mean":  best_val_cbi_mean if best_val_cbi_mean > -float("inf") else None,
+            "test_by_selection": {
+                "auc": {
+                    "ckpt": "best_model.pt",
+                    "test_mean_auc":  best_mean_auc,
+                    "test_mean_cbi":  best_mean_cbi,
+                },
+                **({
+                    "cbi": {
+                        "ckpt": "best_model_by_cbi.pt",
+                        "test_mean_auc":  cbi_sel_mean_auc,
+                        "test_mean_auprc": cbi_sel_mean_auprc,
+                        "test_mean_cbi":  cbi_sel_mean_cbi,
+                        "test_auc_by_p":  {f"{p:.2f}": cbi_sel_per_p_auc[p] for p in cbi_sel_per_p_auc},
+                        "test_cbi_by_p":  {f"{p:.2f}": cbi_sel_per_p_cbi[p] for p in cbi_sel_per_p_cbi},
+                        "test_ece_by_p":  {f"{p:.2f}": cbi_sel_per_p_ece[p] for p in cbi_sel_per_p_ece},
+                    }
+                } if cbi_sel_per_p_auc else {})
+            },
+            "absmask_mean_auc":     absmask_mean_auc,
+            "absmask_mean_auprc":   absmask_mean_auprc,
+            "absmask_mean_cbi":     absmask_mean_cbi,
+            "absmask_auc_by_p":     {f"{p:.2f}": absmask_per_p_auc[p]   for p in absmask_per_p_auc},
+            "absmask_auprc_by_p":   {f"{p:.2f}": absmask_per_p_auprc[p] for p in absmask_per_p_auprc},
+            "absmask_cbi_by_p":     {f"{p:.2f}": absmask_per_p_cbi[p]   for p in absmask_per_p_cbi},
+            "absmask_brier_by_p":   {f"{p:.2f}": absmask_per_p_brier[p] for p in absmask_per_p_brier},
+            "absmask_ece_by_p":     {f"{p:.2f}": absmask_per_p_ece[p]   for p in absmask_per_p_ece},
+            "absmask_auc_q25_by_p": {f"{p:.2f}": absmask_per_p_q25[p]   for p in absmask_per_p_q25},
+            "absmask_auc_q50_by_p": {f"{p:.2f}": absmask_per_p_q50[p]   for p in absmask_per_p_q50},
+            "absmask_auc_q75_by_p": {f"{p:.2f}": absmask_per_p_q75[p]   for p in absmask_per_p_q75},
+            "absmask_pr_lift_median_by_p": {f"{p:.2f}": absmask_per_p_lift[p] for p in absmask_per_p_lift},
         }
         with open(os.path.join(args.output_dir, "ablation_summary.json"), "w") as f:
             json.dump(summary, f, indent=2)

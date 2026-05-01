@@ -442,6 +442,71 @@ class JSDMDataCollator:
         return batch
 
 
+class AbsenceMaskCollator(JSDMDataCollator):
+    """Mask all absences + p fraction of presences."""
+    def __init__(self, p,
+                 site_lats=None, site_lons=None, site_times=None,
+                 spatial_scale_km=1.0, euclidean=False,
+                 blind_threshold=None, base_seed=0):
+        super().__init__(p=p,
+                         site_lats=site_lats, site_lons=site_lons, site_times=site_times,
+                         spatial_scale_km=spatial_scale_km,
+                         euclidean=euclidean,
+                         blind_threshold=blind_threshold,
+                         mask_token_prob=1.0)
+        self.p = float(p)
+        self.base_seed = int(base_seed)
+
+    def __call__(self, examples):
+        batch = {k: torch.stack([ex[k] for ex in examples]) for k in examples[0].keys()}
+        target_species = batch["target_species"]
+        source_species = batch["source_species"]
+        B, S = target_species.shape
+
+        seed = self.base_seed + int(batch["target_idx"][0].item())
+        g = torch.Generator().manual_seed(seed)
+
+        is_absence = (target_species == 0)
+        is_presence = (target_species == 1)
+        presence_mask = is_presence & torch.bernoulli(
+            torch.full((B, S), self.p), generator=g
+        ).bool()
+        masked = is_absence | presence_mask
+        for b in range(B):
+            if not masked[b].any():
+                masked[b, torch.randint(S, (1,), generator=g)] = True
+
+        target_ids = target_species.long()
+        target_ids[masked] = 2
+
+        source_ids = source_species.long()
+        if self._has_coords and self.blind_threshold is not None:
+            src_idx = batch["source_idx"].numpy()
+            tgt_idx = batch["target_idx"].numpy()
+            blind_dists = _spatial_blind_dists(
+                self.site_lats, self.site_lons,
+                tgt_idx, src_idx,
+                self.spatial_scale_km, euclidean=self.euclidean,
+            )
+            is_blind = blind_dists <= self.blind_threshold
+            blind_mask = masked[:, :, None] & is_blind[:, None, :]
+            source_ids[blind_mask] = 2
+        else:
+            source_ids[masked[:, :, None].expand_as(source_ids)] = 2
+
+        labels = target_species.clone()
+        labels[~masked] = -100
+
+        batch["input_ids"] = target_ids.unsqueeze(-1)
+        batch["source_ids"] = source_ids
+        batch["labels"] = labels.unsqueeze(-1)
+        batch["env_data"] = batch.pop("source_env")
+        batch["target_site_idx"] = batch.pop("target_idx").unsqueeze(-1)
+        del batch["target_species"]
+        del batch["source_species"]
+        return batch
+
+
 class FixedPValCollator(JSDMDataCollator):
     def __init__(self, p,
                  site_lats=None, site_lons=None, site_times=None,

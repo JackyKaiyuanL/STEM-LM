@@ -41,25 +41,53 @@ def auc_pr_lift(labels: np.ndarray, preds: np.ndarray,
     return (pr / prevalence) if np.isfinite(pr) else float("nan")
 
 
+def safe_brier(labels: np.ndarray, preds: np.ndarray) -> float:
+    if labels.size == 0 or np.isnan(preds).any():
+        return float("nan")
+    return float(np.mean((preds - labels.astype(np.float64)) ** 2))
+
+
+def safe_ece(labels: np.ndarray, preds: np.ndarray, n_bins: int = 15) -> float:
+    if labels.size == 0 or np.isnan(preds).any():
+        return float("nan")
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    idx = np.clip(np.digitize(preds, edges) - 1, 0, n_bins - 1)
+    err = 0.0
+    n = preds.size
+    for b in range(n_bins):
+        m = idx == b
+        if not m.any():
+            continue
+        err += (m.sum() / n) * abs(labels[m].mean() - preds[m].mean())
+    return float(err)
+
+
 def safe_cbi(labels: np.ndarray, preds: np.ndarray,
-             n_windows: int = 101, width: float = 0.1) -> float:
-    if labels.size == 0 or labels.sum() == 0:
+             n_windows: int = 101, width: float = 0.1,
+             min_per_window: int = 10) -> float:
+    """Continuous Boyce Index (Hirzel et al. 2006). P/E with background-only
+    denominator; sparse windows (<min_per_window obs) are dropped to suppress
+    small-N noise."""
+    if labels.size == 0 or labels.sum() == 0 or labels.sum() == labels.size:
         return float("nan")
     if np.isnan(preds).any():
         return float("nan")
     pres_preds = preds[labels == 1]
+    bg_preds = preds[labels == 0]
+    if bg_preds.size == 0 or pres_preds.size == 0:
+        return float("nan")
     centers = np.linspace(0.0, 1.0, n_windows)
     half_w = width / 2.0
     pe = np.full(n_windows, np.nan, dtype=np.float64)
     for i, ctr in enumerate(centers):
         lo, hi = ctr - half_w, ctr + half_w
-        in_w = (preds >= lo) & (preds <= hi)
-        if not in_w.any():
+        n_bg = int(((bg_preds >= lo) & (bg_preds <= hi)).sum())
+        if n_bg < min_per_window:
             continue
-        e_frac = in_w.sum() / preds.size
+        e_frac = n_bg / bg_preds.size
         if e_frac == 0:
             continue
-        p_frac = ((pres_preds >= lo) & (pres_preds <= hi)).sum() / max(pres_preds.size, 1)
+        p_frac = ((pres_preds >= lo) & (pres_preds <= hi)).sum() / pres_preds.size
         pe[i] = p_frac / e_frac
     ok = np.isfinite(pe)
     if ok.sum() < 3 or np.unique(pe[ok]).size < 2:
@@ -78,6 +106,7 @@ def compute_per_species_metrics(probs: np.ndarray,
     S = probs.shape[1]
     out: Dict[str, Dict[int, float]] = {
         "auc_roc": {}, "auc_pr": {}, "auc_pr_lift": {}, "cbi": {},
+        "brier": {}, "ece": {},
     }
     for s in range(S):
         mask = labels[:, s] != -100
@@ -91,6 +120,8 @@ def compute_per_species_metrics(probs: np.ndarray,
         out["auc_pr"][s] = pr
         out["auc_pr_lift"][s] = (pr / prev) if (np.isfinite(pr) and prev > 0) else float("nan")
         out["cbi"][s] = safe_cbi(y, p)
+        out["brier"][s] = safe_brier(y, p)
+        out["ece"][s] = safe_ece(y, p)
     return out
 
 
@@ -103,11 +134,18 @@ def summarize_per_species_metrics(per_sp: Dict[str, Dict[int, float]]) -> Dict[s
     prs = _clean(per_sp.get("auc_pr", {}))
     lifts = _clean(per_sp.get("auc_pr_lift", {}))
     cbis = _clean(per_sp.get("cbi", {}))
+    briers = _clean(per_sp.get("brier", {}))
+    eces = _clean(per_sp.get("ece", {}))
     return {
         "mean_auc_roc":       float(np.mean(aucs)) if aucs else float("nan"),
         "mean_auc_pr":        float(np.mean(prs)) if prs else float("nan"),
         "median_auc_pr_lift": float(np.median(lifts)) if lifts else float("nan"),
         "mean_cbi":           float(np.mean(cbis)) if cbis else float("nan"),
+        "mean_brier":         float(np.mean(briers)) if briers else float("nan"),
+        "mean_ece":           float(np.mean(eces)) if eces else float("nan"),
+        "auc_roc_q25":        float(np.quantile(aucs, 0.25)) if aucs else float("nan"),
+        "auc_roc_q50":        float(np.quantile(aucs, 0.50)) if aucs else float("nan"),
+        "auc_roc_q75":        float(np.quantile(aucs, 0.75)) if aucs else float("nan"),
         "n_species":          len(aucs),
     }
 
@@ -190,7 +228,8 @@ def evaluate_loader(model, loader, device, dist_info, amp_dtype=None):
 def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float,
                          bag_K: int, batch_size: int, device,
                          num_workers: int = 0, base_seed: int = 0,
-                         amp_dtype=None, distributed_sampler: bool = False) -> Dict:
+                         amp_dtype=None, distributed_sampler: bool = False,
+                         collator_cls=None) -> Dict:
     model.eval()
     use_amp = amp_dtype is not None and device.type == "cuda"
     dist_info_dev = _move_dist_info(dist_info, device)
@@ -202,7 +241,8 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
     is_distributed = bool(distributed_sampler) and torch.distributed.is_initialized()
 
     mask_seed = base_seed + int(round(p_value * 1000))
-    collator = FixedPValCollator(
+    cls = collator_cls if collator_cls is not None else FixedPValCollator
+    collator = cls(
         p=p_value,
         site_lats=dist_info["site_lats"],
         site_lons=dist_info["site_lons"],
@@ -263,6 +303,9 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
     if not indices:
         empty = {"mean_auc_roc": float("nan"), "mean_auc_pr": float("nan"),
                  "median_auc_pr_lift": float("nan"), "mean_cbi": float("nan"),
+                 "mean_brier": float("nan"), "mean_ece": float("nan"),
+                 "auc_roc_q25": float("nan"), "auc_roc_q50": float("nan"),
+                 "auc_roc_q75": float("nan"),
                  "n_species": 0}
         return {"p": p_value, "K": bag_K, "summary": empty, "per_species": {},
                 "single_pass_summary": empty}
