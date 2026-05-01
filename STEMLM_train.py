@@ -491,11 +491,6 @@ def main():
                         help="Focal loss focusing parameter. 0 reduces to "
                              "weighted BCE. Ignored when --loss_type=bce. "
                              "Default 2.0 (RetinaNet).")
-    parser.add_argument("--save_best_by_cbi", action="store_true",
-                        help="Also save best_model_by_cbi.pt (best-by-val-CBI) "
-                             "alongside best_model.pt (best-by-val-AUC). At "
-                             "end-of-training both are evaluated on test and "
-                             "reported under test_by_selection.")
     parser.add_argument("--absence_mask_eval", action="store_true",
                         help="Run a second test block: mask all absences + p "
                              "fraction of presences (presence-only data "
@@ -840,7 +835,7 @@ def main():
                 )
                 logger.info(f"  → Best model saved (val_auc_mean={val_auc_mean:.4f})")
 
-            if args.save_best_by_cbi and np.isfinite(val_cbi_mean) and val_cbi_mean > best_val_cbi_mean:
+            if np.isfinite(val_cbi_mean) and val_cbi_mean > best_val_cbi_mean:
                 best_val_cbi_mean = val_cbi_mean
                 torch.save(
                     unwrap(model).state_dict(),
@@ -948,7 +943,7 @@ def main():
     cbi_sel_mean_auprc = float("nan")
     cbi_sel_mean_cbi = float("nan")
     cbi_ckpt_path = os.path.join(args.output_dir, "best_model_by_cbi.pt")
-    if args.save_best_by_cbi and os.path.exists(cbi_ckpt_path):
+    if os.path.exists(cbi_ckpt_path):
         log_main(env, f"Evaluating CBI-selected model on {eval_split} (K={args.test_bag_K})...")
         unwrap(model).load_state_dict(torch.load(cbi_ckpt_path, map_location=device))
         for p in args.val_p_list:
