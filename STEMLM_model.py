@@ -236,7 +236,7 @@ class EnvSourceModule(nn.Module):
 
 # =============================================================================
 # Row Self-Attention along species axis
-# Species attend to each other — the interaction term.
+# Species attend to each other — the cooccurrence term.
 # =============================================================================
 
 class SpeciesSelfAttention(nn.Module):
@@ -873,11 +873,10 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
 
 
 # =============================================================================
-# Extract interaction matrix
+# Extract cooccurrence matrix
 # =============================================================================
 
-def extract_interaction_matrix(output: JSDMOutput, layer_idx: int = -1) -> torch.Tensor:
-    """Extract S×S species interaction from self-attention. (B, S, S)"""
+def extract_cooccurrence_matrix(output: JSDMOutput, layer_idx: int = -1) -> torch.Tensor:
     if output.species_attentions is None:
         raise ValueError("Run with output_attentions=True")
     attn = output.species_attentions[layer_idx]

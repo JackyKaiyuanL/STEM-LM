@@ -44,12 +44,15 @@ on a uniform-mask block AND a presence-only (absence-mask) block.
 | Use case | Recipe |
 |---|---|
 | Habitat-suitability mapping (uses ranking) | **focal γ=1**, no class_weighting |
-| Occupancy modeling (uses absolute probabilities) | **BCE + `--class_weighting`** |
+| Occupancy modeling (uses absolute probabilities) | **BCE**, no class_weighting |
 | Maximum CBI (suitability gradient only) | focal γ=2, no class_weighting |
 
-On eButterfly: focal γ=1 → AUC@p=1=0.86, CBI=0.79, ECE=0.028. BCE+cw → AUC=0.86,
-CBI=0.54, ECE=0.013. Focal trades a small AUC for big CBI gains; γ=2 maximizes
-CBI but degrades ECE 6×.
+Focal trades a small AUC for big CBI gains; γ=2 maximizes CBI but degrades ECE.
+
+**Note on `--class_weighting`.** On datasets with balanced per-species presence
+counts, cw is a near-no-op with BCE and actively hurts focal (subsumed by
+γ-modulation). On heavily long-tailed datasets it may help BCE recover
+rare-species calibration. Worth re-checking per dataset.
 
 ## Key options
 
@@ -126,7 +129,7 @@ Each `--output_dir` gets:
 - `test_results.csv` flat test metrics by mask scheme × p
 - `per_species_auc.csv` per-species AUC / AUPRC / CBI per p
 - `ablation_summary.json` test metrics for both checkpoints + both mask schemes
-- `interaction_matrix.npy` learned species-species attention
+- `cooccurrence_matrix.npy` learned species-species attention
 
 ## Inference
 

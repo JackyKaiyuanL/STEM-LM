@@ -19,7 +19,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-from STEMLM_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_interaction_matrix
+from STEMLM_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_cooccurrence_matrix
 from STEMLM_data import create_dataloaders, save_splits, load_splits, build_val_loaders_fixed_p
 from STEMLM_metric import (
     compute_per_species_metrics,
@@ -414,9 +414,9 @@ def main():
                              "with --fold random.")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                         help="Gradient clipping max norm (default 1.0).")
-    parser.add_argument("--interaction_extract_batches", type=int, default=20,
+    parser.add_argument("--cooccurrence_extract_batches", type=int, default=20,
                         help="Number of val batches used to estimate the species "
-                             "interaction matrix at the end of training (default 20).")
+                             "cooccurrence matrix at the end of training (default 20).")
     parser.add_argument("--splits_path", type=str, default=None,
                         help="Path to a splits.json (written by a previous training run). "
                              "When set, overrides --fold / --resolution / "
@@ -1107,12 +1107,12 @@ def main():
             json.dump(summary, f, indent=2)
             
     if env.is_main:
-        logger.info("Extracting species interaction matrix...")
+        logger.info("Extracting species cooccurrence matrix...")
         unwrap(model).eval()
-        interactions = []
+        cooccurrences = []
         with torch.no_grad():
             for i, batch in enumerate(val_loader):
-                if i >= args.interaction_extract_batches:
+                if i >= args.cooccurrence_extract_batches:
                     break
                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                 output = unwrap(model)(
@@ -1127,10 +1127,10 @@ def main():
                     euclidean=dist_info.get("euclidean", False),
                     output_attentions=True,
                 )
-                interactions.append(extract_interaction_matrix(output).cpu())
+                cooccurrences.append(extract_cooccurrence_matrix(output).cpu())
 
-        interaction_matrix = torch.cat(interactions, dim=0).mean(dim=0).numpy()
-        np.save(os.path.join(args.output_dir, "interaction_matrix.npy"), interaction_matrix)
+        cooccurrence_matrix = torch.cat(cooccurrences, dim=0).mean(dim=0).numpy()
+        np.save(os.path.join(args.output_dir, "cooccurrence_matrix.npy"), cooccurrence_matrix)
 
         with open(os.path.join(args.output_dir, "species_names.json"), "w") as f:
             json.dump(dataset.species_cols, f)
