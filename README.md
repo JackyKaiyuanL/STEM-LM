@@ -13,7 +13,7 @@ or passed via `--env_cols`.
 | `STEMLM_model.py` | Model: species self-attn, ST + env cross-attn, FIRE distance bias. `JSDMConfig.ablation` ∈ `{full, no_st, no_env, no_st_env}`. |
 | `STEMLM_data.py` | Dataset, collators (uniform-mask + absence-mask), H3 / grid block CV splits. |
 | `STEMLM_train.py` | Training, per-epoch val, end-of-training K-pass-bagged test eval. |
-| `STEMLM_metric.py` | AUC / AUPRC / PR-lift / CBI / Brier / ECE primitives + `bagged_evaluate_at_p`. Library only — no CLI. |
+| `STEMLM_metric.py` | AUC / AUPRC / CBI / Brier / ECE primitives + `bagged_evaluate_at_p`. Library only — no CLI. |
 
 ## Quickstart
 
@@ -124,7 +124,7 @@ Each `--output_dir` gets:
 - `config.json`, `species_names.json`, `splits.json`
 - `training_log.csv` per-epoch metrics
 - `test_results.csv` flat test metrics by mask scheme × p
-- `per_species_auc.csv` per-species AUC / AUPRC / PR-lift / CBI per p
+- `per_species_auc.csv` per-species AUC / AUPRC / CBI per p
 - `ablation_summary.json` test metrics for both checkpoints + both mask schemes
 - `interaction_matrix.npy` learned species-species attention
 

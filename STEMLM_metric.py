@@ -31,16 +31,6 @@ def safe_auc_pr(labels: np.ndarray, preds: np.ndarray) -> float:
         return float("nan")
 
 
-def auc_pr_lift(labels: np.ndarray, preds: np.ndarray,
-                prevalence: Optional[float] = None) -> float:
-    if prevalence is None:
-        prevalence = float(labels.mean()) if labels.size > 0 else 0.0
-    if prevalence <= 0.0:
-        return float("nan")
-    pr = safe_auc_pr(labels, preds)
-    return (pr / prevalence) if np.isfinite(pr) else float("nan")
-
-
 def safe_brier(labels: np.ndarray, preds: np.ndarray) -> float:
     if labels.size == 0 or np.isnan(preds).any():
         return float("nan")
@@ -103,7 +93,7 @@ def compute_per_species_metrics(probs: np.ndarray,
         raise ValueError(f"probs {probs.shape} != labels {labels.shape}")
     S = probs.shape[1]
     out: Dict[str, Dict[int, float]] = {
-        "auc_roc": {}, "auc_pr": {}, "auc_pr_lift": {}, "cbi": {},
+        "auc_roc": {}, "auc_pr": {}, "cbi": {},
         "brier": {}, "ece": {},
     }
     for s in range(S):
@@ -112,11 +102,8 @@ def compute_per_species_metrics(probs: np.ndarray,
         p = probs[mask, s].astype(np.float64)
         if y.size == 0 or 0 == y.sum() or y.sum() == y.size:
             continue
-        prev = float(y.mean())
         out["auc_roc"][s] = safe_auc_roc(y, p)
-        pr = safe_auc_pr(y, p)
-        out["auc_pr"][s] = pr
-        out["auc_pr_lift"][s] = (pr / prev) if (np.isfinite(pr) and prev > 0) else float("nan")
+        out["auc_pr"][s] = safe_auc_pr(y, p)
         out["cbi"][s] = safe_cbi(y, p)
         out["brier"][s] = safe_brier(y, p)
         out["ece"][s] = safe_ece(y, p)
@@ -124,26 +111,23 @@ def compute_per_species_metrics(probs: np.ndarray,
 
 
 def summarize_per_species_metrics(per_sp: Dict[str, Dict[int, float]]) -> Dict[str, float]:
-    # mean_auc_roc, mean_auc_pr, median_auc_pr_lift, mean_cbi, n_species
     def _clean(d):
         return [v for v in d.values() if np.isfinite(v)]
     aucs = _clean(per_sp.get("auc_roc", {}))
     prs = _clean(per_sp.get("auc_pr", {}))
-    lifts = _clean(per_sp.get("auc_pr_lift", {}))
     cbis = _clean(per_sp.get("cbi", {}))
     briers = _clean(per_sp.get("brier", {}))
     eces = _clean(per_sp.get("ece", {}))
     return {
-        "mean_auc_roc":       float(np.mean(aucs)) if aucs else float("nan"),
-        "mean_auc_pr":        float(np.mean(prs)) if prs else float("nan"),
-        "median_auc_pr_lift": float(np.median(lifts)) if lifts else float("nan"),
-        "mean_cbi":           float(np.mean(cbis)) if cbis else float("nan"),
-        "mean_brier":         float(np.mean(briers)) if briers else float("nan"),
-        "mean_ece":           float(np.mean(eces)) if eces else float("nan"),
-        "auc_roc_q25":        float(np.quantile(aucs, 0.25)) if aucs else float("nan"),
-        "auc_roc_q50":        float(np.quantile(aucs, 0.50)) if aucs else float("nan"),
-        "auc_roc_q75":        float(np.quantile(aucs, 0.75)) if aucs else float("nan"),
-        "n_species":          len(aucs),
+        "mean_auc_roc": float(np.mean(aucs)) if aucs else float("nan"),
+        "mean_auc_pr":  float(np.mean(prs)) if prs else float("nan"),
+        "mean_cbi":     float(np.mean(cbis)) if cbis else float("nan"),
+        "mean_brier":   float(np.mean(briers)) if briers else float("nan"),
+        "mean_ece":     float(np.mean(eces)) if eces else float("nan"),
+        "auc_roc_q25":  float(np.quantile(aucs, 0.25)) if aucs else float("nan"),
+        "auc_roc_q50":  float(np.quantile(aucs, 0.50)) if aucs else float("nan"),
+        "auc_roc_q75":  float(np.quantile(aucs, 0.75)) if aucs else float("nan"),
+        "n_species":    len(aucs),
     }
 
 def run_forward(model, batch, dist_info, device, output_attentions=False):
@@ -299,7 +283,7 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
     indices = sorted(sum_probs.keys())
     if not indices:
         empty = {"mean_auc_roc": float("nan"), "mean_auc_pr": float("nan"),
-                 "median_auc_pr_lift": float("nan"), "mean_cbi": float("nan"),
+                 "mean_cbi": float("nan"),
                  "mean_brier": float("nan"), "mean_ece": float("nan"),
                  "auc_roc_q25": float("nan"), "auc_roc_q50": float("nan"),
                  "auc_roc_q75": float("nan"),

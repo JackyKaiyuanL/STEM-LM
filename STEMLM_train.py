@@ -307,7 +307,7 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
     max_n = max((len(species_labels[s]) for s in range(S)), default=0)
     if max_n == 0:
         empty = {"mean_auc_roc": float("nan"), "mean_auc_pr": float("nan"),
-                 "median_auc_pr_lift": float("nan"), "mean_cbi": float("nan"),
+                 "mean_cbi": float("nan"),
                  "mean_brier": float("nan"), "mean_ece": float("nan"),
                  "auc_roc_q25": float("nan"), "auc_roc_q50": float("nan"),
                  "auc_roc_q75": float("nan"),
@@ -843,7 +843,6 @@ def main():
 
     per_p_auc = {}
     per_p_auprc = {}
-    per_p_lift = {}
     per_p_cbi = {}
     per_p_brier = {}
     per_p_ece = {}
@@ -864,7 +863,6 @@ def main():
         s = result["summary"]
         per_p_auc[p]    = s["mean_auc_roc"]
         per_p_auprc[p]  = s["mean_auc_pr"]
-        per_p_lift[p]   = s["median_auc_pr_lift"]
         per_p_cbi[p]    = s["mean_cbi"]
         per_p_brier[p]  = s.get("mean_brier", float("nan"))
         per_p_ece[p]    = s.get("mean_ece", float("nan"))
@@ -874,10 +872,11 @@ def main():
         per_p_per_species[p] = result["per_species"]
         log_main(env,
             f"{eval_split} p={p:.2f}  bag(K={args.test_bag_K}) "
-            f"AUC={s['mean_auc_roc']:.4f}  AUPRC={s['mean_auc_pr']:.4f}  "
-            f"PR-lift(med)={s['median_auc_pr_lift']:.2f}  CBI={s['mean_cbi']:.3f}  "
-            f"Brier={per_p_brier[p]:.4f}  ECE={per_p_ece[p]:.4f}  "
+            f"AUC={s['mean_auc_roc']:.4f}  "
             f"AUCq25/50/75={per_p_q25[p]:.3f}/{per_p_q50[p]:.3f}/{per_p_q75[p]:.3f}  "
+            f"AUPRC={s['mean_auc_pr']:.4f}  "
+            f"CBI={s['mean_cbi']:.3f}  "
+            f"Brier={per_p_brier[p]:.4f}  ECE={per_p_ece[p]:.4f}  "
             f"(n={s['n_species']})"
         )
     best_mean_auc   = float(np.mean(list(per_p_auc.values())))
@@ -932,7 +931,6 @@ def main():
 
     absmask_per_p_auc = {}
     absmask_per_p_auprc = {}
-    absmask_per_p_lift = {}
     absmask_per_p_cbi = {}
     absmask_per_p_brier = {}
     absmask_per_p_ece = {}
@@ -952,7 +950,6 @@ def main():
             if p == 1.0 and 1.0 in per_p_auc:
                 absmask_per_p_auc[p]   = per_p_auc[p]
                 absmask_per_p_auprc[p] = per_p_auprc[p]
-                absmask_per_p_lift[p]  = per_p_lift[p]
                 absmask_per_p_cbi[p]   = per_p_cbi[p]
                 absmask_per_p_brier[p] = per_p_brier[p]
                 absmask_per_p_ece[p]   = per_p_ece[p]
@@ -974,7 +971,6 @@ def main():
             s = result["summary"]
             absmask_per_p_auc[p]   = s["mean_auc_roc"]
             absmask_per_p_auprc[p] = s["mean_auc_pr"]
-            absmask_per_p_lift[p]  = s["median_auc_pr_lift"]
             absmask_per_p_cbi[p]   = s["mean_cbi"]
             absmask_per_p_brier[p] = s.get("mean_brier", float("nan"))
             absmask_per_p_ece[p]   = s.get("mean_ece", float("nan"))
@@ -983,10 +979,11 @@ def main():
             absmask_per_p_q75[p]   = s.get("auc_roc_q75", float("nan"))
             log_main(env,
                 f"absmask p={p:.2f}  bag(K={args.test_bag_K}) "
-                f"AUC={s['mean_auc_roc']:.4f}  AUPRC={s['mean_auc_pr']:.4f}  "
-                f"PR-lift(med)={s['median_auc_pr_lift']:.2f}  CBI={s['mean_cbi']:.3f}  "
-                f"Brier={absmask_per_p_brier[p]:.4f}  ECE={absmask_per_p_ece[p]:.4f}  "
+                f"AUC={s['mean_auc_roc']:.4f}  "
                 f"AUCq25/50/75={absmask_per_p_q25[p]:.3f}/{absmask_per_p_q50[p]:.3f}/{absmask_per_p_q75[p]:.3f}  "
+                f"AUPRC={s['mean_auc_pr']:.4f}  "
+                f"CBI={s['mean_cbi']:.3f}  "
+                f"Brier={absmask_per_p_brier[p]:.4f}  ECE={absmask_per_p_ece[p]:.4f}  "
                 f"(n={s['n_species']})"
             )
         if absmask_per_p_auc:
@@ -1011,7 +1008,6 @@ def main():
                 ps = per_p_per_species[p]
                 row[f"auc_p{p:.2f}"]      = ps.get("auc_roc",     {}).get(sp, float("nan"))
                 row[f"auprc_p{p:.2f}"]    = ps.get("auc_pr",      {}).get(sp, float("nan"))
-                row[f"prlift_p{p:.2f}"]   = ps.get("auc_pr_lift", {}).get(sp, float("nan"))
                 row[f"cbi_p{p:.2f}"]      = ps.get("cbi",         {}).get(sp, float("nan"))
             row["auc_mean"]   = float(np.nanmean([row[f"auc_p{p:.2f}"]   for p in args.val_p_list]))
             row["auprc_mean"] = float(np.nanmean([row[f"auprc_p{p:.2f}"] for p in args.val_p_list]))
@@ -1025,28 +1021,26 @@ def main():
             test_rows.append({
                 "mask_scheme": "uniform", "p": p,
                 "auc": per_p_auc.get(p, float("nan")),
-                "auprc": per_p_auprc.get(p, float("nan")),
-                "pr_lift_median": per_p_lift.get(p, float("nan")),
-                "cbi": per_p_cbi.get(p, float("nan")),
-                "brier": per_p_brier.get(p, float("nan")),
-                "ece": per_p_ece.get(p, float("nan")),
                 "auc_q25": per_p_q25.get(p, float("nan")),
                 "auc_q50": per_p_q50.get(p, float("nan")),
                 "auc_q75": per_p_q75.get(p, float("nan")),
+                "auprc": per_p_auprc.get(p, float("nan")),
+                "cbi": per_p_cbi.get(p, float("nan")),
+                "brier": per_p_brier.get(p, float("nan")),
+                "ece": per_p_ece.get(p, float("nan")),
             })
-        if args.absence_mask_eval:
+        if not args.no_absence_mask_eval:
             for p in args.absence_mask_p_list:
                 test_rows.append({
                     "mask_scheme": "absence_mask", "p": p,
                     "auc": absmask_per_p_auc.get(p, float("nan")),
-                    "auprc": absmask_per_p_auprc.get(p, float("nan")),
-                    "pr_lift_median": absmask_per_p_lift.get(p, float("nan")),
-                    "cbi": absmask_per_p_cbi.get(p, float("nan")),
-                    "brier": absmask_per_p_brier.get(p, float("nan")),
-                    "ece": absmask_per_p_ece.get(p, float("nan")),
                     "auc_q25": absmask_per_p_q25.get(p, float("nan")),
                     "auc_q50": absmask_per_p_q50.get(p, float("nan")),
                     "auc_q75": absmask_per_p_q75.get(p, float("nan")),
+                    "auprc": absmask_per_p_auprc.get(p, float("nan")),
+                    "cbi": absmask_per_p_cbi.get(p, float("nan")),
+                    "brier": absmask_per_p_brier.get(p, float("nan")),
+                    "ece": absmask_per_p_ece.get(p, float("nan")),
                 })
         pd.DataFrame(test_rows).to_csv(
             os.path.join(args.output_dir, "test_results.csv"), index=False)
@@ -1069,7 +1063,6 @@ def main():
             "test_auc_q25_by_p":  {f"{p:.2f}": per_p_q25[p]   for p in per_p_q25},
             "test_auc_q50_by_p":  {f"{p:.2f}": per_p_q50[p]   for p in per_p_q50},
             "test_auc_q75_by_p":  {f"{p:.2f}": per_p_q75[p]   for p in per_p_q75},
-            "test_pr_lift_median_by_p": {f"{p:.2f}": per_p_lift[p] for p in per_p_lift},
             "eval_split":         eval_split,
             "num_species":        config.num_species,
             "num_epochs":         args.num_epochs,
@@ -1109,7 +1102,6 @@ def main():
             "absmask_auc_q25_by_p": {f"{p:.2f}": absmask_per_p_q25[p]   for p in absmask_per_p_q25},
             "absmask_auc_q50_by_p": {f"{p:.2f}": absmask_per_p_q50[p]   for p in absmask_per_p_q50},
             "absmask_auc_q75_by_p": {f"{p:.2f}": absmask_per_p_q75[p]   for p in absmask_per_p_q75},
-            "absmask_pr_lift_median_by_p": {f"{p:.2f}": absmask_per_p_lift[p] for p in absmask_per_p_lift},
         }
         with open(os.path.join(args.output_dir, "ablation_summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
