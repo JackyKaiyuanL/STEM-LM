@@ -442,7 +442,7 @@ def main():
                         help="Disable zero-init of the periodic columns of FIRE's input "
                              "linear. By default the periodic contribution starts at zero "
                              "so the monotone bias is unaffected at step 0.")
-    parser.add_argument("--per_species_env_rank", type=int, default=0,
+    parser.add_argument("--per_species_env_rank", type=int, default=8,
                         help="Rank of the parallel per-species env head bolted in "
                              "alongside the shared env encoder. Reads raw target_env "
                              "via low-rank A∈(E,r)·B∈(r,S) (A zero-init, monotone safe) "

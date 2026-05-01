@@ -52,7 +52,7 @@ class JSDMConfig:
 
     ablation: str = "full"  # full | no_st | no_env | no_st_env
 
-    per_species_env_rank: int = 0
+    per_species_env_rank: int = 8
 
     # Training — per-row mask rate (float in [0,1], "unif[:lo,hi]" for Uniform, or "beta:a,b" for Beta).
     p: "float | str" = 0.15

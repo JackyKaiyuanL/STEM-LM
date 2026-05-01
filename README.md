@@ -78,7 +78,7 @@ rare-species calibration. Worth re-checking per dataset.
 
 **Model**
 - `--hidden_size 256 --num_attention_heads 8 --num_hidden_layers 4 --intermediate_size 512`
-- `--num_env_groups 3 --dropout 0.1`
+- `--num_env_groups 5 --dropout 0.1`
 - `--temporal_fire_init_periods 365 182 ...` periods (days) for sin/cos channels added to FIRE temporal bias. Recommended for cyclic phenology; omit to disable.
 - `--per_species_env_rank 8` parallel per-species env head (low-rank A·B + bias on raw target_env).
 - `--no_time` purely spatial.
