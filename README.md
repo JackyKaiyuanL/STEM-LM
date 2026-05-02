@@ -74,7 +74,6 @@ rare-species calibration. Worth re-checking per dataset.
 - `--splits_path` reuse a prior `splits.json` (keeps train/val/test identical across runs).
 - `--train_frac 0.8 --test_frac 0.1` (val = remainder)
 - `--num_source_sites 64`
-- `--blind_percentile auto` spatial blind-radius percentile for source masking.
 
 **Model**
 - `--hidden_size 256 --num_attention_heads 8 --num_hidden_layers 4 --intermediate_size 512`

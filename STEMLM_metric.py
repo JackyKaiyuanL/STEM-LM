@@ -230,7 +230,6 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
         site_times=dist_info["site_times"],
         spatial_scale_km=dist_info["spatial_scale_km"],
         euclidean=dist_info.get("euclidean", False),
-        blind_threshold=dist_info["blind_threshold"],
         base_seed=mask_seed,
     )
     subset = Subset(dataset, eval_indices)

@@ -71,60 +71,6 @@ def _tiled_stats(lats: np.ndarray, lons: np.ndarray, times: np.ndarray,
     return float(max_sp.item()), float(max_tp.item())
 
 
-def _tiled_spatial_quantile(lats: np.ndarray, lons: np.ndarray,
-                            spatial_scale: float, percentile: float,
-                            euclidean: bool,
-                            device: str = "cpu", tile: int = 4096,
-                            n_bins: int = 1_000_000) -> float:
-                            
-    N = len(lats)
-    lats_t = torch.as_tensor(lats, dtype=torch.float64, device=device)
-    lons_t = torch.as_tensor(lons, dtype=torch.float64, device=device)
-    sp_scale = float(spatial_scale)
-
-    def compute_block(r0, r1):
-        la = lats_t[r0:r1, None]; lb = lats_t[None, :]
-        lo_a = lons_t[r0:r1, None]; lo_b = lons_t[None, :]
-        if euclidean:
-            sp = torch.sqrt((la - lb) ** 2 + (lo_a - lo_b) ** 2)
-        else:
-            sp = haversine_pairs_torch(la, lo_a, lb, lo_b)
-        return sp / sp_scale
-
-    cmin = torch.tensor(float("inf"), dtype=torch.float64, device=device)
-    cmax = torch.tensor(0.0, dtype=torch.float64, device=device)
-    for r0 in range(0, N, tile):
-        c = compute_block(r0, min(r0 + tile, N))
-        c_pos = c[c > 0]
-        if c_pos.numel() > 0:
-            cmin = torch.minimum(cmin, c_pos.min())
-            cmax = torch.maximum(cmax, c_pos.max())
-    cmin_v = float(cmin.item()); cmax_v = float(cmax.item())
-    if not np.isfinite(cmin_v) or cmax_v <= 0:
-        return 0.0
-        
-
-    hist = torch.zeros(n_bins, dtype=torch.int64, device=device)
-    total = 0
-    span = cmax_v - cmin_v
-    for r0 in range(0, N, tile):
-        c = compute_block(r0, min(r0 + tile, N))
-        c_pos = c[c > 0]
-        if c_pos.numel() == 0:
-            continue
-        bin_idx = ((c_pos - cmin_v) / span * (n_bins - 1)).round().clamp(0, n_bins - 1).long()
-        hist += torch.bincount(bin_idx, minlength=n_bins)
-        total += int(c_pos.numel())
-
-    if total == 0:
-        return 0.0
-    target = percentile / 100.0 * total
-    cdf = torch.cumsum(hist, dim=0)
-    bin_cut = int(torch.searchsorted(cdf, torch.tensor(target, device=device)).item())
-    bin_cut = min(bin_cut, n_bins - 1)
-    return cmin_v + (bin_cut / (n_bins - 1)) * span
-
-
 def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
     if value is None:
         return 1.0 if fallback <= 0 else float(fallback)
@@ -295,26 +241,12 @@ class JSDMDataset(Dataset):
         }
 
 
-def _spatial_blind_dists(site_lats, site_lons,
-                         tgt_idx_np, src_idx_np,
-                         spatial_scale_km, euclidean=False):
-    la_t = site_lats[tgt_idx_np][:, None]
-    lo_t = site_lons[tgt_idx_np][:, None]
-    la_s = site_lats[src_idx_np]
-    lo_s = site_lons[src_idx_np]
-    if euclidean:
-        sp = np.sqrt((la_t - la_s) ** 2 + (lo_t - lo_s) ** 2).astype(np.float32)
-    else:
-        sp = haversine_pairs_np(la_t, lo_t, la_s, lo_s)
-    return torch.from_numpy((sp / spatial_scale_km).astype(np.float32))
-
-
 class JSDMDataCollator:
     def __init__(self, p=0.15,
                  site_lats=None, site_lons=None, site_times=None,
                  spatial_scale_km=1.0,
                  euclidean=False,
-                 blind_threshold=None, mask_token_prob=1.0, seed=None):
+                 mask_token_prob=1.0, seed=None):
 
         self.p = self._canonicalize(p)
         def _to_np(x):
@@ -328,7 +260,6 @@ class JSDMDataCollator:
         self.site_times = _to_np(site_times)
         self.spatial_scale_km = float(spatial_scale_km)
         self.euclidean = bool(euclidean)
-        self.blind_threshold = blind_threshold
         self._has_coords = self.site_lats is not None and self.site_lons is not None and self.site_times is not None
         self.mask_token_prob = mask_token_prob
         self.generator = (torch.Generator().manual_seed(int(seed))
@@ -411,21 +342,6 @@ class JSDMDataCollator:
         target_ids[indices_replaced] = 2
 
         source_ids = source_species.long()
-        if self._has_coords and self.blind_threshold is not None:
-            source_idx = batch["source_idx"]
-            target_idx = batch["target_idx"]
-            src_idx_np = source_idx.numpy()
-            tgt_idx_np = target_idx.numpy()
-            blind_dists = _spatial_blind_dists(
-                self.site_lats, self.site_lons,
-                tgt_idx_np, src_idx_np,
-                self.spatial_scale_km, euclidean=self.euclidean,
-            )
-            is_blind = blind_dists <= self.blind_threshold
-            blind_mask = masked_indices[:, :, None] & is_blind[:, None, :]
-            source_ids[blind_mask] = 2
-        else:
-            source_ids[masked_indices[:, :, None].expand_as(source_ids)] = 2
 
         labels[~masked_indices] = -100
 
@@ -446,12 +362,11 @@ class AbsenceMaskCollator(JSDMDataCollator):
     def __init__(self, p,
                  site_lats=None, site_lons=None, site_times=None,
                  spatial_scale_km=1.0, euclidean=False,
-                 blind_threshold=None, base_seed=0):
+                 base_seed=0):
         super().__init__(p=p,
                          site_lats=site_lats, site_lons=site_lons, site_times=site_times,
                          spatial_scale_km=spatial_scale_km,
                          euclidean=euclidean,
-                         blind_threshold=blind_threshold,
                          mask_token_prob=1.0)
         self.p = float(p)
         self.base_seed = int(base_seed)
@@ -479,19 +394,6 @@ class AbsenceMaskCollator(JSDMDataCollator):
         target_ids[masked] = 2
 
         source_ids = source_species.long()
-        if self._has_coords and self.blind_threshold is not None:
-            src_idx = batch["source_idx"].numpy()
-            tgt_idx = batch["target_idx"].numpy()
-            blind_dists = _spatial_blind_dists(
-                self.site_lats, self.site_lons,
-                tgt_idx, src_idx,
-                self.spatial_scale_km, euclidean=self.euclidean,
-            )
-            is_blind = blind_dists <= self.blind_threshold
-            blind_mask = masked[:, :, None] & is_blind[:, None, :]
-            source_ids[blind_mask] = 2
-        else:
-            source_ids[masked[:, :, None].expand_as(source_ids)] = 2
 
         labels = target_species.clone()
         labels[~masked] = -100
@@ -510,12 +412,11 @@ class FixedPValCollator(JSDMDataCollator):
     def __init__(self, p,
                  site_lats=None, site_lons=None, site_times=None,
                  spatial_scale_km=1.0, euclidean=False,
-                 blind_threshold=None, base_seed=0):
+                 base_seed=0):
         super().__init__(p=p,
                          site_lats=site_lats, site_lons=site_lons, site_times=site_times,
                          spatial_scale_km=spatial_scale_km,
                          euclidean=euclidean,
-                         blind_threshold=blind_threshold,
                          mask_token_prob=1.0)
         self.p = float(p)
         self.base_seed = int(base_seed)
@@ -538,19 +439,6 @@ class FixedPValCollator(JSDMDataCollator):
         target_ids[masked] = 2
 
         source_ids = source_species.long()
-        if self._has_coords and self.blind_threshold is not None:
-            src_idx = batch["source_idx"].numpy()
-            tgt_idx = batch["target_idx"].numpy()
-            blind_dists = _spatial_blind_dists(
-                self.site_lats, self.site_lons,
-                tgt_idx, src_idx,
-                self.spatial_scale_km, euclidean=self.euclidean,
-            )
-            is_blind = blind_dists <= self.blind_threshold
-            blind_mask = masked[:, :, None] & is_blind[:, None, :]
-            source_ids[blind_mask] = 2
-        else:
-            source_ids[masked[:, :, None].expand_as(source_ids)] = 2
 
         labels = target_species.clone()
         labels[~masked] = -100
@@ -578,7 +466,6 @@ def build_val_loaders_fixed_p(dataset, val_indices, dist_info, p_values,
             site_times=dist_info["site_times"],
             spatial_scale_km=dist_info["spatial_scale_km"],
             euclidean=dist_info.get("euclidean", False),
-            blind_threshold=dist_info["blind_threshold"],
             base_seed=base_seed + 1000 * i,
         )
         loaders.append((float(p), DataLoader(
@@ -588,119 +475,12 @@ def build_val_loaders_fixed_p(dataset, val_indices, dist_info, p_values,
     return loaders
 
 
-def auto_blind_percentile(
-    dataset: "JSDMDataset",
-    n_pairs: int = 100_000,
-    seed: int = 0,
-    min_pairs_per_bin: int = 50,
-) -> Tuple[float, dict]:
-    
-    rng = np.random.RandomState(seed)
-    N = len(dataset)
-    i = rng.randint(0, N, n_pairs)
-    j = rng.randint(0, N, n_pairs)
-    keep = i != j
-    i, j = i[keep], j[keep]
-
-    lats = dataset.lats.astype(np.float64)
-    lons = dataset.lons.astype(np.float64)
-    d_km = haversine_pairs_np(lats[i], lons[i], lats[j], lons[j])
-
-    S = dataset.species_data.astype(bool)
-    inter = (S[i] & S[j]).sum(axis=1)
-    union = (S[i] | S[j]).sum(axis=1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        jacc = np.where(union > 0, inter / np.maximum(union, 1), 0.0)
-    bg = float(jacc.mean())
-
-    d_min, d_max = max(1e-3, float(d_km.min())), float(d_km.max())
-    edges = np.logspace(np.log10(max(d_min, 0.1)), np.log10(d_max), 20)
-    edges = np.concatenate([[0.0], edges])
-    j_bins: List[float] = []
-    n_bins: List[int] = []
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        m = (d_km >= lo) & (d_km < hi)
-        n_bins.append(int(m.sum()))
-        j_bins.append(float(jacc[m].mean()) if m.sum() >= min_pairs_per_bin else float("nan"))
-
-    valid = [k for k, n in enumerate(n_bins) if n >= min_pairs_per_bin]
-    if not valid:
-        raise ValueError("auto blind_percentile: no distance bin has enough pairs.")
-    j0 = j_bins[valid[0]]
-    if not np.isfinite(j0):
-        raise ValueError("auto blind_percentile: nearest-bin Jaccard is undefined.")
-    if j0 <= bg:
-        raise ValueError(
-            f"auto blind_percentile: nearest-bin Jaccard ({j0:.4f}) ≤ background "
-            f"({bg:.4f}). The dataset shows no near-range autocorrelation, so "
-            f"there's nothing for blinding to block. Pass an explicit "
-            f"--blind_percentile instead."
-        )
-
-    tau = 0.5 * (j0 + bg)
-    d_star = None
-    for k in valid:
-        if j_bins[k] <= tau:
-            d_star = edges[k]
-            break
-    if d_star is None:
-        raise ValueError(
-            f"auto blind_percentile: mean Jaccard never drops to τ={tau:.4f} "
-            f"within the observed range. The autocorrelation extends past the "
-            f"sampled extent — set --blind_percentile manually."
-        )
-
-    d_norm = d_km / dataset.spatial_scale_km
-    pct = float((d_norm <= d_star / dataset.spatial_scale_km).mean() * 100.0)
-    diag = {
-        "background_jaccard": bg,
-        "nearest_bin_jaccard": j0,
-        "tau": tau,
-        "d_star_km": float(d_star),
-        "d_star_norm": float(d_star / dataset.spatial_scale_km),
-        "spatial_scale_km": dataset.spatial_scale_km,
-        "bin_edges_km": edges.tolist(),
-        "mean_jaccard_by_bin": j_bins,
-        "n_pairs_by_bin": n_bins,
-    }
-    return pct, diag
-
-
-def compute_dist_info(
-    dataset: "JSDMDataset",
-    blind_percentile="auto",   # float | "auto"
-    tile: int = 4096,
-    hist_bins: int = 1_000_000,
-) -> dict:
-    
-    if isinstance(blind_percentile, str):
-        if blind_percentile.lower() != "auto":
-            raise ValueError(f"blind_percentile must be a float or 'auto'; got {blind_percentile!r}")
-        print("  blind_percentile='auto': measuring Jaccard(d) to pick half-decay radius...")
-        pct, diag = auto_blind_percentile(dataset)
-        print(f"    background Jaccard = {diag['background_jaccard']:.4f}")
-        print(f"    nearest-bin Jaccard = {diag['nearest_bin_jaccard']:.4f}")
-        print(f"    τ (half-decay)      = {diag['tau']:.4f}")
-        print(f"    d* = {diag['d_star_km']:.1f} km  →  percentile = {pct:.3f}%")
-        blind_percentile = pct
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"  Computing blind-threshold percentile (tiled histogram, device={device})...")
-    blind_threshold = _tiled_spatial_quantile(
-        dataset.lats, dataset.lons,
-        spatial_scale=dataset.spatial_scale_km,
-        percentile=float(blind_percentile),
-        euclidean=dataset.euclidean_coords,
-        device=device, tile=tile, n_bins=hist_bins,
-    )
-    print(f"  Blind threshold: {blind_threshold:.4f} ({blind_percentile:.3f}th percentile)")
-
+def compute_dist_info(dataset: "JSDMDataset") -> dict:
     return {
         "site_lats":  torch.as_tensor(dataset.lats,  dtype=torch.float32),
         "site_lons":  torch.as_tensor(dataset.lons,  dtype=torch.float32),
         "site_times": torch.as_tensor(dataset.times, dtype=torch.float32),
         "euclidean":  dataset.euclidean_coords,
-        "blind_threshold": blind_threshold,
         "max_spatial_dist": float(dataset._max_spatial),
         "max_temporal_dist": float(dataset._max_temporal),
         "spatial_scale_km": dataset.spatial_scale_km,
@@ -801,7 +581,6 @@ def h3_block_split(lats, lons, resolution=2, train_frac=0.8, test_frac=0.1, seed
 def create_dataloaders(
     csv_path, batch_size=32, num_source_sites=64,
     p=0.15,
-    blind_percentile="auto",
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None, spatial_scale_km=None,
     euclidean_coords=False, no_time=False,
@@ -809,7 +588,7 @@ def create_dataloaders(
     saved_splits: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     restrict_source_pool_with_saved_splits: bool = True,
 ):
-    
+
     dataset = JSDMDataset(
         csv_path=csv_path,
         num_source_sites=num_source_sites,
@@ -820,7 +599,7 @@ def create_dataloaders(
     )
 
     print("Computing distance info...")
-    dist_info = compute_dist_info(dataset, blind_percentile=blind_percentile)
+    dist_info = compute_dist_info(dataset)
 
     
     if saved_splits is not None:
@@ -884,7 +663,6 @@ def create_dataloaders(
         site_times=dataset.times,
         spatial_scale_km=dataset.spatial_scale_km,
         euclidean=dataset.euclidean_coords,
-        blind_threshold=dist_info["blind_threshold"],
         seed=seed,
     )
 

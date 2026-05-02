@@ -711,7 +711,7 @@ class JSDMModel(nn.Module):
     def forward(
         self,
         input_ids,       # (B, S, T)  0=abs, 1=pres, 2=mask
-        source_ids,      # (B, S, N)  0=abs, 1=pres, 2=blind
+        source_ids,      # (B, S, N)  0=abs, 1=pres
         source_idx,      # (B, N)
         target_site_idx, # (B, T)
         env_data,        # (B, N, E)

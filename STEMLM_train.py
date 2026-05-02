@@ -113,11 +113,6 @@ def _parse_rate(s):
     return float(s)
 
 
-def _parse_blind_pct(s):
-    if isinstance(s, str) and s.lower() == "auto":
-        return "auto"
-    return float(s)
-
 def move_dist_info_to_device(dist_info, device):
     out = dict(dist_info)
     for k in ("site_lats", "site_lons", "site_times"):
@@ -338,10 +333,6 @@ def main():
     parser = argparse.ArgumentParser(description="Train STEM-LM")
     parser.add_argument("csv_path", type=str)
     parser.add_argument("--num_source_sites", type=int, default=64)
-    parser.add_argument("--blind_percentile", type=_parse_blind_pct, default="auto",
-                        help="Percentile of normalized spatial pairwise distance used as the "
-                             "blind radius. Default 'auto': picked via the half-decay rule on "
-                             "the dataset's Jaccard(d) curve. Pass a float to override.")
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--num_attention_heads", type=int, default=4)
     parser.add_argument("--num_hidden_layers", type=int, default=3)
@@ -522,7 +513,6 @@ def main():
         batch_size=args.batch_size,
         num_source_sites=args.num_source_sites,
         p=args.p,
-        blind_percentile=args.blind_percentile,
         train_frac=args.train_frac,
         test_frac=args.test_frac,
         num_workers=args.num_workers,
