@@ -439,12 +439,10 @@ def main():
                              "via low-rank A∈(E,r)·B∈(r,S) (A zero-init, monotone safe) "
                              "+ per-species bias. Active in full / no_st ablations; "
                              "silent in no_env / no_st_env. Default 0 (disabled).")
-    parser.add_argument("--loss_type", choices=["bce", "focal"], default="bce",
-                        help="Loss function. 'bce' = sigmoid BCE (default, "
-                             "backward-compatible). 'focal' = sigmoid focal loss "
-                             "(Lin et al. 2017). Focal trades AUC for CBI: on "
-                             "eButterfly, BCE p13 vs focal: AUC 0.882->0.857, "
-                             "CBI 0.298->0.638.")
+    parser.add_argument("--loss_type", choices=["bce", "focal"], default="focal",
+                        help="Loss function. 'focal' = sigmoid focal loss "
+                             "(Lin et al. 2017; default, alpha=0.25, gamma=2.0 "
+                             "RetinaNet defaults). 'bce' = sigmoid BCE.")
     parser.add_argument("--focal_alpha", type=float, default=0.25,
                         help="Focal loss alpha (positive-class weight). Set <0 "
                              "to disable alpha-balancing. Ignored when "

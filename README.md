@@ -17,48 +17,26 @@ or passed via `--env_cols`.
 
 ## Quickstart
 
-**Recommended (focal, balanced for SDM deployment):**
 ```bash
 python STEMLM_train.py data.csv \
     --output_dir ./out \
     --p unif:0.0,1.0 \
-    --temporal_fire_init_periods 365 182 \
-    --loss_type focal --focal_gamma 1.0 --focal_alpha 0.25
+    --temporal_fire_init_periods 365 182
 ```
 
-**BCE baseline (best for occupancy / population-modeling downstream):**
-```bash
-python STEMLM_train.py data.csv \
-    --output_dir ./out \
-    --p unif:0.0,1.0 \
-    --temporal_fire_init_periods 365 182 \
-    --class_weighting 0.999
-```
+Defaults to focal loss (α=0.25, γ=2.0). Saves two checkpoints
+(`best_model.pt` by val-AUC, `best_model_by_cbi.pt` by val-CBI), evaluates
+both, and reports per-p AUC / AUPRC / CBI / Brier / ECE on a uniform-mask
+block AND a presence-only (absence-mask) block.
 
-Both save two checkpoints (`best_model.pt` by val-AUC, `best_model_by_cbi.pt`
-by val-CBI), evaluate both, and report per-p AUC / AUPRC / CBI / Brier / ECE
-on a uniform-mask block AND a presence-only (absence-mask) block.
-
-## Choosing a loss
-
-| Use case | Recipe |
-|---|---|
-| Habitat-suitability mapping (uses ranking) | **focal γ=1**, no class_weighting |
-| Occupancy modeling (uses absolute probabilities) | **BCE**, no class_weighting |
-| Maximum CBI (suitability gradient only) | focal γ=2, no class_weighting |
-
-Focal trades a small AUC for big CBI gains; γ=2 maximizes CBI but degrades ECE.
-
-**Note on `--class_weighting`.** On datasets with balanced per-species presence
-counts, cw is a near-no-op with BCE and actively hurts focal (subsumed by
-γ-modulation). On heavily long-tailed datasets it may help BCE recover
-rare-species calibration. Worth re-checking per dataset.
+To use BCE instead, pass `--loss_type bce`. Focal trades a small AUC for big
+CBI gains; γ=2 maximizes CBI but degrades ECE.
 
 ## Key options
 
 **Loss** (defaults shown)
-- `--loss_type {bce,focal}` `bce`
-- `--focal_alpha 0.25 --focal_gamma 2.0` (RetinaNet defaults; γ=1 recommended for SDM)
+- `--loss_type {bce,focal}` `focal`
+- `--focal_alpha 0.25 --focal_gamma 2.0` (RetinaNet defaults)
 - `--class_weighting [β]` opt-in. Pass alone → β=0.999. BCE only.
 
 **Mask rate**
