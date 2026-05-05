@@ -493,6 +493,17 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
     env.barrier()
 
+    final_artifacts = [
+        os.path.join(args.output_dir, "test_results.csv"),
+        os.path.join(args.output_dir, "per_species_auc.csv"),
+        os.path.join(args.output_dir, "cooccurrence_matrix.npy"),
+    ]
+    if all(os.path.exists(p) for p in final_artifacts):
+        log_main(env, f"All final artifacts already exist in {args.output_dir}; skipping.")
+        for p in final_artifacts:
+            log_main(env, f"  {p}")
+        return
+
     if env.is_distributed:
         log_main(env,
             f"Distributed training: world_size={env.world_size}, "
