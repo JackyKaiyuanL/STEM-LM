@@ -307,10 +307,6 @@ def main():
         sys.exit(1)
     print(f"  vars OK: {args.vars}")
 
-    # Pre-sample DEM + ERA5 orography at every obs, ONCE, before the thread pool
-    # (rasterio/xarray are not thread-safe on shared handles; also avoids repeat I/O).
-    # ERA5 orography is loaded from a one-off CDS-downloaded NetCDF; if missing,
-    # it is auto-downloaded via cdsapi the first time.
     obs_dem_elev  = None
     obs_era5_elev = None
     if args.dem_vrt is not None:

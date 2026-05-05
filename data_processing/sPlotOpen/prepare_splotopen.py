@@ -167,9 +167,6 @@ def main(min_presences=100, us_only=False, europe=False, australia=False,
         header = header.sample(n=max_plots, random_state=seed)
         _log(f"Subsampled to {max_plots:,} plots", t0=t0, quiet=quiet)
 
-    # time = 0 for all plots (Date_of_recording is unreliable — many values are
-    # batch-release dates rather than actual survey dates; env variables are static
-    # 30-year climatological normals so temporal variation adds no signal here)
     header["time"] = 0.0
     _log("time set to 0.0 for all plots (static env dataset)", t0=t0, quiet=quiet)
 
@@ -182,8 +179,6 @@ def main(min_presences=100, us_only=False, europe=False, australia=False,
     dt = _read_dt(plot_ids, dt_chunksize=dt_chunksize, quiet=quiet, t0=t0)
     _log(f"DT filtered unique pairs: {len(dt):,} (plot,species)", t0=t0, quiet=quiet)
 
-    # Filter species by minimum presences BEFORE building the plot×species matrix.
-    # This avoids materializing an enormous dense matrix when using --all_records.
     sp_counts = dt["Species"].value_counts()
     keep = sp_counts.index[sp_counts >= min_presences].tolist()
     dropped = len(sp_counts) - len(keep)
