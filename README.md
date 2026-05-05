@@ -13,7 +13,7 @@ or passed via `--env_cols`.
 | `STEMLM_model.py` | Model: species self-attn, ST + env cross-attn, FIRE distance bias. `JSDMConfig.ablation` ∈ `{full, no_st, no_env, no_st_env}`. |
 | `STEMLM_data.py` | Dataset, collators (uniform-mask + absence-mask), H3 splits. |
 | `STEMLM_train.py` | Training, per-epoch val, end-of-training K-pass-bagged test eval. |
-| `STEMLM_metric.py` | AUROC / AUPRC / CBI / Brier / ECE primitives + `bagged_evaluate_at_p`. Library only — no CLI. |
+| `STEMLM_metric.py` | AUROC / AUPRC / CBI / Brier / ECE calculations + `bagged_evaluate_at_p`. Library only — no CLI. |
 
 ## Quickstart
 
