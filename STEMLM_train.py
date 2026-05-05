@@ -280,7 +280,7 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
         total_loss += output.loss.item()
         num_batches += 1
 
-        probs  = torch.sigmoid(output.logits).squeeze(-1).cpu().numpy()
+        probs  = torch.sigmoid(output.logits.float()).squeeze(-1).cpu().numpy()
         labels = batch["labels"].squeeze(-1).cpu().numpy()
         mask   = labels != -100
         for s in range(S):
@@ -1117,7 +1117,7 @@ def main():
                 )
                 cooccurrences.append(extract_cooccurrence_matrix(output).cpu())
 
-        cooccurrence_matrix = torch.cat(cooccurrences, dim=0).mean(dim=0).numpy()
+        cooccurrence_matrix = torch.cat(cooccurrences, dim=0).mean(dim=0).float().numpy()
         np.save(os.path.join(args.output_dir, "cooccurrence_matrix.npy"), cooccurrence_matrix)
 
         with open(os.path.join(args.output_dir, "species_names.json"), "w") as f:
