@@ -1,0 +1,70 @@
+SoilGrids v2.0 Soil Property Variables
+========================================
+Source:   https://soilgrids.org  /  https://isric.org/explore/soilgrids
+Version:  2.0 (Poggio et al. 2021)
+License:  CC BY 4.0
+Citation: Poggio et al. (2021), SOIL 7:217–240
+
+Variables (8 total → env_19 to env_26):
+  NOTE: Exact 8 variables should be confirmed against Teng et al. 2023
+  (SatBird paper) supplementary materials or SatBird code repository.
+  Best candidate set based on standard usage:
+
+  env_19  bdod   Bulk density of fine earth (cg/cm³)
+  env_20  cec    Cation exchange capacity (mmol(c)/kg)
+  env_21  cfvo   Coarse fragments volumetric fraction (cm³/100 cm³)
+  env_22  clay   Clay content (g/kg)
+  env_23  nitrogen  Total nitrogen (cg/kg)
+  env_24  phh2o  Soil pH in H₂O (pHx10)
+  env_25  sand   Sand content (g/kg)
+  env_26  silt   Silt content (g/kg)
+
+Depth layer:        0–5 cm (surface, "sl1" in SoilGrids naming)
+                    *** VERIFY this matches SatBird/SatButterfly ***
+Spatial resolution: 250 m (native); resample to ~1 km to match WorldClim
+Projection:         Homolosine (native) → reproject to WGS84 EPSG:4326
+Format:             GeoTIFF via WCS or bulk download
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DOWNLOAD INSTRUCTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Option A — WCS REST API (recommended for regional downloads):
+  Base URL: https://maps.isric.org/mapserv?map=/map/{variable}.map
+  WCS GetCoverage for each variable + depth layer.
+
+  Example (bdod, 0-5cm, bounding box for Europe):
+    https://maps.isric.org/mapserv?map=/map/bdod.map&SERVICE=WCS&VERSION=2.0.1
+    &REQUEST=GetCoverage&COVERAGEID=bdod_0-5cm_mean
+    &SUBSETTINGCRS=http://www.opengis.net/def/crs/EPSG/0/4326
+    &SUBSET=X(-12,40)&SUBSET=Y(35,72)
+    &OUTPUTCRS=http://www.opengis.net/def/crs/EPSG/0/4326
+    &FORMAT=image/tiff
+
+  Repeat for each variable {bdod, cec, cfvo, clay, nitrogen, phh2o, sand, silt}
+  and each region {us, europe, australia}.
+
+Option B — bulk download via ISRIC data hub:
+  https://data.isric.org/geonetwork/srv/eng/catalog.search#/search?q=soilgrids
+
+After download, resample to 1 km and reproject to WGS84 if not already,
+then merge into a single multiband GeoTIFF in the variable order above:
+  gdalwarp -t_srs EPSG:4326 -tr 0.008333 0.008333 -r bilinear \
+    raw/bdod_0-5cm_mean.tif raw/bdod_1km.tif
+  gdal_merge.py -separate -o soilgrids_8band.tif \
+    raw/bdod_1km.tif raw/cec_1km.tif ... raw/silt_1km.tif
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROCESSING NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- Native projection is Interrupted Goode's Homolosine — must reproject
+  to WGS84 before merging with WorldClim.
+- Use bilinear resampling when upscaling from 250 m to 1 km.
+- NoData over ocean/water is expected — these cells will be masked anyway
+  by the land mask during inference grid generation.
+- Scale factors: SoilGrids values are stored as integers with a scale factor
+  (e.g., bdod ÷ 100 = g/cm³). Apply scale before saving or at extraction time.
+  Confirm scale factors from SoilGrids documentation for each variable.

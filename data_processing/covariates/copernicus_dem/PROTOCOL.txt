@@ -1,0 +1,53 @@
+Copernicus DEM GLO-30 — Elevation
+===================================
+Source:   https://opentopography.s3.sdsc.edu/raster/COP30/
+Version:  GLO-30 (30 m resolution, 2021 release)
+License:  Copernicus DEM License — free for scientific/commercial use
+Citation: European Space Agency / Airbus (2021).
+          Copernicus DEM — Global and European Digital Elevation Model.
+          DOI: 10.5270/ESA-c5d3d65
+
+Variable (1 total → env_dem):
+  env_dem  Ellipsoidal height above WGS84 ellipsoid (metres)
+           Ocean / missing tiles filled with 0
+
+Spatial resolution: 30 m (native); point extraction at native resolution
+Projection:         WGS84 geographic (EPSG:4326)
+Format:             26,475 GeoTIFF tiles (1°×1° each), publicly accessible via HTTP
+Coverage:           Global — 180°W to 180°E, 90°S to 84°N
+
+STATUS: VRT catalog downloaded (COP30_hh.vrt, 12 MB).
+        Individual tiles are NOT stored locally — fetched on demand via VSICURL.
+        No account or API key required for tile access.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ACCESS METHOD (VSICURL)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Tiles are publicly accessible via HTTP without authentication:
+  Base URL: https://opentopography.s3.sdsc.edu/raster/COP30/COP30_hh/
+  Tile URL: {base}/Copernicus_DSM_10_{N/S}{lat:02d}_00_{E/W}{lon:03d}_00_DEM.tif
+
+Point extraction uses rasterio with GDAL's /vsicurl/ virtual filesystem:
+  url = f"/vsicurl/{COP_BASE}/{tile_name}"
+  with rasterio.open(url) as src:
+      vals = list(src.sample(coords))
+
+Only the byte ranges needed per point are fetched via HTTP range requests.
+No local tile storage required. Requires internet access at extraction time.
+
+The global VRT catalog (COP30_hh.vrt) is stored locally and can be used
+to read any region via VSICURL by updating tile paths to absolute URLs.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROCESSING NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Use bilinear resampling when downscaling 30 m → 1 km.
+- Ocean/water pixels may have NoData or value 0 — these will be masked
+  by the land mask during inference grid generation.
+- Tiles over high latitudes (>60°N) may have gaps filled from SRTM or
+  TanDEM-X; this is fine for SDM applications.
+- For sPlotOpen Europe: download tiles covering lat 35–72°N, lon -12–40°E
+  (~2,660 1°×1° tiles). Use OpenTopography bulk download to avoid this.

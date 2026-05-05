@@ -1,0 +1,107 @@
+ERA5-Land Reanalysis — Temporally-Resolved Climate
+====================================================
+Product:   ERA5-Land monthly averaged data
+Source:    Copernicus Climate Data Store (CDS)
+           https://cds.climate.copernicus.eu/
+Dataset:   reanalysis-era5-land-monthly-means
+Access:    Free account required at cds.climate.copernicus.eu
+           Install cdsapi: pip install cdsapi
+           Configure ~/.cdsapirc with API key
+License:   Copernicus License (free for all uses)
+Citation:  Muñoz Sabater, J. (2019). ERA5-Land monthly averaged data from
+           1950 to present. Copernicus Climate Change Service (C3S) CDS.
+           DOI: 10.24381/cds.68d2bb30
+
+Temporal coverage:  1950-01 to ~2 months before present (monthly)
+                    Hourly also available (much larger)
+Spatial resolution: 0.1° × 0.1° (~9 km) — native
+Projection:         Regular lat/lon WGS84
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USE CASE: eButterfly 2010+ temporal version
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For each eButterfly checklist (lat, lon, date): extract ERA5-Land monthly
+values for the month (and possibly preceding months) of observation.
+This gives temporally-resolved climate at the time the butterfly was seen —
+far more meaningful than 30-year WorldClim averages for modeling
+interannual and seasonal variation in butterfly occurrence.
+
+Candidate variables (to be finalized after temporal resolution discussion):
+  2m_temperature          (°C) — ambient temperature at survey time
+  total_precipitation     (m)  — monthly total rainfall
+  2m_dewpoint_temperature (°C) — humidity proxy
+  surface_solar_radiation_downwards  (J/m²) — insolation / sunshine
+  10m_u_component_of_wind (m/s)
+  10m_v_component_of_wind (m/s)
+  snow_depth_water_equivalent  (m)  — winter severity signal
+  soil_temperature_level_1     (°C) — near-surface soil temp
+
+NOTE: Exact variable list and temporal aggregation window (single month,
+rolling 3-month mean, etc.) to be decided — discussion pending.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DOWNLOAD INSTRUCTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  import cdsapi
+  c = cdsapi.Client()
+  c.retrieve(
+      "reanalysis-era5-land-monthly-means",
+      {
+          "product_type": "monthly_averaged_reanalysis",
+          "variable": [
+              "2m_temperature",
+              "total_precipitation",
+              "2m_dewpoint_temperature",
+              "surface_solar_radiation_downwards",
+              "10m_u_component_of_wind",
+              "10m_v_component_of_wind",
+              "snow_depth_water_equivalent",
+              "soil_temperature_level_1",
+          ],
+          "year":  [str(y) for y in range(2010, 2027)],
+          "month": [f"{m:02d}" for m in range(1, 13)],
+          "time":  "00:00",
+          "area":  [84, -170, 7, -50],  # N, W, S, E — covers all eButterfly region
+          "format": "netcdf",
+      },
+      "raw/era5_land_monthly_2010_2026.nc"
+  )
+
+  # For Europe (sPlotOpen — not needed since time=0, but available if needed):
+  # "area": [72, -12, 35, 40]
+  # For Australia:
+  # "area": [-10, 113, -44, 154]
+
+File size estimate: ~8 vars × 17 years × 12 months × (NA region) ≈ 2–4 GB
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROCESSING NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- Native resolution 0.1° matches a reasonable extraction scale for eButterfly
+  checklists; no resampling needed for point extraction.
+- Extraction: for each checklist (lat, lon, date), look up the ERA5-Land
+  grid cell containing the point and extract the value for the corresponding
+  year+month.
+- Temperature unit: Kelvin in raw ERA5 — subtract 273.15 for °C.
+- Precipitation unit: metres (monthly total) — multiply by 1000 for mm.
+- Solar radiation: accumulated J/m² per month — divide by seconds in month
+  for W/m² mean flux.
+- Wind: combine u and v components as sqrt(u²+v²) for wind speed if needed.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OPEN QUESTIONS  (resolve before extraction)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- Temporal aggregation window: single observation month only, or include
+  lagged months (e.g., 1–3 month rolling mean to capture recent conditions)?
+- Final variable list: all 8 above, or subset?
+- Whether to also download hourly for finer temporal matching (much larger).
+- ERA5-Land is available from 1950 — worth downloading pre-2010 for
+  other potential uses even if eButterfly only uses 2010+?

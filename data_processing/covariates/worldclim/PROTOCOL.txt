@@ -1,0 +1,63 @@
+WorldClim v2.1 Bioclimatic Variables
+======================================
+Source:   https://worldclim.org/data/worldclim21.html
+Version:  2.1 (released 2020)
+License:  CC BY 4.0
+Citation: Fick & Hijmans (2017), Int. J. Climatol. 37:4302–4315
+
+Variables (19 total → env_00 to env_18):
+  env_00  bio1   Annual Mean Temperature (°C × 10)
+  env_01  bio2   Mean Diurnal Range (Mean of monthly (max − min temp))
+  env_02  bio3   Isothermality (bio2/bio7 × 100)
+  env_03  bio4   Temperature Seasonality (std dev × 100)
+  env_04  bio5   Max Temperature of Warmest Month
+  env_05  bio6   Min Temperature of Coldest Month
+  env_06  bio7   Temperature Annual Range (bio5 − bio6)
+  env_07  bio8   Mean Temperature of Wettest Quarter
+  env_08  bio9   Mean Temperature of Driest Quarter
+  env_09  bio10  Mean Temperature of Warmest Quarter
+  env_10  bio11  Mean Temperature of Coldest Quarter
+  env_11  bio12  Annual Precipitation (mm)
+  env_12  bio13  Precipitation of Wettest Month
+  env_13  bio14  Precipitation of Driest Month
+  env_14  bio15  Precipitation Seasonality (CV)
+  env_15  bio16  Precipitation of Wettest Quarter
+  env_16  bio17  Precipitation of Driest Quarter
+  env_17  bio18  Precipitation of Warmest Quarter
+  env_18  bio19  Precipitation of Coldest Quarter
+
+Spatial resolution:  30 arc-seconds (~1 km at equator)
+Temporal basis:      1970–2000 average (climatological normals)
+Projection:          WGS84 geographic (EPSG:4326)
+Format:              GeoTIFF, one file per variable
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DOWNLOAD INSTRUCTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Option A — full global tiles (simplest, ~1.5 GB):
+  https://worldclim.org/data/worldclim21.html
+  → "Bioclimatic variables" → "30s" resolution
+  Downloads: wc2.1_30s_bio.zip
+  Unzip into raw/
+
+Option B — regional tiles (smaller download):
+  Use WorldClim tile downloads for specific regions.
+  Tiles available at 2.5 min, 5 min, 10 min resolution if 30s is too large.
+
+After download, merge into a single multiband GeoTIFF in order bio1..bio19:
+  gdal_merge.py -separate -o worldclim_19band.tif \
+    raw/wc2.1_30s_bio_1.tif raw/wc2.1_30s_bio_2.tif ... raw/wc2.1_30s_bio_19.tif
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROCESSING NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- No reprojection needed (already WGS84 geographic).
+- NoData values: use bilinear interpolation when resampling to match
+  SoilGrids/DEM resolution if needed; otherwise extract at native 1 km.
+- For point extraction (plot coordinates): use rasterio sample() at
+  exact lat/lon — no spatial averaging needed at plot scale.
+- For inference grids at 0.1°: extract at grid centroid coordinates.

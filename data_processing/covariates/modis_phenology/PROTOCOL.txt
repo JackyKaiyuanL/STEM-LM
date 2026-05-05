@@ -1,0 +1,92 @@
+MODIS Vegetation Indices — Phenological Signal
+================================================
+Product:   MOD13Q1 v6.1 (Terra MODIS 16-day NDVI/EVI composite)
+Source:    NASA EOSDIS / LP DAAC
+           https://lpdaac.usgs.gov/products/mod13q1v061/
+Access:    NASA Earthdata (free account required)
+           https://urs.earthdata.nasa.gov/
+License:   NASA open data policy (public domain)
+Citation:  Didan, K. (2021). MODIS/Terra Vegetation Indices 16-Day L3 Global
+           250m SIN Grid V061. NASA EOSDIS Land Processes DAAC.
+           DOI: 10.5067/MODIS/MOD13Q1.061
+
+Temporal coverage:  2000-02-18 to present
+Spatial resolution: 250 m
+Projection:         Sinusoidal (native) → reproject to WGS84
+Key bands used:
+  - NDVI  (Normalized Difference Vegetation Index, scale ×10000)
+  - EVI   (Enhanced Vegetation Index, scale ×10000)
+  - pixel_reliability  (use as quality mask: 0=good, 1=marginal)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TWO USE CASES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A. STATIC / CLIMATOLOGICAL  — DROPPED
+   eButterfly static uses WorldClim + SoilGrids + DEM (same as sPlotOpen).
+   MODIS phenology climatology was considered but dropped — soil vars are
+   used instead. No MODIS download needed for the static dataset.
+
+B. DYNAMIC / DATE-MATCHED  (for eButterfly 2010+ temporal version — FUTURE)
+   - For each checklist (lat, lon, date): extract the NDVI/EVI value from
+     the 16-day composite period containing the observation date
+   - Captures actual vegetation state at time of observation
+   - Discussion of exact temporal resolution pending ERA5-Land decisions
+   - Output: extracted per-row at join time, not pre-stored as a raster
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DOWNLOAD INSTRUCTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Recommended tool: earthaccess Python library (NASA Earthdata API)
+  pip install earthaccess
+
+  import earthaccess
+  earthaccess.login(strategy="netrc")  # store credentials in ~/.netrc
+  results = earthaccess.search_data(
+      short_name="MOD13Q1",
+      version="061",
+      bounding_box=(-125, 24, -66, 50),   # US
+      temporal=("2010-01-01", "2023-12-31")
+  )
+  earthaccess.download(results, "raw/us/")
+
+Alternative: NASA AppEEARS bulk extraction service
+  https://appeears.earthdatacloud.nasa.gov/
+  Allows point-based extraction (upload CSV of lat/lon/date → returns
+  NDVI/EVI values per point) — most efficient for dynamic use case B.
+  No raster download needed; output is a CSV with extracted values.
+
+TILES needed per region (MODIS sinusoidal grid h/v notation):
+  Continental US:   h08v04, h08v05, h09v04, h09v05, h10v04, h10v05,
+                    h11v04, h11v05, h12v04, h12v05
+  Canada (partial): h10v03, h11v03, h12v03, h13v03
+  Europe:           h17v03, h17v04, h18v03, h18v04, h19v03, h19v04,
+                    h20v03, h20v04
+  Australia:        h29v11, h29v12, h30v11, h30v12, h31v11, h31v12
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROCESSING NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- Apply quality mask: keep only pixel_reliability in {0, 1}; set rest to NaN
+- Scale factors: divide NDVI and EVI by 10000 to get [-1, 1] range
+- For static climatology: average across all composites in the same
+  calendar month (e.g., all January composites 2010–2023)
+- Reproject from Sinusoidal to WGS84 EPSG:4326 using gdalwarp -r bilinear
+- Resample to 1 km to match WorldClim/SoilGrids grid:
+    gdalwarp -t_srs EPSG:4326 -tr 0.008333 0.008333 -r bilinear input.tif output.tif
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OPEN QUESTIONS  (resolve before processing)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- For static version: use 12 monthly means, or seasonal summaries (4)?
+  Or peak/timing phenological metrics (green-up DOY, peak NDVI, duration)?
+- For dynamic version: use raw 16-day composite value, or
+  deviation from climatological mean (anomaly)?
+- Temporal resolution of dynamic extraction: pending ERA5-Land discussion.
