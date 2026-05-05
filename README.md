@@ -11,9 +11,9 @@ or passed via `--env_cols`.
 | File | Purpose |
 |---|---|
 | `STEMLM_model.py` | Model: species self-attn, ST + env cross-attn, FIRE distance bias. `JSDMConfig.ablation` ∈ `{full, no_st, no_env, no_st_env}`. |
-| `STEMLM_data.py` | Dataset, collators (uniform-mask + absence-mask), H3 / grid block CV splits. |
+| `STEMLM_data.py` | Dataset, collators (uniform-mask + absence-mask), H3 splits. |
 | `STEMLM_train.py` | Training, per-epoch val, end-of-training K-pass-bagged test eval. |
-| `STEMLM_metric.py` | AUC / AUPRC / CBI / Brier / ECE primitives + `bagged_evaluate_at_p`. Library only — no CLI. |
+| `STEMLM_metric.py` | AUROC / AUPRC / CBI / Brier / ECE primitives + `bagged_evaluate_at_p`. Library only — no CLI. |
 
 ## Quickstart
 
@@ -25,12 +25,12 @@ python STEMLM_train.py data.csv \
 ```
 
 Defaults to focal loss (α=0.25, γ=2.0). Saves two checkpoints
-(`best_model.pt` by val-AUC, `best_model_by_cbi.pt` by val-CBI), evaluates
-both, and reports per-p AUC / AUPRC / CBI / Brier / ECE on a uniform-mask
+(`best_model.pt` by val-AUROC, `best_model_by_cbi.pt` by val-CBI), evaluates
+both, and reports per-p AUROC / AUPRC / CBI / Brier / ECE on a uniform-mask
 block AND a presence-only (absence-mask) block.
 
-To use BCE instead, pass `--loss_type bce`. Focal trades a small AUC for big
-CBI gains; γ=2 maximizes CBI but degrades ECE.
+To use BCE instead, pass `--loss_type bce`. Focal trades a small AUROC for big
+CBI gains; γ=2 maximizes CBI at the cost of slight decrease in AUROC.
 
 ## Key options
 
@@ -56,7 +56,7 @@ CBI gains; γ=2 maximizes CBI but degrades ECE.
 **Model**
 - `--hidden_size 256 --num_attention_heads 8 --num_hidden_layers 4 --intermediate_size 512`
 - `--num_env_groups 5 --dropout 0.1`
-- `--temporal_fire_init_periods 365 182 ...` periods (days) for sin/cos channels added to FIRE temporal bias. Recommended for cyclic phenology; omit to disable.
+- `--temporal_fire_init_periods 365 182 ...` periods (days) for sin/cos input added to FIRE temporal bias. Omit to disable.
 - `--per_species_env_rank 8` parallel per-species env head (low-rank A·B + bias on raw target_env).
 - `--no_time` purely spatial.
 - `--euclidean_coords` non-geographic 2D coords.
@@ -64,12 +64,12 @@ CBI gains; γ=2 maximizes CBI but degrades ECE.
 **Training**
 - `--batch_size 32 --num_epochs 50 --learning_rate 1e-4 --weight_decay 0.01`
 - `--max_grad_norm 1.0 --gradient_checkpointing`
-- `--mixed_precision {none,bf16,fp16}` `none`. `bf16` recommended on A40/L40/A100/H100.
+- `--mixed_precision {none,bf16,fp16}` `none`. `bf16`
 - `--grad_accum_steps 1` effective batch = `batch_size × grad_accum_steps × world_size`.
-- `--test_bag_K 10` K-pass bagging at end of training. K=1 disables.
+- `--test_bag_K 10` K-pass bagging at end of training.
 
 **Ablation**
-- `--ablation {full,no_st,no_env,no_st_env}` `full`. Disabled branches aren't instantiated.
+- `--ablation {full,no_st,no_env,no_st_env}` `full`.
 
 ## Distributed (multi-GPU)
 
@@ -99,12 +99,12 @@ done
 ## Outputs
 
 Each `--output_dir` gets:
-- `best_model.pt` (best-by-val-AUC) and `best_model_by_cbi.pt` (best-by-val-CBI)
+- `best_model.pt` (best-by-val-AUROC) and `best_model_by_cbi.pt` (best-by-val-CBI)
 - `latest_checkpoint.pt` (preemption resume) + periodic `checkpoint_epoch{N}.pt`
 - `config.json`, `species_names.json`, `splits.json`
 - `training_log.csv` per-epoch metrics
 - `test_results.csv` flat test metrics by mask scheme × p
-- `per_species_auc.csv` per-species AUC / AUPRC / CBI per p
+- `per_species_auc.csv` per-species AUROC / AUPRC / CBI per p
 - `ablation_summary.json` test metrics for both checkpoints + both mask schemes
 - `cooccurrence_matrix.npy` learned species-species attention
 
