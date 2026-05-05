@@ -178,7 +178,7 @@ def evaluate_loader(model, loader, device, dist_info, amp_dtype=None):
             total_loss += out.loss.item()
             num_batches += 1
 
-        probs = torch.sigmoid(out.logits.squeeze(-1)).cpu().numpy()
+        probs = torch.sigmoid(out.logits.float().squeeze(-1)).cpu().numpy()
         labels = batch["labels"].squeeze(-1).cpu().numpy() if "labels" in batch \
                  else np.full_like(probs, fill_value=-100, dtype=np.int64)
         target_idx = batch["target_site_idx"].squeeze(-1).cpu().numpy()
@@ -251,7 +251,7 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
                     out = run_forward(model, batch, dist_info_dev, device)
             else:
                 out = run_forward(model, batch, dist_info_dev, device)
-            probs = torch.sigmoid(out.logits.squeeze(-1)).cpu().numpy()
+            probs = torch.sigmoid(out.logits.float().squeeze(-1)).cpu().numpy()
             labels = batch["labels"].squeeze(-1).cpu().numpy()
             target_idx = batch["target_site_idx"].squeeze(-1).cpu().numpy()
             for b, ti in enumerate(target_idx):
