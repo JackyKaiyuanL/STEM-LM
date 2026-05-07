@@ -4,20 +4,7 @@ Joint species distribution model with masked-species pretraining.
 
 **Input CSV**: `time, latitude, longitude, env_*, species_*` — one row per
 site–time observation. Species are 0/1; env columns must be prefixed `env_*`
-or passed via `--env_cols`.
-
-## Data
-
-Both datasets used in the paper are public; preparation is fully scripted under `data_processing/`.
-
-| Dataset | Source | URL | Prep |
-|---|---|---|---|
-| eButterfly NA 2011–2025 (M=17,077, S=173) | GBIF DwC-A `cf3bdc30-370c-48d3-8fff-b587a39d72d6` | https://www.gbif.org/dataset/cf3bdc30-370c-48d3-8fff-b587a39d72d6 | `data_processing/eButterfly/` |
-| sPlotOpen v2.0 (M=95,104, S=1,201) | iDiv Data Repository v76 (Sabatini et al. 2021) | https://idata.idiv.de/ddm/Data/ShowData/3474 | `data_processing/sPlotOpen/` |
-
-Each subfolder's README lists the exact download steps for the raw archive plus environmental rasters (ERA5-Land, MOD13Q1, WorldClim, SoilGrids, Copernicus DEM) and the script order to produce the final files consumed by `STEMLM_train.py`:
-- `<dataset>.csv` — wide presence/absence + env covariates
-- `<dataset>_splits.json` — H3 resolution-2 spatial-block split, seed 42, 80/10/10
+or passed via `--env_cols`. Dataset preparation pipelines (eButterfly, sPlotOpen) live under `data_processing/<dataset>/` with per-source download instructions.
 
 ## Files
 
