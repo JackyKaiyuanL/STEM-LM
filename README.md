@@ -6,6 +6,19 @@ Joint species distribution model with masked-species pretraining.
 site–time observation. Species are 0/1; env columns must be prefixed `env_*`
 or passed via `--env_cols`.
 
+## Data
+
+Both datasets used in the paper are public; preparation is fully scripted under `data_processing/`.
+
+| Dataset | Source | URL | Prep |
+|---|---|---|---|
+| eButterfly NA 2011–2025 (M=17,077, S=173) | GBIF DwC-A `cf3bdc30-370c-48d3-8fff-b587a39d72d6` | https://www.gbif.org/dataset/cf3bdc30-370c-48d3-8fff-b587a39d72d6 | `data_processing/eButterfly/` |
+| sPlotOpen v2.0 (M=95,104, S=1,201) | iDiv Data Repository v76 (Sabatini et al. 2021) | https://idata.idiv.de/ddm/Data/ShowData/3474 | `data_processing/sPlotOpen/` |
+
+Each subfolder's README lists the exact download steps for the raw archive plus environmental rasters (ERA5-Land, MOD13Q1, WorldClim, SoilGrids, Copernicus DEM) and the script order to produce the final files consumed by `STEMLM_train.py`:
+- `<dataset>.csv` — wide presence/absence + env covariates
+- `<dataset>_splits.json` — H3 resolution-2 spatial-block split, seed 42, 80/10/10
+
 ## Files
 
 | File | Purpose |
@@ -84,18 +97,86 @@ torchrun --nproc_per_node=4 STEMLM_train.py data.csv \
     --output_dir ./out --mixed_precision bf16 --batch_size 32 [args]
 ```
 
-## Per-mode ablation loop
+## Reproducing paper results
 
-Run `full` first (without `--splits_path`) to produce the shared splits, then
-reuse:
+All STEM-LM runs use H3 resolution-2 spatial splits (seed 42); deep-learning runs use three training seeds (41, 42, 43), and the mean across seeds is reported in the paper. Default training hyperparameters: focal loss (γ=2, α=0.25), `--p unif:0.0,1.0`, batch size 128, bf16, AdamW, cosine LR.
+
+**eButterfly — main runs (Tables 3, 5)**
 ```bash
-for mode in full no_st no_env no_st_env; do
-    python STEMLM_train.py data.csv --ablation $mode \
-        --output_dir ./ablation/$mode \
-        --splits_path ./ablation/full/splits.json \
-        --temporal_fire_init_periods 365 182
+for s in 41 42 43; do
+  python STEMLM_train.py data/ebutterfly_na_2011_2025.csv \
+      --output_dir ./out/ebutterfly_focal_seed${s} \
+      --splits_path data/ebutterfly_splits.json \
+      --p unif:0.0,1.0 --temporal_fire_init_periods 365 182 122 91 \
+      --num_epochs 100 --batch_size 128 --mixed_precision bf16 \
+      --temperature_scaling --seed ${s}
+done
+
+# BCE variant (Table 3 STEM-LM (B))
+for s in 41 42 43; do
+  python STEMLM_train.py data/ebutterfly_na_2011_2025.csv \
+      --output_dir ./out/ebutterfly_bce_seed${s} \
+      --splits_path data/ebutterfly_splits.json \
+      --loss_type bce --p unif:0.0,1.0 \
+      --temporal_fire_init_periods 365 182 122 91 \
+      --num_epochs 100 --batch_size 128 --mixed_precision bf16 \
+      --temperature_scaling --seed ${s}
 done
 ```
+
+**eButterfly — cross-attention head ablation (Table 1)**
+```bash
+for mode in full no_st no_env no_st_env; do
+  for s in 41 42 43; do
+    python STEMLM_train.py data/ebutterfly_na_2011_2025.csv \
+        --ablation ${mode} \
+        --output_dir ./out/ablation/${mode}_seed${s} \
+        --splits_path data/ebutterfly_splits.json \
+        --p unif:0.0,1.0 --temporal_fire_init_periods 365 182 122 91 \
+        --num_epochs 100 --batch_size 128 --mixed_precision bf16 \
+        --seed ${s}
+  done
+done
+```
+
+**eButterfly — source-site count ablation (Table 2)**
+```bash
+for N in 32 64 128; do
+  for s in 41 42 43; do
+    python STEMLM_train.py data/ebutterfly_na_2011_2025.csv \
+        --num_source_sites ${N} \
+        --output_dir ./out/sites${N}_seed${s} \
+        --splits_path data/ebutterfly_splits.json \
+        --p unif:0.0,1.0 --temporal_fire_init_periods 365 182 122 91 \
+        --num_epochs 100 --batch_size 128 --mixed_precision bf16 \
+        --seed ${s}
+  done
+done
+```
+
+**sPlotOpen — main runs (Tables 4, 5)**
+```bash
+for s in 41 42 43; do
+  python STEMLM_train.py data/splotopen_global.csv \
+      --output_dir ./out/splotopen_focal_seed${s} \
+      --splits_path data/splotopen_global_splits.json \
+      --no_time --p unif:0.0,1.0 \
+      --num_epochs 50 --batch_size 128 --mixed_precision bf16 \
+      --temperature_scaling --seed ${s}
+done
+
+# BCE variant
+for s in 41 42 43; do
+  python STEMLM_train.py data/splotopen_global.csv \
+      --output_dir ./out/splotopen_bce_seed${s} \
+      --splits_path data/splotopen_global_splits.json \
+      --loss_type bce --no_time --p unif:0.0,1.0 \
+      --num_epochs 50 --batch_size 128 --mixed_precision bf16 \
+      --temperature_scaling --seed ${s}
+done
+```
+
+**Baselines** — see `benchmarks/{statistical_SDM,MaskSDM,CISO}/<dataset>/`. Each subfolder has a self-contained notebook (or script) plus per-baseline README with upstream-repo clone hooks and the exact data-staging requirements.
 
 ## Outputs
 
