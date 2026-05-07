@@ -45,6 +45,7 @@ CBI gains; γ=2 maximizes CBI at the cost of slight decrease in AUROC.
 - `--val_p_list 0.25 0.5 0.75 1.0` per-epoch fixed-p val rates.
 - `--absence_mask_p_list 0.25 0.5 0.75 1.0` rates for the presence-only test block.
 - `--no_absence_mask_eval` to skip the presence-only block.
+- `--temperature_scaling` adds Guo 2017 post-hoc temperature scaling: fit T\* on val logits at p=1.00, apply at every test p. Saves `temperature.json` (T\* + per-p T-cal ECE) and a `tcal_ece` column in `test_results.csv`. Apply at inference with `sigmoid(logits / T*)`.
 
 **Splits** (block CV by default)
 - `--fold {h3,grid,random}` `h3`
@@ -103,10 +104,11 @@ Each `--output_dir` gets:
 - `latest_checkpoint.pt` (preemption resume) + periodic `checkpoint_epoch{N}.pt`
 - `config.json`, `species_names.json`, `splits.json`
 - `training_log.csv` per-epoch metrics
-- `test_results.csv` flat test metrics by mask scheme × p
+- `test_results.csv` flat test metrics by mask scheme × p (includes `tcal_ece` when `--temperature_scaling`)
 - `per_species_auc.csv` per-species AUROC / AUPRC / CBI per p
 - `ablation_summary.json` test metrics for both checkpoints + both mask schemes
 - `cooccurrence_matrix.npy` learned species-species attention
+- `temperature.json` (only with `--temperature_scaling`) — `T_star`, `fitted_at_p`, and per-p T-cal ECE for both mask schemes
 
 ## Inference
 

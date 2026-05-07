@@ -1,7 +1,8 @@
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score, average_precision_score
 from scipy.stats import spearmanr
 from torch.utils.data import DataLoader, Subset
@@ -312,3 +313,110 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
         "per_species": per_sp_bag,
         "single_pass_summary": summary_single,
     }
+
+
+@torch.no_grad()
+def gather_logits_at_p(model, dataset, eval_indices, dist_info, p_value: float,
+                       batch_size: int, device,
+                       num_workers: int = 0, base_seed: int = 0,
+                       amp_dtype=None, distributed_sampler: bool = False,
+                       collator_cls=None) -> Tuple[np.ndarray, np.ndarray]:
+    """Single-pass forward at fixed mask rate `p_value`; returns
+    (logits, labels) aligned by target_site_idx, both shape (N_eval, S).
+    Used for Guo-style temperature scaling fitting and T-cal ECE evaluation.
+    Distributed-safe (gathers across ranks)."""
+    model.eval()
+    use_amp = amp_dtype is not None and device.type == "cuda"
+    dist_info_dev = _move_dist_info(dist_info, device)
+    is_distributed = bool(distributed_sampler) and torch.distributed.is_initialized()
+
+    mask_seed = base_seed + int(round(p_value * 1000))
+    cls = collator_cls if collator_cls is not None else FixedPValCollator
+    collator = cls(
+        p=p_value,
+        site_lats=dist_info["site_lats"],
+        site_lons=dist_info["site_lons"],
+        site_times=dist_info["site_times"],
+        spatial_scale_km=dist_info["spatial_scale_km"],
+        euclidean=dist_info.get("euclidean", False),
+        base_seed=mask_seed,
+    )
+    subset = Subset(dataset, eval_indices)
+    np.random.seed(mask_seed)
+    torch.manual_seed(mask_seed)
+    if is_distributed:
+        sampler = DistributedSampler(subset, shuffle=False)
+        loader = DataLoader(subset, batch_size=batch_size, sampler=sampler,
+                            collate_fn=collator, num_workers=num_workers, pin_memory=True)
+    else:
+        loader = DataLoader(subset, batch_size=batch_size, shuffle=False,
+                            collate_fn=collator, num_workers=num_workers, pin_memory=True)
+
+    logits_by_idx: Dict[int, np.ndarray] = {}
+    labels_by_idx: Dict[int, np.ndarray] = {}
+    for batch in loader:
+        if use_amp:
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                out = run_forward(model, batch, dist_info_dev, device)
+        else:
+            out = run_forward(model, batch, dist_info_dev, device)
+        z = out.logits.float().squeeze(-1).cpu().numpy()
+        labels = batch["labels"].squeeze(-1).cpu().numpy()
+        target_idx = batch["target_site_idx"].squeeze(-1).cpu().numpy()
+        for b, ti in enumerate(target_idx):
+            ti = int(ti)
+            logits_by_idx[ti] = z[b]
+            labels_by_idx[ti] = labels[b]
+
+    if is_distributed:
+        objs = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(objs, (logits_by_idx, labels_by_idx))
+        merged_z, merged_lab = {}, {}
+        for zd, ld in objs:
+            merged_z.update(zd)
+            merged_lab.update(ld)
+        logits_by_idx, labels_by_idx = merged_z, merged_lab
+
+    indices = sorted(logits_by_idx.keys())
+    if not indices:
+        S = dataset[0]["labels"].shape[-1] if hasattr(dataset, "__len__") else 0
+        return np.zeros((0, S), dtype=np.float32), np.zeros((0, S), dtype=np.int64)
+    logits_arr = np.stack([logits_by_idx[i] for i in indices], axis=0).astype(np.float32)
+    labels_arr = np.stack([labels_by_idx[i] for i in indices], axis=0).astype(np.int64)
+    return logits_arr, labels_arr
+
+
+def fit_temperature(val_logits: np.ndarray, val_labels: np.ndarray,
+                    max_iter: int = 200) -> float:
+    """Guo et al. 2017 §4.2: fit single positive scalar T* by minimizing BCE
+    on masked positions of validation logits. Returns T* (float)."""
+    mask = (val_labels != -100)
+    z = torch.from_numpy(val_logits[mask]).float()
+    y = torch.from_numpy(val_labels[mask].astype(np.float32))
+    log_T = torch.zeros(1, requires_grad=True)
+    opt = torch.optim.LBFGS([log_T], lr=0.1, max_iter=max_iter,
+                            line_search_fn="strong_wolfe")
+    def closure():
+        opt.zero_grad()
+        loss = F.binary_cross_entropy_with_logits(z / log_T.exp(), y)
+        loss.backward()
+        return loss
+    opt.step(closure)
+    return float(log_T.exp().item())
+
+
+def compute_per_species_ece_from_logits(logits: np.ndarray, labels: np.ndarray,
+                                        T: float = 1.0, n_bins: int = 15) -> float:
+    """Per-species mean ECE on T-scaled probabilities. Same convention as
+    summarize_per_species_metrics(safe_ece(...)) — average across species
+    after dropping species with no positive or no negative."""
+    probs = 1.0 / (1.0 + np.exp(-logits.astype(np.float64) / T))
+    eces = []
+    for s in range(labels.shape[1]):
+        m = labels[:, s] != -100
+        y = labels[m, s].astype(np.int64)
+        p = probs[m, s]
+        if y.size == 0 or y.sum() == 0 or y.sum() == y.size:
+            continue
+        eces.append(safe_ece(y, p, n_bins=n_bins))
+    return float(np.mean(eces)) if eces else float("nan")

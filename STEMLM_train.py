@@ -25,6 +25,9 @@ from STEMLM_metric import (
     compute_per_species_metrics,
     summarize_per_species_metrics,
     bagged_evaluate_at_p,
+    gather_logits_at_p,
+    fit_temperature,
+    compute_per_species_ece_from_logits,
 )
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -466,6 +469,12 @@ def main():
                              "FixedPValCollator base_seed is held fixed) and re-seeds only "
                              "source-pool sampling, so bagging averages source-resample variance "
                              "without inflating numbers via mask-pattern ensembling. K=1 disables.")
+    parser.add_argument("--temperature_scaling", action="store_true",
+                        help="After test eval, fit Guo et al. 2017 temperature scalar T* on "
+                             "validation logits at p=1.00 by L-BFGS on NLL, apply at every "
+                             "test p (uniform + absence-mask), and save T* + per-p T-cal ECE "
+                             "to temperature.json. Downstream inference should divide logits "
+                             "by T* (sigmoid(logits / T*)) when temperature.json is present.")
     args = parser.parse_args()
 
     if args.splits_path is None:
@@ -995,6 +1004,54 @@ def main():
                 f"CBI={absmask_mean_cbi:.3f}"
             )
 
+    T_star = None
+    tcal_per_p_ece: dict = {}
+    absmask_tcal_per_p_ece: dict = {}
+    if args.temperature_scaling and env.is_main:
+        log_main(env, "[temperature_scaling] gathering val logits at p=1.00...")
+        val_logits, val_labels = gather_logits_at_p(
+            unwrap(model), dataset, np.array(splits["val"]), dist_info,
+            p_value=1.0, batch_size=args.batch_size, device=device,
+            num_workers=args.num_workers, base_seed=args.seed + 30_000,
+            amp_dtype=amp_dtype, distributed_sampler=False,
+        )
+        T_star = fit_temperature(val_logits, val_labels)
+        log_main(env, f"[temperature_scaling] T* = {T_star:.4f}")
+        for p in args.val_p_list:
+            tl, ty = gather_logits_at_p(
+                unwrap(model), dataset, eval_indices, dist_info,
+                p_value=p, batch_size=args.batch_size, device=device,
+                num_workers=args.num_workers, base_seed=args.seed + 40_000,
+                amp_dtype=amp_dtype, distributed_sampler=False,
+            )
+            tcal_per_p_ece[p] = compute_per_species_ece_from_logits(tl, ty, T=T_star)
+            log_main(env, f"  uniform p={p:.2f}: T-cal ECE = {tcal_per_p_ece[p]:.4f}")
+        if not args.no_absence_mask_eval:
+            from STEMLM_data import AbsenceMaskCollator
+            for p in args.absence_mask_p_list:
+                if p == 1.0 and 1.0 in tcal_per_p_ece:
+                    absmask_tcal_per_p_ece[p] = tcal_per_p_ece[1.0]
+                    continue
+                tl, ty = gather_logits_at_p(
+                    unwrap(model), dataset, eval_indices, dist_info,
+                    p_value=p, batch_size=args.batch_size, device=device,
+                    num_workers=args.num_workers, base_seed=args.seed + 50_000,
+                    amp_dtype=amp_dtype, distributed_sampler=False,
+                    collator_cls=AbsenceMaskCollator,
+                )
+                absmask_tcal_per_p_ece[p] = compute_per_species_ece_from_logits(tl, ty, T=T_star)
+                log_main(env, f"  absmask p={p:.2f}: T-cal ECE = {absmask_tcal_per_p_ece[p]:.4f}")
+        with open(os.path.join(args.output_dir, "temperature.json"), "w") as f:
+            json.dump({
+                "T_star": float(T_star),
+                "fitted_at_p": 1.0,
+                "fitted_on_split": "val",
+                "n_bins": 15,
+                "uniform_tcal_ece_by_p": {f"{p:.2f}": v for p, v in tcal_per_p_ece.items()},
+                "absmask_tcal_ece_by_p": {f"{p:.2f}": v for p, v in absmask_tcal_per_p_ece.items()},
+            }, f, indent=2)
+        log_main(env, f"[temperature_scaling] saved -> {args.output_dir}/temperature.json")
+
     if env.is_main:
         import pandas as pd
         all_species = sorted({
@@ -1027,6 +1084,7 @@ def main():
                 "cbi": per_p_cbi.get(p, float("nan")),
                 "brier": per_p_brier.get(p, float("nan")),
                 "ece": per_p_ece.get(p, float("nan")),
+                "tcal_ece": tcal_per_p_ece.get(p, float("nan")),
             })
         if not args.no_absence_mask_eval:
             for p in args.absence_mask_p_list:
@@ -1040,6 +1098,7 @@ def main():
                     "cbi": absmask_per_p_cbi.get(p, float("nan")),
                     "brier": absmask_per_p_brier.get(p, float("nan")),
                     "ece": absmask_per_p_ece.get(p, float("nan")),
+                    "tcal_ece": absmask_tcal_per_p_ece.get(p, float("nan")),
                 })
         pd.DataFrame(test_rows).to_csv(
             os.path.join(args.output_dir, "test_results.csv"), index=False)
