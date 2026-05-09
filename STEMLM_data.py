@@ -62,6 +62,40 @@ def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
     return float(value)
 
 
+def _normalize_time_col(df: pd.DataFrame, time_col: str, no_time: bool) -> bool:
+    has_time = (not no_time) and (time_col in df.columns)
+    if not has_time:
+        reason = "--no_time" if no_time else f"column '{time_col}' not found"
+        print(f"  Time ignored ({reason}) — purely spatial model")
+        return False
+    col = df[time_col]
+    is_stringlike = (col.dtype == "object"
+                     or pd.api.types.is_datetime64_any_dtype(col)
+                     or pd.api.types.is_string_dtype(col))
+    if is_stringlike:
+        dt = pd.to_datetime(col)
+        df[time_col] = (dt - dt.min()).dt.days.astype(float)
+    else:
+        df[time_col] = df[time_col].astype(float)
+    return True
+
+
+class _SparseSpeciesData:
+    def __init__(self, csr):
+        self._csr = csr
+        self.shape = csr.shape
+
+    def __len__(self):
+        return self._csr.shape[0]
+
+    def __getitem__(self, key):
+        sub = self._csr[key]
+        arr = np.asarray(sub.todense(), dtype=np.float32)
+        if isinstance(key, (int, np.integer)):
+            return arr.ravel()
+        return arr
+
+
 class JSDMDataset(Dataset):
     def __init__(
         self,
@@ -82,27 +116,11 @@ class JSDMDataset(Dataset):
         if df.isna().any().any():
             nan_cols = df.columns[df.isna().any()].tolist()
             raise ValueError(
-                "NaNs found in columns: "
-                + ", ".join(nan_cols)
+                "NaNs found in columns: " + ", ".join(nan_cols)
                 + ". Please impute or drop missing values before training."
             )
 
-        has_time = (not no_time) and (time_col in df.columns)
-        if not has_time:
-            reason = "--no_time" if no_time else f"column '{time_col}' not found"
-            print(f"  Time ignored ({reason}) — purely spatial model")
-
-        if has_time:
-            col = df[time_col]
-            is_stringlike = (col.dtype == "object"
-                             or pd.api.types.is_datetime64_any_dtype(col)
-                             or pd.api.types.is_string_dtype(col))
-            if is_stringlike:
-                dt = pd.to_datetime(col)
-                df[time_col] = (dt - dt.min()).dt.days.astype(float)
-            else:
-                df[time_col] = df[time_col].astype(float)
-
+        has_time = _normalize_time_col(df, time_col, no_time)
         coord_cols = ([time_col] if has_time else []) + [lat_col, lon_col]
         if env_cols is None:
             env_cols     = [c for c in df.columns if c not in coord_cols and c.startswith("env_")]
@@ -110,6 +128,14 @@ class JSDMDataset(Dataset):
         else:
             species_cols = [c for c in df.columns if c not in coord_cols and c not in env_cols]
 
+        species_data = df[species_cols].values.astype(np.float32)
+        self._setup_post_load(df, species_data, species_cols, env_cols,
+                              time_col, lat_col, lon_col, has_time,
+                              spatial_scale_km, euclidean_coords)
+
+    def _setup_post_load(self, df, species_data, species_cols, env_cols,
+                         time_col, lat_col, lon_col, has_time,
+                         spatial_scale_km, euclidean_coords):
         self.species_cols = species_cols
         self.env_cols = env_cols
         self.num_species = len(species_cols)
@@ -126,7 +152,7 @@ class JSDMDataset(Dataset):
         self.lons = self.coords[:, 1]
         N = len(df)
         self.times = df[time_col].values.astype(np.float32) if has_time else np.zeros(N, dtype=np.float32)
-        self.species_data = df[species_cols].values.astype(np.float32)
+        self.species_data = species_data
         self.env_data = (
             df[env_cols].values.astype(np.float32) if env_cols
             else np.zeros((N, 1), dtype=np.float32)
@@ -239,6 +265,86 @@ class JSDMDataset(Dataset):
             "target_idx":     torch.tensor(idx, dtype=torch.long),
             "source_idx":     torch.from_numpy(source_idx.astype(np.int64)),
         }
+
+
+class JSDMSparseDataset(JSDMDataset):
+    def __init__(
+        self,
+        parquet_path: str,
+        vocab_path: str,
+        num_source_sites: int = 64,
+        time_col: str = "time",
+        lat_col: str = "latitude",
+        lon_col: str = "longitude",
+        env_cols: Optional[List[str]] = None,
+        spatial_scale_km: Optional[float] = None,
+        euclidean_coords: bool = False,
+        no_time: bool = False,
+    ):
+        Dataset.__init__(self)
+        self.num_source_sites = num_source_sites
+
+        df = pd.read_parquet(parquet_path)
+        with open(vocab_path) as f:
+            species_cols = json.load(f)
+        if "species_idx" not in df.columns:
+            raise ValueError(
+                "Sparse parquet must have a 'species_idx' column "
+                "(variable-length list<int32> per row). Got: " + ", ".join(df.columns)
+            )
+
+        non_species = [c for c in df.columns if c != "species_idx"]
+        if df[non_species].isna().any().any():
+            nan_cols = [c for c in non_species if df[c].isna().any()]
+            raise ValueError("NaNs found in columns: " + ", ".join(nan_cols))
+
+        has_time = _normalize_time_col(df, time_col, no_time)
+        coord_cols = ([time_col] if has_time else []) + [lat_col, lon_col]
+        if env_cols is None:
+            env_cols = [c for c in df.columns
+                        if c not in coord_cols and c != "species_idx" and c.startswith("env_")]
+
+        from scipy.sparse import csr_matrix
+        idx_lists = df["species_idx"].values
+        N_rows = len(df)
+        counts = np.fromiter((len(x) for x in idx_lists), dtype=np.int64, count=N_rows)
+        indptr = np.empty(N_rows + 1, dtype=np.int64)
+        indptr[0] = 0
+        np.cumsum(counts, out=indptr[1:])
+        indices = (np.concatenate([np.asarray(x, dtype=np.int32) for x in idx_lists])
+                   if N_rows else np.array([], dtype=np.int32))
+        data = np.ones(indices.size, dtype=np.float32)
+        csr = csr_matrix((data, indices, indptr), shape=(N_rows, len(species_cols)))
+        species_data = _SparseSpeciesData(csr)
+
+        self._setup_post_load(df, species_data, species_cols, env_cols,
+                              time_col, lat_col, lon_col, has_time,
+                              spatial_scale_km, euclidean_coords)
+
+
+def csv_to_sparse_parquet(
+    csv_path: str,
+    parquet_out: str,
+    vocab_out: str,
+    time_col: str = "time",
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+) -> None:
+    df = pd.read_csv(csv_path)
+    coord_cols = [c for c in (time_col, lat_col, lon_col) if c in df.columns]
+    env_cols = [c for c in df.columns if c not in coord_cols and c.startswith("env_")]
+    species_cols = [c for c in df.columns if c not in coord_cols and c not in env_cols]
+
+    species_arr = df[species_cols].values.astype(bool)
+    species_idx_per_row = [np.where(row)[0].astype(np.int32) for row in species_arr]
+
+    out_df = df[coord_cols + env_cols].copy()
+    out_df["species_idx"] = species_idx_per_row
+    out_df.to_parquet(parquet_out, index=False)
+
+    os.makedirs(os.path.dirname(os.path.abspath(vocab_out)) or ".", exist_ok=True)
+    with open(vocab_out, "w") as f:
+        json.dump(species_cols, f)
 
 
 class JSDMDataCollator:
