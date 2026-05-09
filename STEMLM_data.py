@@ -9,6 +9,8 @@ from typing import Optional, List, Dict, Any, Tuple
 
 
 EARTH_RADIUS_KM = 6371.0
+_K_MAX = 1024
+_K_QUERY_OVERFETCH = 4
 
 
 def haversine_pairs_np(lat_a: np.ndarray, lon_a: np.ndarray,
@@ -37,38 +39,19 @@ def haversine_pairs_torch(lat_a: torch.Tensor, lon_a: torch.Tensor,
     return EARTH_RADIUS_KM * 2.0 * torch.asin(torch.sqrt(a.clamp(min=0.0)))
 
 
-def _site_distance_rows_np(lats: np.ndarray, lons: np.ndarray,
-                           times: np.ndarray, idx,
-                           euclidean: bool) -> Tuple[np.ndarray, np.ndarray]:
+def _bbox_max_distance(lats: np.ndarray, lons: np.ndarray, times: np.ndarray,
+                       euclidean: bool):
+    lat_min = float(lats.min()); lat_max = float(lats.max())
+    lon_min = float(lons.min()); lon_max = float(lons.max())
     if euclidean:
-        dx = lats - lats[idx]; dy = lons - lons[idx]
-        spatial = np.sqrt(dx * dx + dy * dy).astype(np.float32)
+        max_sp = float(np.hypot(lat_max - lat_min, lon_max - lon_min))
     else:
-        spatial = haversine_pairs_np(lats[idx], lons[idx], lats, lons)
-    temporal = np.abs(times - times[idx]).astype(np.float32)
-    return spatial, temporal
-
-
-def _tiled_stats(lats: np.ndarray, lons: np.ndarray, times: np.ndarray,
-                 euclidean: bool, device: str = "cpu", tile: int = 4096):
-    N = len(lats)
-    lats_t = torch.as_tensor(lats, dtype=torch.float64, device=device)
-    lons_t = torch.as_tensor(lons, dtype=torch.float64, device=device)
-    times_t = torch.as_tensor(times, dtype=torch.float64, device=device)
-    max_sp = torch.tensor(0.0, dtype=torch.float64, device=device)
-    max_tp = torch.tensor(0.0, dtype=torch.float64, device=device)
-    for r0 in range(0, N, tile):
-        r1 = min(r0 + tile, N)
-        la = lats_t[r0:r1, None]; lb = lats_t[None, :]
-        lo_a = lons_t[r0:r1, None]; lo_b = lons_t[None, :]
-        if euclidean:
-            sp = torch.sqrt((la - lb) ** 2 + (lo_a - lo_b) ** 2)
-        else:
-            sp = haversine_pairs_torch(la, lo_a, lb, lo_b)
-        tp = (times_t[r0:r1, None] - times_t[None, :]).abs()
-        max_sp = torch.maximum(max_sp, sp.max())
-        max_tp = torch.maximum(max_tp, tp.max())
-    return float(max_sp.item()), float(max_tp.item())
+        c_lat = np.array([lat_min, lat_min, lat_max, lat_max], dtype=np.float64)
+        c_lon = np.array([lon_min, lon_max, lon_min, lon_max], dtype=np.float64)
+        i, j = np.triu_indices(4, k=1)
+        max_sp = float(haversine_pairs_np(c_lat[i], c_lon[i], c_lat[j], c_lon[j]).max())
+    max_tp = float(times.max() - times.min()) if len(times) else 0.0
+    return max_sp, max_tp
 
 
 def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
@@ -152,80 +135,97 @@ class JSDMDataset(Dataset):
         self.has_time = bool(has_time)
 
         print(f"Dataset: {N} observations, {self.num_species} species, {self.num_env_vars} env vars")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"  Computing max pairwise distance (tiled, device={device})...")
-        max_sp, max_tp = _tiled_stats(self.lats, self.lons, self.times,
-                                      euclidean=self.euclidean_coords, device=device)
+        max_sp, max_tp = _bbox_max_distance(self.lats, self.lons, self.times,
+                                            euclidean=self.euclidean_coords)
         self.spatial_scale_km = _resolve_scale(spatial_scale_km, max_sp, "spatial_scale_km")
         self._max_spatial = max_sp
         self._max_temporal = max_tp if has_time else 0.0
-        
-        self.source_pool = None
-        print("Done.")
 
-    def site_distance_rows(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
-        return _site_distance_rows_np(self.lats, self.lons, self.times, idx,
-                                      euclidean=self.euclidean_coords)
+        if self.euclidean_coords:
+            self._tree = None
+        else:
+            from sklearn.neighbors import BallTree
+            self._tree = BallTree(
+                np.deg2rad(np.column_stack([self.lats, self.lons]).astype(np.float64)),
+                metric="haversine",
+            )
+        self._source_pool = None
+        self._source_pool_mask = None
+
+    @property
+    def source_pool(self):
+        return self._source_pool
+
+    @source_pool.setter
+    def source_pool(self, value):
+        self._source_pool = value
+        if value is None:
+            self._source_pool_mask = None
+        else:
+            mask = np.zeros(len(self.lats), dtype=bool)
+            mask[np.asarray(value)] = True
+            self._source_pool_mask = mask
 
     def __len__(self):
         return len(self.species_data)
 
+    def _knn_candidates(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        N_total = len(self.lats)
+        pool_mask = self._source_pool_mask
+        coords_rad = np.deg2rad(self.coords[idx:idx + 1].astype(np.float64))
+        k_query = min(_K_MAX + 1, N_total)
+        if pool_mask is not None:
+            k_query = min(k_query * _K_QUERY_OVERFETCH, N_total)
+
+        while True:
+            dist_rad, neigh = self._tree.query(coords_rad, k=k_query)
+            neigh = neigh[0]
+            sp = (dist_rad[0] * EARTH_RADIUS_KM).astype(np.float32)
+            keep = neigh != idx
+            if pool_mask is not None:
+                keep &= pool_mask[neigh]
+            neigh = neigh[keep]
+            sp = sp[keep]
+            if len(neigh) >= self.num_source_sites or k_query >= N_total:
+                break
+            k_query = min(k_query * 2, N_total)
+        return neigh, sp
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        N_total = len(self.species_data)
         N = self.num_source_sites
+        target_species = self.species_data[idx]
 
-        target_species = self.species_data[idx]  # (S,)
-
-        sp_row, tp_row = self.site_distance_rows(idx)
-        sp_row = sp_row.astype(np.float32, copy=True)
-        tp_row = tp_row.astype(np.float32, copy=True)
-        sp_row[idx] = np.inf
-        tp_row[idx] = np.inf
-
-        # 1. Set of size N drawn by inverse spatial distance only.
-        inv_sp = 1.0 / (sp_row + 1e-6)
-        if self.source_pool is not None:
-            pool_cand = self.source_pool
-            w1 = inv_sp[pool_cand]
-            w1 = w1 / w1.sum()
-            pool_idx = pool_cand[np.random.choice(
-                len(pool_cand), size=N,
-                replace=(N > len(pool_cand) - 1), p=w1,
-            )]
+        if self._tree is None:
+            cand_idx = (self._source_pool if self._source_pool is not None
+                        else np.arange(len(self.lats)))
+            cand_idx = np.asarray(cand_idx)
+            cand_idx = cand_idx[cand_idx != idx]
+            sp = haversine_pairs_np(self.lats[idx], self.lons[idx],
+                                    self.lats[cand_idx], self.lons[cand_idx]) \
+                if not self.euclidean_coords else \
+                np.sqrt((self.lats[cand_idx] - self.lats[idx]) ** 2
+                        + (self.lons[cand_idx] - self.lons[idx]) ** 2).astype(np.float32)
         else:
-            w1 = inv_sp / inv_sp.sum()
-            pool_idx = np.random.choice(
-                N_total, size=N,
-                replace=(N > N_total - 1), p=w1,
-            )
-            
-        s_sp = float(np.median(sp_row[pool_idx])) + 1e-6
+            cand_idx, sp = self._knn_candidates(idx)
+
         if self.has_time:
-            s_tp = float(np.median(tp_row[pool_idx])) + 1e-6
+            tp = np.abs(self.times[cand_idx] - self.times[idx]).astype(np.float32)
         else:
-            s_tp = 1.0
+            tp = np.zeros_like(sp)
 
-        # 2. Final source sample via rescaled inverse distance.
-        if self.has_time:
-            combined_dist = np.sqrt((sp_row / s_sp) ** 2 + (tp_row / s_tp) ** 2)
-        else:
-            combined_dist = sp_row / s_sp
-        inv_dist = 1.0 / (combined_dist + 1e-6)
+        n_cand = len(cand_idx)
+        replace = N > n_cand - 1
 
-        if self.source_pool is not None:
-            pool = self.source_pool
-            w2 = inv_dist[pool]
-            w2 = w2 / w2.sum()
-            source_idx = pool[np.random.choice(
-                len(pool), size=N,
-                replace=(N > len(pool) - 1), p=w2,
-            )]
-        else:
-            w2 = inv_dist / inv_dist.sum()
-            source_idx = np.random.choice(
-                N_total, size=N,
-                replace=(N > N_total - 1), p=w2,
-            )
+        inv_sp = 1.0 / (sp + 1e-6)
+        w1 = inv_sp / inv_sp.sum()
+        sample1 = np.random.choice(n_cand, size=N, replace=replace, p=w1)
+        s_sp = float(np.median(sp[sample1])) + 1e-6
+        s_tp = float(np.median(tp[sample1])) + 1e-6 if self.has_time else 1.0
+
+        combined = np.sqrt((sp / s_sp) ** 2 + (tp / s_tp) ** 2) if self.has_time else (sp / s_sp)
+        inv_d = 1.0 / (combined + 1e-6)
+        w2 = inv_d / inv_d.sum()
+        source_idx = cand_idx[np.random.choice(n_cand, size=N, replace=replace, p=w2)]
 
         source_species = np.ascontiguousarray(self.species_data[source_idx].T)
         source_env = self.env_data[source_idx]

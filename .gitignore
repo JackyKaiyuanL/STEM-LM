@@ -1,5 +1,2 @@
-/__pycache__
-/lab
-/bench
-/Examples
-/data
+__pycache__/
+*.py[cod]

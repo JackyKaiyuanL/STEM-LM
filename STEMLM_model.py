@@ -9,6 +9,7 @@ from transformers.modeling_outputs import ModelOutput
 
 
 _EARTH_RADIUS_KM = 6371.0
+_SPECIES_ATTN_QUERY_CHUNK = 512
 
 def _haversine_bt_n(lat_a, lon_a, lat_b, lon_b):
     lat_a_r = torch.deg2rad(lat_a); lon_a_r = torch.deg2rad(lon_a)
@@ -251,7 +252,6 @@ class SpeciesSelfAttention(nn.Module):
         self.key = nn.Linear(config.hidden_size, self.all_head_size)
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
-        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.attention_probs_dropout_prob = config.attention_probs_dropout_prob
 
     def transpose_for_scores(self, x):
@@ -263,32 +263,38 @@ class SpeciesSelfAttention(nn.Module):
         return x.transpose(-2, -3)
 
     def forward(self, hidden_states, output_attentions=False):
-
-        query_layer = self.transpose_for_scores(self.query(hidden_states))  # (B, T, A, S, D)
-        key_layer   = self.transpose_for_scores(self.key(hidden_states))    # (B, T, A, S, D)
-        value_layer = self.transpose_for_scores(self.value(hidden_states))  # (B, T, A, S, D)
+        query_layer = self.transpose_for_scores(self.query(hidden_states))
+        key_layer   = self.transpose_for_scores(self.key(hidden_states))
+        value_layer = self.transpose_for_scores(self.value(hidden_states))
+        scale = 1.0 / math.sqrt(self.attention_head_size)
 
         if output_attentions:
-            attn_scores = torch.matmul(
-                query_layer, key_layer.transpose(-1, -2)
-            ) / math.sqrt(self.attention_head_size)
-            attn_probs = F.softmax(attn_scores, dim=-1)
-            attn_probs = self.dropout(attn_probs)
-            context = torch.matmul(attn_probs, value_layer)
-            context = context.transpose(-2, -3).contiguous()
+            S = query_layer.shape[-2]
+            chunk = min(_SPECIES_ATTN_QUERY_CHUNK, S)
+            K_t = key_layer.transpose(-1, -2)
+            ctx_parts, attn_parts = [], []
+            for i in range(0, S, chunk):
+                Qc = query_layer[..., i:i + chunk, :]
+                p = F.dropout(
+                    F.softmax(torch.matmul(Qc, K_t) * scale, dim=-1),
+                    p=self.attention_probs_dropout_prob,
+                    training=self.training,
+                )
+                ctx_parts.append(torch.matmul(p, value_layer))
+                attn_parts.append(p.mean(dim=-3))
+            context = torch.cat(ctx_parts, dim=-2).transpose(-2, -3).contiguous()
+            attn_probs = torch.cat(attn_parts, dim=-2)
             new_shape = context.size()[:-2] + (self.all_head_size,)
-            context = context.view(*new_shape)
-            return context, attn_probs
-        else:
-            context = F.scaled_dot_product_attention(
-                query_layer, key_layer, value_layer,
-                dropout_p=self.attention_probs_dropout_prob if self.training else 0.0,
-                scale=1.0 / math.sqrt(self.attention_head_size),
-            )
-            context = context.transpose(-2, -3).contiguous()
-            new_shape = context.size()[:-2] + (self.all_head_size,)
-            context = context.view(*new_shape)
-            return (context,)
+            return context.view(*new_shape), attn_probs
+
+        context = F.scaled_dot_product_attention(
+            query_layer, key_layer, value_layer,
+            dropout_p=self.attention_probs_dropout_prob if self.training else 0.0,
+            scale=scale,
+        )
+        context = context.transpose(-2, -3).contiguous()
+        new_shape = context.size()[:-2] + (self.all_head_size,)
+        return (context.view(*new_shape),)
 
 
 
@@ -880,4 +886,4 @@ def extract_cooccurrence_matrix(output: JSDMOutput, layer_idx: int = -1) -> torc
     if output.species_attentions is None:
         raise ValueError("Run with output_attentions=True")
     attn = output.species_attentions[layer_idx]
-    return attn.squeeze(1).mean(dim=1)
+    return attn.squeeze(1)
