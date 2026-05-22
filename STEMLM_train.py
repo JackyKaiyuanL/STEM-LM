@@ -336,6 +336,9 @@ def main():
     parser = argparse.ArgumentParser(description="Train STEM-LM")
     parser.add_argument("csv_path", type=str)
     parser.add_argument("--num_source_sites", type=int, default=64)
+    parser.add_argument("--num_scale_sites", type=int, default=None,
+                        help="N1: nearest neighbors used to estimate the per-target "
+                             "spatial/temporal bandwidths; defaults to --num_source_sites.")
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--num_attention_heads", type=int, default=4)
     parser.add_argument("--num_hidden_layers", type=int, default=3)
@@ -530,6 +533,7 @@ def main():
         csv_path=args.csv_path,
         batch_size=args.batch_size,
         num_source_sites=args.num_source_sites,
+        num_scale_sites=args.num_scale_sites,
         p=args.p,
         train_frac=args.train_frac,
         test_frac=args.test_frac,
