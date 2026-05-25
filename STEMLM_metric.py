@@ -54,9 +54,12 @@ def safe_ece(labels: np.ndarray, preds: np.ndarray, n_bins: int = 15) -> float:
 
 
 def safe_cbi(labels: np.ndarray, preds: np.ndarray,
-             n_windows: int = 101, width: float = 0.1,
-             min_per_window: int = 10) -> float:
-    # Continuous Boyce Index (Hirzel et al. 2006)
+             n_windows: int = 101, bin_width_frac: float = 0.1) -> float:
+    # Continuous Boyce Index (Hirzel et al. 2006). Moving windows span the observed
+    # prediction range [min, max]; each window has width bin_width_frac of that range.
+    # P/E is the presence fraction over the absence (background) fraction per window;
+    # CBI is the Spearman correlation between window center and P/E. Windows with no
+    # background points are dropped.
     if labels.size == 0 or labels.sum() == 0 or labels.sum() == labels.size:
         return float("nan")
     if np.isnan(preds).any():
@@ -65,18 +68,18 @@ def safe_cbi(labels: np.ndarray, preds: np.ndarray,
     bg_preds = preds[labels == 0]
     if bg_preds.size == 0 or pres_preds.size == 0:
         return float("nan")
-    centers = np.linspace(0.0, 1.0, n_windows)
-    half_w = width / 2.0
+    lo, hi = float(preds.min()), float(preds.max())
+    if hi <= lo:
+        return float("nan")
+    half_w = 0.5 * bin_width_frac * (hi - lo)
+    centers = np.linspace(lo, hi, n_windows)
     pe = np.full(n_windows, np.nan, dtype=np.float64)
     for i, ctr in enumerate(centers):
-        lo, hi = ctr - half_w, ctr + half_w
-        n_bg = int(((bg_preds >= lo) & (bg_preds <= hi)).sum())
-        if n_bg < min_per_window:
-            continue
-        e_frac = n_bg / bg_preds.size
+        lo_i, hi_i = ctr - half_w, ctr + half_w
+        e_frac = ((bg_preds >= lo_i) & (bg_preds <= hi_i)).sum() / bg_preds.size
         if e_frac == 0:
             continue
-        p_frac = ((pres_preds >= lo) & (pres_preds <= hi)).sum() / pres_preds.size
+        p_frac = ((pres_preds >= lo_i) & (pres_preds <= hi_i)).sum() / pres_preds.size
         pe[i] = p_frac / e_frac
     ok = np.isfinite(pe)
     if ok.sum() < 3 or np.unique(pe[ok]).size < 2:
