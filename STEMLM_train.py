@@ -179,7 +179,7 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
 
     optimizer.zero_grad()
     for batch_idx, batch in enumerate(loader):
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         B = batch["input_ids"].shape[0]
         w = loss_weight[None, :].expand(B, -1).to(device) if loss_weight is not None else None
@@ -269,7 +269,7 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
     use_amp = amp_dtype is not None and device.type == "cuda"
 
     for batch in loader:
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         if use_amp:
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 output = _forward(model, batch, dist_info,
@@ -566,6 +566,8 @@ def main():
             collate_fn=train_collator,
             num_workers=args.num_workers,
             pin_memory=True,
+            worker_init_fn=seed_worker,
+            persistent_workers=args.num_workers > 0,
         )
         log_main(env,
             f"Train loader sharded: per-rank batches={len(train_loader)}, "
@@ -1176,7 +1178,7 @@ def main():
             for i, batch in enumerate(val_loader):
                 if i >= args.cooccurrence_extract_batches:
                     break
-                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                 output = unwrap(model)(
                     input_ids=batch["input_ids"], source_ids=batch["source_ids"],
                     source_idx=batch["source_idx"],

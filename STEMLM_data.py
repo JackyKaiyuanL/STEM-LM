@@ -9,6 +9,12 @@ from typing import Optional, List, Dict, Any, Tuple
 
 
 EARTH_RADIUS_KM = 6371.0
+
+
+def seed_worker(worker_id):
+    np.random.seed(torch.initial_seed() % 2**32)
+
+
 _K_MAX = 1024
 _K_QUERY_OVERFETCH = 4
 
@@ -588,6 +594,7 @@ def build_val_loaders_fixed_p(dataset, val_indices, dist_info, p_values,
         loaders.append((float(p), DataLoader(
             subset, batch_size=batch_size, shuffle=False,
             collate_fn=col, num_workers=num_workers, pin_memory=True,
+            worker_init_fn=seed_worker,
         )))
     return loaders
 
@@ -787,11 +794,14 @@ def create_dataloaders(
     train_shuffle_gen = torch.Generator().manual_seed(int(seed))
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                                collate_fn=collator, num_workers=num_workers, pin_memory=True,
-                               generator=train_shuffle_gen)
+                               worker_init_fn=seed_worker, generator=train_shuffle_gen,
+                               persistent_workers=num_workers > 0)
     val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                               collate_fn=collator, num_workers=num_workers, pin_memory=True)
+                               collate_fn=collator, num_workers=num_workers, pin_memory=True,
+                               worker_init_fn=seed_worker)
     test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
-                               collate_fn=collator, num_workers=num_workers, pin_memory=True) if test_dataset else None
+                               collate_fn=collator, num_workers=num_workers, pin_memory=True,
+                               worker_init_fn=seed_worker) if test_dataset else None
 
     print(f"Split ({split_origin}): "
           f"{len(train_indices)} train / {len(val_indices)} val / {len(test_indices)} test")

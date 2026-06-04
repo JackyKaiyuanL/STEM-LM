@@ -8,7 +8,7 @@ from scipy.stats import spearmanr
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
-from STEMLM_data import FixedPValCollator
+from STEMLM_data import FixedPValCollator, seed_worker
 
 def safe_auc_roc(labels: np.ndarray, preds: np.ndarray) -> float:
     if labels.size == 0 or len(set(labels.tolist())) < 2:
@@ -244,10 +244,12 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
         if is_distributed:
             sampler = DistributedSampler(subset, shuffle=False)
             loader = DataLoader(subset, batch_size=batch_size, sampler=sampler,
-                                collate_fn=collator, num_workers=num_workers, pin_memory=True)
+                                collate_fn=collator, num_workers=num_workers, pin_memory=True,
+                                worker_init_fn=seed_worker)
         else:
             loader = DataLoader(subset, batch_size=batch_size, shuffle=False,
-                                collate_fn=collator, num_workers=num_workers, pin_memory=True)
+                                collate_fn=collator, num_workers=num_workers, pin_memory=True,
+                                worker_init_fn=seed_worker)
 
         for batch in loader:
             if use_amp:
@@ -350,10 +352,12 @@ def gather_logits_at_p(model, dataset, eval_indices, dist_info, p_value: float,
     if is_distributed:
         sampler = DistributedSampler(subset, shuffle=False)
         loader = DataLoader(subset, batch_size=batch_size, sampler=sampler,
-                            collate_fn=collator, num_workers=num_workers, pin_memory=True)
+                            collate_fn=collator, num_workers=num_workers, pin_memory=True,
+                            worker_init_fn=seed_worker)
     else:
         loader = DataLoader(subset, batch_size=batch_size, shuffle=False,
-                            collate_fn=collator, num_workers=num_workers, pin_memory=True)
+                            collate_fn=collator, num_workers=num_workers, pin_memory=True,
+                            worker_init_fn=seed_worker)
 
     logits_by_idx: Dict[int, np.ndarray] = {}
     labels_by_idx: Dict[int, np.ndarray] = {}
