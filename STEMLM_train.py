@@ -654,7 +654,7 @@ def main():
             model,
             device_ids=[env.local_rank],
             output_device=env.local_rank,
-            find_unused_parameters=True,
+            find_unused_parameters=args.ablation != "full",
             gradient_as_bucket_view=True,
         )
         log_main(env, "Model wrapped with DistributedDataParallel")
@@ -693,6 +693,7 @@ def main():
             {"params": nodecay_params, "weight_decay": 0.0},
         ],
         lr=args.learning_rate,
+        fused=device.type == "cuda",
     )
     
     total_steps = (len(train_loader) // max(args.grad_accum_steps, 1)) * args.num_epochs
