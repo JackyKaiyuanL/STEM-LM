@@ -149,13 +149,6 @@ class RMSNorm(nn.Module):
 
 # =============================================================================
 # Target Input
-#
-# State embedding: 3 tokens (0=absent, 1=present, 2=mask).
-# Species identity embedding: learned per-species vector (S × H), added to
-#   state embedding so every species has a distinct input representation
-#   independent of its state.
-#
-#   No positional encoding since species ordering is arbitrary.
 # =============================================================================
 
 class TargetInput(nn.Module):
@@ -180,7 +173,6 @@ class TargetInput(nn.Module):
 
 # =============================================================================
 # Target Environment Module
-# Projects target site's own env vars into a single token appended to env_emb.
 # =============================================================================
 
 class TargetEnvModule(nn.Module):
@@ -237,7 +229,6 @@ class EnvSourceModule(nn.Module):
 
 # =============================================================================
 # Row Self-Attention along species axis
-# Species attend to each other — the cooccurrence term.
 # =============================================================================
 
 class SpeciesSelfAttention(nn.Module):
@@ -527,8 +518,6 @@ class EnvColAttention(nn.Module):
 
 # =============================================================================
 # Combined Attention
-#
-# row_attention → (st_col + env_col) sum residual
 # =============================================================================
 
 class JSDMAttention(nn.Module):
@@ -553,14 +542,12 @@ class JSDMAttention(nn.Module):
         st_attention_mask=None, st_dist=None,
         output_attentions=False,
     ):
-        # 1. Pre-norm → species self-attention → residual  (B,S,T,H) ↔ (B,T,S,H)
         row_output = self.row_attention(
             hidden_states=self.row_norm(hidden_states).transpose(-2, -3),
             output_attentions=output_attentions,
         )
         h = hidden_states + row_output[0].transpose(-2, -3)
 
-        # 2 & 3. Shared pre-norm → ST and/or Env cross-attention → summed residual
         st_attn  = None
         env_attn = None
 
@@ -587,7 +574,6 @@ class JSDMAttention(nn.Module):
             h = h + env_out[0]
             if output_attentions:
                 env_attn = env_out[1]
-        # else (no_st_env): pure species-self block, skip cross-attention
 
         out = (h,)
         if output_attentions:
@@ -845,10 +831,7 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
                         w = loss_weight.unsqueeze(-1).expand_as(labels)[mask]
                         loss = (per_el * w).sum() / w.sum()
                 elif loss_type == "focal":
-                    # Sigmoid focal loss (Lin et al. 2017, RetinaNet form):
-                    #   FL = -alpha_t * (1 - p_t)^gamma * log(p_t)
-                    #   p_t     = p if y==1 else 1-p
-                    #   alpha_t = alpha if y==1 else 1-alpha   (alpha<0 disables alpha)
+                    # Sigmoid focal loss (Lin et al. 2017, RetinaNet form)
                     x = logits[mask].float()
                     y = labels[mask].float()
                     ce = F.binary_cross_entropy_with_logits(x, y, reduction="none")
