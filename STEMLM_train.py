@@ -334,7 +334,12 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
 
 def main():
     parser = argparse.ArgumentParser(description="Train STEM-LM")
-    parser.add_argument("csv_path", type=str)
+    parser.add_argument("csv_path", type=str,
+                        help="Wide CSV, or (with --vocab_path) a sparse-parquet file or "
+                             "directory of parquet shards.")
+    parser.add_argument("--vocab_path", type=str, default=None,
+                        help="species_vocab.json; if set, csv_path is read as sparse parquet "
+                             "(species_idx) via JSDMSparseDataset.")
     parser.add_argument("--num_source_sites", type=int, default=64)
     parser.add_argument("--num_scale_sites", type=int, default=None,
                         help="N1: nearest neighbors used to estimate the per-target "
@@ -545,6 +550,7 @@ def main():
         fold_method=args.fold,
         resolution=args.resolution,
         saved_splits=saved_splits,
+        vocab_path=args.vocab_path,
     )
 
     if env.is_distributed:

@@ -301,7 +301,14 @@ class JSDMSparseDataset(JSDMDataset):
         self.num_source_sites = num_source_sites
         self.num_scale_sites = num_scale_sites if num_scale_sites is not None else num_source_sites
 
-        df = pd.read_parquet(parquet_path)
+        if os.path.isdir(parquet_path):
+            parts = sorted(os.path.join(parquet_path, f)
+                           for f in os.listdir(parquet_path) if f.endswith(".parquet"))
+            if not parts:
+                raise FileNotFoundError(f"No .parquet shards in {parquet_path}")
+            df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
+        else:
+            df = pd.read_parquet(parquet_path)
         with open(vocab_path) as f:
             species_cols = json.load(f)
         if "species_idx" not in df.columns:
@@ -711,17 +718,30 @@ def create_dataloaders(
     fold_method="random", resolution: Optional[int] = None,
     saved_splits: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     restrict_source_pool_with_saved_splits: bool = True,
+    vocab_path: Optional[str] = None,
 ):
 
-    dataset = JSDMDataset(
-        csv_path=csv_path,
-        num_source_sites=num_source_sites,
-        num_scale_sites=num_scale_sites,
-        env_cols=env_cols,
-        spatial_scale_km=spatial_scale_km,
-        euclidean_coords=euclidean_coords,
-        no_time=no_time,
-    )
+    if vocab_path is not None:
+        dataset = JSDMSparseDataset(
+            parquet_path=csv_path,
+            vocab_path=vocab_path,
+            num_source_sites=num_source_sites,
+            num_scale_sites=num_scale_sites,
+            env_cols=env_cols,
+            spatial_scale_km=spatial_scale_km,
+            euclidean_coords=euclidean_coords,
+            no_time=no_time,
+        )
+    else:
+        dataset = JSDMDataset(
+            csv_path=csv_path,
+            num_source_sites=num_source_sites,
+            num_scale_sites=num_scale_sites,
+            env_cols=env_cols,
+            spatial_scale_km=spatial_scale_km,
+            euclidean_coords=euclidean_coords,
+            no_time=no_time,
+        )
 
     print("Computing distance info...")
     dist_info = compute_dist_info(dataset)
