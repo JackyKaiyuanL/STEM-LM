@@ -1,9 +1,10 @@
 # CISO benchmark on eButterfly
 
-Reproduces the CISO-SDM baseline on the eButterfly NA dataset for seeds 1337/1338/1339.
+Reproduces the CISO-SDM baseline on the eButterfly NA dataset. The seed-1337
+notebook is the template for all runs.
 
 ## What's here
-- `ciso_train_benchmark_final_seed{1337,1338,1339}.ipynb` — train + evaluate at five `eval_known_ratio` levels.
+- `ciso_train_benchmark_final_seed1337.ipynb` — train + evaluate at five `eval_known_ratio` levels.
 - `results_CISO_butterfly_100_epochs_seed*/results_ratio_*.csv` — pre-computed per-mask metrics.
 - `results_CISO_butterfly_100_epochs_seed*/ciso_benchmark_summary.csv` — aggregated summary.
 
@@ -20,6 +21,9 @@ cd benchmarks/CISO/eButterfly
 export WORK_DIR=/path/to/dir/containing/csv_and_splits
 jupyter notebook ciso_train_benchmark_final_seed1337.ipynb
 ```
+For another seed, change the config's `training.seed` and the seed-suffixed
+`RESULTS_DIR` in the notebook before running it.
+
 The notebook will:
 1. Generate the prep `.npy` / CSV files and `configs/config_ciso_*.yaml` from the input CSV + splits.
 2. Train CISO for 100 epochs.

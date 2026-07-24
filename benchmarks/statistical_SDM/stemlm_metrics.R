@@ -37,7 +37,7 @@ safe_ece <- function(labels, preds, n_bins = 15) {
   err
 }
 
-# CBI: bg-only "expected" denominator, min_per_window floor — matches STEMLM_metric.safe_cbi.
+# CBI: bg-only "expected" denominator, min_per_window floor
 safe_cbi <- function(labels, preds, n_windows = 101, width = 0.1, min_per_window = 10) {
   if (sum(labels) == 0 || sum(labels) == length(labels)) return(NA_real_)
   if (any(is.na(preds))) return(NA_real_)
