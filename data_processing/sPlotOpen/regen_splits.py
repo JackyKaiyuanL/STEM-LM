@@ -1,19 +1,4 @@
-"""
-Regenerate ebutterfly_splits_v2.json from the v2 CSV using the same h3
-spatial-block fold as the original (resolution=2, seed=42, train/val/test
-0.8/0.1/0.1).
-
-Required because phase 1 / 3 can drop a handful of rows whose nearest valid
-WorldClim or MODIS pixel is too far away.
-
-Usage:
-  python regen_splits_v2.py \\
-      --in_csv  ${REPO_ROOT}/lab/ebutterfly_na_2011_2025_jsdm_v2.csv \\
-      --out_json ${REPO_ROOT}/lab/ebutterfly_splits_v2.json \\
-      --resolution 2 --seed 42
-
-Self-contained — no model code needed. Mirrors jsdm_data.py:h3_block_split.
-"""
+"""Generate an H3 spatial-block split for the processed sPlotOpen CSV."""
 
 import argparse
 import json
@@ -31,7 +16,7 @@ def log(msg):
 
 
 def h3_block_split(lats, lons, resolution=2, train_frac=0.8, test_frac=0.1, seed=42):
-    """Mirror of jsdm_data.py's h3_block_split."""
+    """Mirror STEMLM_data.h3_block_split."""
     try:
         import h3
     except ImportError:
@@ -44,21 +29,20 @@ def h3_block_split(lats, lons, resolution=2, train_frac=0.8, test_frac=0.1, seed
     n_cells = len(uniq_cells)
     log(f"  {n} obs across {n_cells} unique h3 res-{resolution} cells")
 
-    rng = np.random.default_rng(seed)
+    rng = np.random.RandomState(seed)
     perm = rng.permutation(n_cells)
     shuffled = uniq_cells[perm]
 
-    n_train_cells = int(round(n_cells * train_frac))
-    n_test_cells  = int(round(n_cells * test_frac))
-    n_val_cells   = n_cells - n_train_cells - n_test_cells
+    n_test_cells = max(1, round(n_cells * test_frac))
+    n_val_cells = max(1, round(n_cells * (1 - train_frac - test_frac)))
 
-    train_cells = set(shuffled[:n_train_cells])
-    val_cells   = set(shuffled[n_train_cells:n_train_cells + n_val_cells])
-    test_cells  = set(shuffled[n_train_cells + n_val_cells:])
+    test_cells = set(shuffled[:n_test_cells])
+    val_cells = set(shuffled[n_test_cells:n_test_cells + n_val_cells])
+    train_cells = set(shuffled) - test_cells - val_cells
 
-    train_idx = np.array([i for i in range(n) if cells[i] in train_cells], dtype=np.int64)
-    val_idx   = np.array([i for i in range(n) if cells[i] in val_cells],   dtype=np.int64)
-    test_idx  = np.array([i for i in range(n) if cells[i] in test_cells],  dtype=np.int64)
+    train_idx = np.where(np.isin(cells, list(train_cells)))[0]
+    val_idx = np.where(np.isin(cells, list(val_cells)))[0]
+    test_idx = np.where(np.isin(cells, list(test_cells)))[0]
     return train_idx, val_idx, test_idx
 
 
