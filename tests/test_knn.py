@@ -11,7 +11,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from stemlm.data import JSDMDataset
+from stemlm.data import (
+    _K_MAX,
+    _K_QUERY_OVERFETCH,
+    JSDMDataset,
+    haversine_pairs_np,
+)
 
 SPECIES = [f"species_{i}" for i in range(6)]
 ENV_COLS = ["env_temp", "env_precip"]
@@ -68,6 +73,31 @@ def test_batched_matches_sequential(dataset):
     assert len(ref) == len(got)
     for i, r, g in zip(indices, ref, got, strict=True):
         np.testing.assert_array_equal(r, g, err_msg=f"source_idx differs at index {i}")
+
+
+def _bruteforce_candidates(ds, idx):
+    """Exact nearest-in-pool candidate set the FAISS path should reproduce:
+    the in-pool points among the k_query true-nearest by haversine."""
+    n = len(ds.lats)
+    k_query = min(_K_MAX + 1, n)
+    if ds._source_pool_mask is not None:
+        k_query = min(k_query * _K_QUERY_OVERFETCH, n)
+    d = haversine_pairs_np(ds.lats[idx], ds.lons[idx], ds.lats, ds.lons)
+    order = np.argsort(d, kind="stable")[:k_query]
+    keep = order != idx
+    if ds._source_pool_mask is not None:
+        keep &= ds._source_pool_mask[order]
+    return order[keep]
+
+
+def test_faiss_candidates_match_bruteforce(dataset):
+    """FAISS (exact Flat at this N) must return exactly the brute-force
+    haversine nearest-in-pool — validates the xyz L2 == great-circle ordering."""
+    for idx in [3, 8, 40, 99, 158]:
+        cand, sp = dataset._candidates_scalar(idx)
+        expected = _bruteforce_candidates(dataset, idx)
+        assert set(cand.tolist()) == set(expected.tolist()), f"candidate set differs at {idx}"
+        assert np.all(np.diff(sp) >= -1e-3), "candidates not sorted by distance"
 
 
 def test_batched_matches_sequential_full_pool(tmp_path_factory):
