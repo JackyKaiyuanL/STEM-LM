@@ -382,11 +382,12 @@ def add_train_args(parser):
                              "Val = 1 - train_frac - test_frac. Set to 0 to disable "
                              "(final AUC reported on val, same as early-stopping set).")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_workers", type=int, default=min(8, os.cpu_count() or 1),
-                        help="DataLoader worker processes. Default min(8, cpu_count). "
+    parser.add_argument("--num_workers", type=int, default=min(32, os.cpu_count() or 1),
+                        help="DataLoader worker processes. Default min(32, cpu_count). "
                              "The per-sample source-pool KNN sampling is CPU-bound and "
                              "serial per worker, so 0 starves the GPU (measured ~7x slower "
-                             "on an H100). Set 0 only for debugging.")
+                             "on an H100). Throughput plateaus at 32 on an H100 node "
+                             "(16->32 is +17%%, 48 and 64 are flat). Set 0 only for debugging.")
     parser.add_argument("--output_dir", type=str, default="./STEMLM_output")
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--compile", action="store_true",

@@ -343,14 +343,11 @@ class STCrossAttention(nn.Module):
     ):
         query_layer = self.transpose_for_scores(self.query(hidden_states))
         if isinstance(source_embeddings, tuple):
-            # (basis, ids): project the 3*S distinct source rows, then gather.
+            # (basis, flat_idx): project the 3*S distinct source rows, then gather.
             # Equivalent to projecting the dense (B, S, N, H) tensor — the linear
             # map is applied to exactly the same vectors — but the big tensor is
             # never built, so neither is its saved activation for backward.
-            basis, source_ids = source_embeddings
-            S = basis.size(1)
-            flat_idx = (source_ids * S
-                        + torch.arange(S, device=source_ids.device)[None, :, None])
+            basis, flat_idx = source_embeddings
             key_layer = self.transpose_for_scores(
                 self._gather_projected(self.key, basis, flat_idx))
             value_layer = self.transpose_for_scores(
@@ -738,7 +735,14 @@ class JSDMModel(nn.Module):
         species_emb = self.target_input.species_embedding.weight        # (S, H)
         state_emb = self.target_input.embedding.weight                 # (3, H)
         source_basis = state_emb[:, None, :] + species_emb[None, :, :]  # (3, S, H)
-        source_emb = (source_basis, source_ids)
+        # Flatten (state, species) into one index up front — every layer reuses it,
+        # and this is where a narrow (uint8) source_ids gets widened, on-device.
+        S_src = source_basis.size(1)
+        source_flat_idx = (
+            source_ids.long() * S_src
+            + torch.arange(S_src, device=source_ids.device)[None, :, None]
+        )
+        source_emb = (source_basis, source_flat_idx)
 
         if self.use_env:
             env_emb = torch.cat([

@@ -571,7 +571,10 @@ class JSDMDataCollator:
             )
         target_ids[indices_replaced] = 2
 
-        source_ids = source_species.long()
+        # 0/1 presence: keep it uint8 through worker IPC and the host copy
+        # (int64 would be 8x the bytes for a tensor that is ~99% zeros);
+        # the model widens it on-device where the gather needs an index.
+        source_ids = source_species.to(torch.uint8)
 
         labels[~masked_indices] = -100
 
@@ -623,7 +626,10 @@ class AbsenceMaskCollator(JSDMDataCollator):
         target_ids = target_species.long()
         target_ids[masked] = 2
 
-        source_ids = source_species.long()
+        # 0/1 presence: keep it uint8 through worker IPC and the host copy
+        # (int64 would be 8x the bytes for a tensor that is ~99% zeros);
+        # the model widens it on-device where the gather needs an index.
+        source_ids = source_species.to(torch.uint8)
 
         labels = target_species.clone()
         labels[~masked] = -100
@@ -668,7 +674,10 @@ class FixedPValCollator(JSDMDataCollator):
         target_ids = target_species.long()
         target_ids[masked] = 2
 
-        source_ids = source_species.long()
+        # 0/1 presence: keep it uint8 through worker IPC and the host copy
+        # (int64 would be 8x the bytes for a tensor that is ~99% zeros);
+        # the model widens it on-device where the gather needs an index.
+        source_ids = source_species.to(torch.uint8)
 
         labels = target_species.clone()
         labels[~masked] = -100
