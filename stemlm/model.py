@@ -337,12 +337,63 @@ class STCrossAttention(nn.Module):
         table = proj(basis).reshape(-1, proj.out_features)
         return F.embedding(flat_idx, table)
 
+    def _collapsed_forward(self, query_layer, basis, source_ids,
+                           combined_mask, output_attentions):
+        """Attend over source sites without ever materialising K or V.
+
+        Keys and values take only ``basis.size(0) * S`` distinct values, so the
+        query-key products reduce to one per (bin, species) and the context is a
+        weighted sum of the few distinct value vectors:
+
+            out = sum_n a_n V[id_n, s] = sum_i (sum_{n: id_n = i} a_n) V[i, s]
+
+        Only the (B, S, heads, T, N) attention weights are built — the dense K/V
+        would be (B, S, N, all_head), tens of times larger.
+        """
+        n_bins, S, _ = basis.shape
+        h, hd = self.num_attention_heads, self.attention_head_size
+        k_tab = self.key(basis).view(n_bins, S, h, hd)
+        v_tab = self.value(basis).view(n_bins, S, h, hd)
+
+        # One query-key product per bin: (B, S, h, T, n_bins)
+        qk = torch.einsum("bshtd,ishd->bshti", query_layer, k_tab)
+        qk = qk / math.sqrt(hd)
+
+        # Expand each source site to its bin's score. gather() reads the expanded
+        # index as a view, so no (B, S, h, T, N) index tensor is materialised.
+        B, _, _, T, _ = qk.shape
+        N = source_ids.size(-1)
+        idx = source_ids.long()[:, :, None, None, :].expand(B, S, h, T, N)
+        attn_scores = torch.gather(qk, -1, idx)
+        if combined_mask is not None:
+            attn_scores = attn_scores + combined_mask
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        weights = F.dropout(attn_probs, p=self.attention_probs_dropout_prob,
+                            training=self.training)
+
+        # Total weight landing on each bin, then combine the distinct values.
+        bins = torch.stack(
+            [(weights * (source_ids == i)[:, :, None, None, :]).sum(-1)
+             for i in range(n_bins)],
+            dim=-1,
+        )                                                   # (B, S, h, T, n_bins)
+        context = torch.einsum("bshti,ishd->bshtd", bins, v_tab)
+        context = context.transpose(-2, -3).contiguous()
+        context = context.view(*context.size()[:-2], self.all_head_size)
+        return (context, attn_probs) if output_attentions else (context,)
+
     def forward(
         self, hidden_states, source_embeddings,
         attention_mask=None, st_dist_bias=None, output_attentions=False,
     ):
         query_layer = self.transpose_for_scores(self.query(hidden_states))
-        if isinstance(source_embeddings, tuple):
+        collapse = None
+        if isinstance(source_embeddings, tuple) and len(source_embeddings) == 3:
+            # (basis, flat_idx, ids): keys/values stay collapsed to their few
+            # distinct rows — see _collapsed_forward.
+            basis, _flat_idx, source_ids = source_embeddings
+            collapse = (basis, source_ids)
+        elif isinstance(source_embeddings, tuple):
             # (basis, flat_idx): project the 3*S distinct source rows, then gather.
             # Equivalent to projecting the dense (B, S, N, H) tensor — the linear
             # map is applied to exactly the same vectors — but the big tensor is
@@ -363,6 +414,10 @@ class STCrossAttention(nn.Module):
             combined_mask = attention_mask
         elif st_dist_bias is not None:
             combined_mask = st_dist_bias.to(query_layer.dtype)
+
+        if collapse is not None:
+            return self._collapsed_forward(query_layer, *collapse,
+                                           combined_mask, output_attentions)
 
         if output_attentions:
             attn_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
@@ -742,7 +797,7 @@ class JSDMModel(nn.Module):
             source_ids.long() * S_src
             + torch.arange(S_src, device=source_ids.device)[None, :, None]
         )
-        source_emb = (source_basis, source_flat_idx)
+        source_emb = (source_basis, source_flat_idx, source_ids)
 
         if self.use_env:
             env_emb = torch.cat([

@@ -12,11 +12,16 @@ import torch
 from stemlm.model import JSDMConfig, JSDMModel, STCrossAttention
 
 
+def _flat_idx(basis, source_ids):
+    """Build the (state, species) flat index exactly as JSDMModel does."""
+    S = basis.size(1)
+    return (source_ids.long() * S
+            + torch.arange(S, device=source_ids.device)[None, :, None])
+
+
 def _dense_source_emb(basis, source_ids):
     """The (B, S, N, H) tensor the gather path avoids building."""
-    S = basis.size(1)
-    s_ar = torch.arange(S, device=source_ids.device)[None, :, None]
-    flat = (source_ids * S + s_ar).reshape(-1)
+    flat = _flat_idx(basis, source_ids).reshape(-1)
     return basis.reshape(-1, basis.size(-1))[flat].view(*source_ids.shape, -1)
 
 
@@ -34,7 +39,7 @@ def test_gather_matches_dense_projection():
 
     dense = _dense_source_emb(basis, source_ids)
     ref = mod(hidden_states, dense, st_dist_bias=bias)[0]
-    got = mod(hidden_states, (basis, source_ids), st_dist_bias=bias)[0]
+    got = mod(hidden_states, (basis, _flat_idx(basis, source_ids)), st_dist_bias=bias)[0]
 
     assert got.shape == ref.shape
     torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
@@ -52,7 +57,8 @@ def test_gather_matches_dense_with_attentions():
     source_ids = torch.randint(0, 3, (B, S, N))
 
     dense = mod(hidden_states, _dense_source_emb(basis, source_ids), output_attentions=True)
-    gathered = mod(hidden_states, (basis, source_ids), output_attentions=True)
+    gathered = mod(hidden_states, (basis, _flat_idx(basis, source_ids)),
+                   output_attentions=True)
     for a, b in zip(dense, gathered, strict=True):
         torch.testing.assert_close(b, a, rtol=1e-4, atol=1e-5)
 
@@ -68,7 +74,7 @@ def test_full_model_forward_runs_with_gather():
     B = 4
     out = model(
         input_ids=torch.randint(0, 3, (B, S, 1)),
-        source_ids=torch.randint(0, 2, (B, S, N)),
+        source_ids=torch.randint(0, 2, (B, S, N), dtype=torch.uint8),  # narrow, as collated
         source_idx=torch.randint(0, NTOT, (B, N)),
         target_site_idx=torch.randint(0, NTOT, (B, 1)),
         env_data=torch.randn(B, N, E),
@@ -81,3 +87,60 @@ def test_full_model_forward_runs_with_gather():
     out.last_hidden_state.sum().backward()
     grad = model.target_input.species_embedding.weight.grad
     assert grad is not None and torch.isfinite(grad).all()
+
+
+def test_collapsed_matches_dense_projection():
+    """The collapsed path (no K/V materialised) must equal the dense reference."""
+    torch.manual_seed(3)
+    cfg = JSDMConfig(hidden_size=64, num_attention_heads=8, num_species=10,
+                     num_source_sites=7)
+    mod = STCrossAttention(cfg).eval()  # eval => dropout off, deterministic
+    B, S, N, T, H = 3, 10, 7, 1, 64
+    hidden_states = torch.randn(B, S, T, H)
+    basis = torch.randn(3, S, H)
+    source_ids = torch.randint(0, 3, (B, S, N), dtype=torch.uint8)
+    bias = torch.randn(B, S, 1, T, N)
+
+    ref = mod(hidden_states, _dense_source_emb(basis, source_ids.long()),
+              st_dist_bias=bias)[0]
+    got = mod(hidden_states,
+              (basis, _flat_idx(basis, source_ids), source_ids),
+              st_dist_bias=bias)[0]
+    assert got.shape == ref.shape
+    torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+
+
+def test_collapsed_matches_dense_attention_probs():
+    """output_attentions must return the same probs as the dense path."""
+    torch.manual_seed(4)
+    cfg = JSDMConfig(hidden_size=32, num_attention_heads=4, num_species=6,
+                     num_source_sites=5)
+    mod = STCrossAttention(cfg).eval()
+    B, S, N, T, H = 2, 6, 5, 1, 32
+    hidden_states = torch.randn(B, S, T, H)
+    basis = torch.randn(3, S, H)
+    source_ids = torch.randint(0, 3, (B, S, N), dtype=torch.uint8)
+
+    ref = mod(hidden_states, _dense_source_emb(basis, source_ids.long()),
+              output_attentions=True)
+    got = mod(hidden_states, (basis, _flat_idx(basis, source_ids), source_ids),
+              output_attentions=True)
+    for a, b in zip(ref, got, strict=True):
+        torch.testing.assert_close(b, a, rtol=1e-4, atol=1e-5)
+
+
+def test_collapsed_no_source_dependence_on_absent_bins():
+    """Sanity: bin weights sum to 1 across bins, so context is a convex mix."""
+    torch.manual_seed(5)
+    cfg = JSDMConfig(hidden_size=32, num_attention_heads=4, num_species=5,
+                     num_source_sites=9)
+    mod = STCrossAttention(cfg).eval()
+    B, S, N, H = 2, 5, 9, 32
+    # All sources absent => context must equal V[0, s] exactly.
+    source_ids = torch.zeros(B, S, N, dtype=torch.uint8)
+    basis = torch.randn(3, S, H)
+    hidden_states = torch.randn(B, S, 1, H)
+    got = mod(hidden_states, (basis, _flat_idx(basis, source_ids), source_ids))[0]
+    v0 = mod.value(basis[0])  # (S, all_head)
+    torch.testing.assert_close(got, v0[None, :, None, :].expand_as(got),
+                               rtol=1e-4, atol=1e-5)
