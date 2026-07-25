@@ -29,6 +29,8 @@ TRAIN_ARGS = [
     "--val_p_list", "0.5", "1.0",
     "--absence_mask_p_list", "0.5", "1.0",
     "--seed", "0",
+    # Tiny data: keep loading in-process — deterministic, no worker/shm overhead.
+    "--num_workers", "0",
 ]
 
 

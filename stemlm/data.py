@@ -231,10 +231,8 @@ class JSDMDataset(Dataset):
             k_query = min(k_query * 2, N_total)
         return neigh, sp
 
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        N = self.num_source_sites
-        target_species = self.species_data[idx]
-
+    def _candidates_scalar(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
+        """Neighbour indices + spatial distances for one target (no tree batching)."""
         if self._tree is None:
             cand_idx = (self._source_pool if self._source_pool is not None
                         else np.arange(len(self.lats)))
@@ -245,9 +243,53 @@ class JSDMDataset(Dataset):
                 if not self.euclidean_coords else \
                 np.sqrt((self.lats[cand_idx] - self.lats[idx]) ** 2
                         + (self.lons[cand_idx] - self.lons[idx]) ** 2).astype(np.float32)
-        else:
-            cand_idx, sp = self._knn_candidates(idx)
+            return cand_idx, sp
+        return self._knn_candidates(idx)
 
+    def _candidates_batch(self, indices: list[int]) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Neighbour indices + distances for a batch via ONE BallTree query.
+
+        Bit-identical to calling ``_candidates_scalar`` per index: the tree ranks
+        (hence kept neighbours and their order) do not depend on batching, and any
+        item too short after the shared query falls back to the exact scalar
+        doubling path.
+        """
+        if self._tree is None:
+            return [self._candidates_scalar(i) for i in indices]
+
+        N_total = len(self.lats)
+        pool_mask = self._source_pool_mask
+        k_query = min(_K_MAX + 1, N_total)
+        if pool_mask is not None:
+            k_query = min(k_query * _K_QUERY_OVERFETCH, N_total)
+
+        idx_arr = np.asarray(indices)
+        coords_rad = np.deg2rad(self.coords[idx_arr].astype(np.float64))
+        dist_rad, neigh = self._tree.query(coords_rad, k=k_query)
+
+        need = max(self.num_source_sites, self.num_scale_sites)
+        out: list[tuple[np.ndarray, np.ndarray]] = []
+        for b, idx in enumerate(indices):
+            nb = neigh[b]
+            sp = (dist_rad[b] * EARTH_RADIUS_KM).astype(np.float32)
+            keep = nb != idx
+            if pool_mask is not None:
+                keep &= pool_mask[nb]
+            nb = nb[keep]
+            sp = sp[keep]
+            if len(nb) >= need or k_query >= N_total:
+                out.append((nb, sp))
+            else:
+                # Rare short-pool tail: redo this one exactly as the scalar path.
+                out.append(self._knn_candidates(idx))
+        return out
+
+    def _sample_from_candidates(self, idx: int, cand_idx: np.ndarray,
+                                sp: np.ndarray) -> dict[str, Any]:
+        """Weight candidates by distance and draw source sites. Consumes one
+        ``np.random.choice`` — callers must invoke in a fixed index order to keep
+        draws reproducible."""
+        N = self.num_source_sites
         if self.has_time:
             tp = np.abs(self.times[cand_idx] - self.times[idx]).astype(np.float32)
         else:
@@ -274,13 +316,25 @@ class JSDMDataset(Dataset):
         target_env = self.env_data[idx]
 
         return {
-            "target_species": torch.from_numpy(target_species),
+            "target_species": torch.from_numpy(self.species_data[idx]),
             "source_species": torch.from_numpy(source_species),
             "source_env":     torch.from_numpy(source_env),
             "target_env":     torch.from_numpy(target_env),
             "target_idx":     torch.tensor(idx, dtype=torch.long),
             "source_idx":     torch.from_numpy(source_idx.astype(np.int64)),
         }
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        cand_idx, sp = self._candidates_scalar(idx)
+        return self._sample_from_candidates(idx, cand_idx, sp)
+
+    def __getitems__(self, indices: list[int]) -> list[dict[str, Any]]:
+        """Batched fetch used by DataLoader: one tree query for the whole batch,
+        then per-item sampling in list order — byte-identical to sequential
+        ``__getitem__`` for the same RNG state."""
+        cands = self._candidates_batch(indices)
+        return [self._sample_from_candidates(i, c, s)
+                for i, (c, s) in zip(indices, cands, strict=True)]
 
 
 class JSDMSparseDataset(JSDMDataset):

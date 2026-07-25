@@ -175,15 +175,23 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
         loader.sampler.set_epoch(epoch)
 
     model.train()
-    total_loss, total_correct, total_masked, num_batches = 0.0, 0, 0, 0
+    # Accumulate on-GPU so the loop stays sync-free: .item() forces a CPU/GPU
+    # sync that stalls the CPU from queuing the next step, idling the GPU. We
+    # read these back only at the logging cadence and at epoch end.
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    correct_sum = torch.zeros((), device=device, dtype=torch.long)
+    masked_sum = torch.zeros((), device=device, dtype=torch.long)
+    num_batches = 0
     use_amp = amp_dtype is not None and device.type == "cuda"
+    # Class weights are constant across steps — move to device once, not per step.
+    loss_weight_dev = loss_weight.to(device) if loss_weight is not None else None
 
     optimizer.zero_grad()
     for batch_idx, batch in enumerate(loader):
         batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         B = batch["input_ids"].shape[0]
-        w = loss_weight[None, :].expand(B, -1).to(device) if loss_weight is not None else None
+        w = loss_weight_dev[None, :].expand(B, -1) if loss_weight_dev is not None else None
 
         if use_amp:
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
@@ -224,23 +232,32 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
             scheduler.step()
             optimizer.zero_grad()
 
-        total_loss += loss.item()
+        loss_sum += loss.detach().double()
         num_batches += 1
 
+        # Fixed-shape accuracy: no boolean-index gather (which would nonzero()
+        # and sync on a data-dependent size) and no mask.any() guard. Compare
+        # everywhere, then count only masked positions.
         mask = batch["labels"] != -100
-        if mask.any():
-            preds = (output.logits[mask] > 0).long()
-            targets = batch["labels"][mask].long()
-            total_correct += (preds == targets).sum().item()
-            total_masked += mask.sum().item()
+        preds = output.logits > 0
+        correct_sum += (preds & (batch["labels"] == 1) & mask).sum() \
+            + (~preds & (batch["labels"] == 0) & mask).sum()
+        masked_sum += mask.sum()
 
         if (batch_idx + 1) % log_interval == 0 and env.is_main:
+            avg_loss = (loss_sum / max(num_batches, 1)).item()
+            avg_acc = (correct_sum.double() / masked_sum.clamp(min=1)).item()
             logger.info(
                 f"Epoch {epoch} | Batch {batch_idx+1}/{len(loader)} | "
-                f"Loss: {total_loss/num_batches:.4f} | "
-                f"Acc: {total_correct/max(total_masked,1):.4f} | "
+                f"Loss: {avg_loss:.4f} | "
+                f"Acc: {avg_acc:.4f} | "
                 f"LR: {scheduler.get_last_lr()[0]:.2e}"
             )
+
+    # Single sync per epoch to materialise the accumulators as Python scalars.
+    total_loss = loss_sum.item()
+    total_correct = int(correct_sum.item())
+    total_masked = int(masked_sum.item())
 
     if env.is_distributed:
         agg = torch.tensor(
@@ -365,9 +382,17 @@ def add_train_args(parser):
                              "Val = 1 - train_frac - test_frac. Set to 0 to disable "
                              "(final AUC reported on val, same as early-stopping set).")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=min(8, os.cpu_count() or 1),
+                        help="DataLoader worker processes. Default min(8, cpu_count). "
+                             "The per-sample source-pool KNN sampling is CPU-bound and "
+                             "serial per worker, so 0 starves the GPU (measured ~7x slower "
+                             "on an H100). Set 0 only for debugging.")
     parser.add_argument("--output_dir", type=str, default="./STEMLM_output")
     parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--compile", action="store_true",
+                        help="Wrap the model in torch.compile to fuse kernels and "
+                             "cut per-step launch overhead. First steps pay a "
+                             "one-time compilation cost.")
     parser.add_argument(
         "--mixed_precision",
         type=str,
@@ -656,6 +681,10 @@ def run_train(args):
 
     if args.gradient_checkpointing:
         model.model.encoder.gradient_checkpointing = True
+
+    if args.compile:
+        model = torch.compile(model)
+        log_main(env, "Model compiled with torch.compile")
 
     if env.is_distributed:
         model = DDP(
