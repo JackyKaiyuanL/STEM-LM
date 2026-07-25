@@ -8,7 +8,7 @@ from scipy.stats import spearmanr
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
-from STEMLM_data import FixedPValCollator, seed_worker
+from stemlm.data import FixedPValCollator, seed_worker
 
 def safe_auc_roc(labels: np.ndarray, preds: np.ndarray) -> float:
     if labels.size == 0 or len(set(labels.tolist())) < 2:

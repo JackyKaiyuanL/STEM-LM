@@ -8,17 +8,27 @@ or passed via `--env_cols`. Dataset preparation pipelines (eButterfly, sPlotOpen
 
 ## Files
 
-| File | Purpose |
+| Module | Purpose |
 |---|---|
-| `STEMLM_model.py` | Model: species self-attn, ST + env cross-attn, FIRE distance bias. `JSDMConfig.ablation` ∈ `{full, no_st, no_env, no_st_env}`. |
-| `STEMLM_data.py` | Dataset, collators (uniform-mask + absence-mask), H3 splits. |
-| `STEMLM_train.py` | Training, per-epoch val, end-of-training K-pass-bagged test eval. |
-| `STEMLM_metric.py` | AUROC / AUPRC / CBI / Brier / ECE calculations + `bagged_evaluate_at_p`. Library only — no CLI. |
+| `stemlm/model.py` | Model: species self-attn, ST + env cross-attn, FIRE distance bias. `JSDMConfig.ablation` ∈ `{full, no_st, no_env, no_st_env}`. |
+| `stemlm/data.py` | Dataset, collators (uniform-mask + absence-mask), H3 splits. |
+| `stemlm/train.py` | Training, per-epoch val, end-of-training K-pass-bagged test eval. |
+| `stemlm/metric.py` | AUROC / AUPRC / CBI / Brier / ECE calculations + `bagged_evaluate_at_p`. Library only — no CLI. |
+| `stemlm/cli.py` | `stemlm` command entry point (subcommands). |
+
+## Install
+
+Managed with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv sync                 # create .venv, install stemlm + deps
+uv run stemlm --help    # or: source .venv/bin/activate && stemlm --help
+```
 
 ## Quickstart
 
 ```bash
-python STEMLM_train.py data.csv \
+stemlm train data.csv \
     --output_dir ./out \
     --p unif:0.0,1.0 \
     --temporal_fire_init_periods 365 182
@@ -80,7 +90,7 @@ Preemption-safe: rank 0 writes `latest_checkpoint.pt` every epoch and resumes
 on resubmission.
 
 ```bash
-torchrun --nproc_per_node=4 STEMLM_train.py data.csv \
+torchrun --nproc_per_node=4 -m stemlm.cli train data.csv \
     --output_dir ./out --mixed_precision bf16 --batch_size 32 [args]
 ```
 
@@ -91,7 +101,7 @@ All STEM-LM runs use H3 resolution-2 spatial splits (seed 42); deep-learning run
 **eButterfly — main runs (Tables 3, 5)**
 ```bash
 for s in 41 42 43; do
-  python STEMLM_train.py data/ebutterfly_na_2011_2025.csv \
+  stemlm train data/ebutterfly_na_2011_2025.csv \
       --output_dir ./out/ebutterfly_focal_seed${s} \
       --splits_path data/ebutterfly_splits.json \
       --p unif:0.0,1.0 --temporal_fire_init_periods 365 182 122 91 \
@@ -101,7 +111,7 @@ done
 
 # BCE variant (Table 3 STEM-LM (B))
 for s in 41 42 43; do
-  python STEMLM_train.py data/ebutterfly_na_2011_2025.csv \
+  stemlm train data/ebutterfly_na_2011_2025.csv \
       --output_dir ./out/ebutterfly_bce_seed${s} \
       --splits_path data/ebutterfly_splits.json \
       --loss_type bce --p unif:0.0,1.0 \
@@ -115,7 +125,7 @@ done
 ```bash
 for mode in full no_st no_env no_st_env; do
   for s in 41 42 43; do
-    python STEMLM_train.py data/ebutterfly_na_2011_2025.csv \
+    stemlm train data/ebutterfly_na_2011_2025.csv \
         --ablation ${mode} \
         --output_dir ./out/ablation/${mode}_seed${s} \
         --splits_path data/ebutterfly_splits.json \
@@ -130,7 +140,7 @@ done
 ```bash
 for N in 32 64 128; do
   for s in 41 42 43; do
-    python STEMLM_train.py data/ebutterfly_na_2011_2025.csv \
+    stemlm train data/ebutterfly_na_2011_2025.csv \
         --num_source_sites ${N} \
         --output_dir ./out/sites${N}_seed${s} \
         --splits_path data/ebutterfly_splits.json \
@@ -144,7 +154,7 @@ done
 **sPlotOpen — main runs (Tables 4, 5)**
 ```bash
 for s in 41 42 43; do
-  python STEMLM_train.py data/splotopen_global.csv \
+  stemlm train data/splotopen_global.csv \
       --output_dir ./out/splotopen_focal_seed${s} \
       --splits_path data/splotopen_global_splits.json \
       --no_time --p unif:0.0,1.0 \
@@ -154,7 +164,7 @@ done
 
 # BCE variant
 for s in 41 42 43; do
-  python STEMLM_train.py data/splotopen_global.csv \
+  stemlm train data/splotopen_global.csv \
       --output_dir ./out/splotopen_bce_seed${s} \
       --splits_path data/splotopen_global_splits.json \
       --loss_type bce --no_time --p unif:0.0,1.0 \
@@ -180,7 +190,7 @@ Each `--output_dir` gets:
 
 ## Inference
 
-`STEMLM_metric.py` is a library; import `bagged_evaluate_at_p`,
+`stemlm.metric` is a library; import `bagged_evaluate_at_p`,
 `compute_per_species_metrics`, `summarize_per_species_metrics`. Pass
 `--splits_path <run_dir>/splits.json` so source-pool matches training rows;
 species ordering must match the run's `species_names.json`.

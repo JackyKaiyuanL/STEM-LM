@@ -3,10 +3,7 @@ import csv
 import json
 import logging
 import os
-import sys
 import time
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from typing import Optional
 
@@ -19,9 +16,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-from STEMLM_model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_cooccurrence_matrix
-from STEMLM_data import create_dataloaders, save_splits, load_splits, build_val_loaders_fixed_p
-from STEMLM_metric import (
+from stemlm.model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_cooccurrence_matrix
+from stemlm.data import create_dataloaders, save_splits, load_splits, build_val_loaders_fixed_p
+from stemlm.metric import (
     compute_per_species_metrics,
     summarize_per_species_metrics,
     bagged_evaluate_at_p,
@@ -332,8 +329,7 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
     return total_loss / max(num_batches, 1), acc, summary, per_sp
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train STEM-LM")
+def add_train_args(parser):
     parser.add_argument("csv_path", type=str,
                         help="Wide CSV, or (with --vocab_path) a sparse-parquet file or "
                              "directory of parquet shards.")
@@ -483,8 +479,10 @@ def main():
                              "test p (uniform + absence-mask), and save T* + per-p T-cal ECE "
                              "to temperature.json. Downstream inference should divide logits "
                              "by T* (sigmoid(logits / T*)) when temperature.json is present.")
-    args = parser.parse_args()
+    parser.set_defaults(func=run_train)
 
+
+def run_train(args):
     if args.splits_path is None:
         if args.fold == "random":
             if args.resolution is not None:
@@ -962,7 +960,7 @@ def main():
     absmask_mean_auprc = float("nan")
     absmask_mean_cbi = float("nan")
     if not args.no_absence_mask_eval:
-        from STEMLM_data import AbsenceMaskCollator
+        from stemlm.data import AbsenceMaskCollator
         log_main(env,
             f"Absence-mask eval on {eval_split} (mask all absences + p "
             f"presences, K={args.test_bag_K})..."
@@ -1040,7 +1038,7 @@ def main():
             tcal_per_p_ece[p] = compute_per_species_ece_from_logits(tl, ty, T=T_star)
             log_main(env, f"  uniform p={p:.2f}: T-cal ECE = {tcal_per_p_ece[p]:.4f}")
         if not args.no_absence_mask_eval:
-            from STEMLM_data import AbsenceMaskCollator
+            from stemlm.data import AbsenceMaskCollator
             for p in args.absence_mask_p_list:
                 if p == 1.0 and 1.0 in tcal_per_p_ece:
                     absmask_tcal_per_p_ece[p] = tcal_per_p_ece[1.0]
@@ -1210,7 +1208,3 @@ def main():
 
     env.barrier()
     env.cleanup()
-
-
-if __name__ == "__main__":
-    main()
