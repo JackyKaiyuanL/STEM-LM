@@ -1,12 +1,11 @@
 import json
 import os
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
-from typing import Optional, List, Dict, Any, Tuple
-
+from torch.utils.data import DataLoader, Dataset
 
 EARTH_RADIUS_KM = 6371.0
 
@@ -47,8 +46,10 @@ def haversine_pairs_torch(lat_a: torch.Tensor, lon_a: torch.Tensor,
 
 def _bbox_max_distance(lats: np.ndarray, lons: np.ndarray, times: np.ndarray,
                        euclidean: bool):
-    lat_min = float(lats.min()); lat_max = float(lats.max())
-    lon_min = float(lons.min()); lon_max = float(lons.max())
+    lat_min = float(lats.min())
+    lat_max = float(lats.max())
+    lon_min = float(lons.min())
+    lon_max = float(lons.max())
     if euclidean:
         max_sp = float(np.hypot(lat_max - lat_min, lon_max - lon_min))
     else:
@@ -60,7 +61,7 @@ def _bbox_max_distance(lats: np.ndarray, lons: np.ndarray, times: np.ndarray,
     return max_sp, max_tp
 
 
-def _resolve_scale(value: Optional[float], fallback: float, name: str) -> float:
+def _resolve_scale(value: float | None, fallback: float, name: str) -> float:
     if value is None:
         return 1.0 if fallback <= 0 else float(fallback)
     if value <= 0:
@@ -112,12 +113,12 @@ class JSDMDataset(Dataset):
         self,
         csv_path: str,
         num_source_sites: int = 64,
-        num_scale_sites: Optional[int] = None,
+        num_scale_sites: int | None = None,
         time_col: str = "time",
         lat_col: str = "latitude",
         lon_col: str = "longitude",
-        env_cols: Optional[List[str]] = None,
-        spatial_scale_km: Optional[float] = None,
+        env_cols: list[str] | None = None,
+        spatial_scale_km: float | None = None,
         euclidean_coords: bool = False,
         no_time: bool = False,
     ):
@@ -208,7 +209,7 @@ class JSDMDataset(Dataset):
     def __len__(self):
         return len(self.species_data)
 
-    def _knn_candidates(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+    def _knn_candidates(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
         N_total = len(self.lats)
         pool_mask = self._source_pool_mask
         coords_rad = np.deg2rad(self.coords[idx:idx + 1].astype(np.float64))
@@ -230,7 +231,7 @@ class JSDMDataset(Dataset):
             k_query = min(k_query * 2, N_total)
         return neigh, sp
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         N = self.num_source_sites
         target_species = self.species_data[idx]
 
@@ -253,7 +254,7 @@ class JSDMDataset(Dataset):
             tp = np.zeros_like(sp)
 
         n_cand = len(cand_idx)
-        replace = N > n_cand - 1
+        replace = n_cand - 1 < N
 
         k1 = min(self.num_scale_sites, n_cand)
         nearest = np.argpartition(sp, k1 - 1)[:k1] if k1 < n_cand else np.arange(n_cand)
@@ -288,12 +289,12 @@ class JSDMSparseDataset(JSDMDataset):
         parquet_path: str,
         vocab_path: str,
         num_source_sites: int = 64,
-        num_scale_sites: Optional[int] = None,
+        num_scale_sites: int | None = None,
         time_col: str = "time",
         lat_col: str = "latitude",
         lon_col: str = "longitude",
-        env_cols: Optional[List[str]] = None,
-        spatial_scale_km: Optional[float] = None,
+        env_cols: list[str] | None = None,
+        spatial_scale_km: float | None = None,
         euclidean_coords: bool = False,
         no_time: bool = False,
     ):
@@ -403,8 +404,8 @@ class JSDMDataCollator:
             if r.startswith("unif:"):
                 try:
                     lo, hi = [float(x) for x in r[len("unif:"):].split(",")]
-                except Exception:
-                    raise ValueError(f"unif range must be 'unif:lo,hi'; got {r!r}")
+                except ValueError:
+                    raise ValueError(f"unif range must be 'unif:lo,hi'; got {r!r}") from None
                 if not (0.0 <= lo <= hi <= 1.0):
                     raise ValueError(
                         f"unif range must satisfy 0 <= lo <= hi <= 1; got [{lo}, {hi}]"
@@ -413,8 +414,8 @@ class JSDMDataCollator:
             if r.startswith("beta:"):
                 try:
                     a, b = [float(x) for x in r[len("beta:"):].split(",")]
-                except Exception:
-                    raise ValueError(f"beta params must be 'beta:alpha,beta'; got {r!r}")
+                except ValueError:
+                    raise ValueError(f"beta params must be 'beta:alpha,beta'; got {r!r}") from None
                 if not (a > 0.0 and b > 0.0):
                     raise ValueError(f"beta alpha and beta must be > 0; got ({a}, {b})")
                 return f"beta:{a},{b}"
@@ -443,13 +444,12 @@ class JSDMDataCollator:
     def __call__(self, examples):
         batch = {
             key: torch.stack([ex[key] for ex in examples])
-            for key in examples[0].keys()
+            for key in examples[0]
         }
 
         target_species = batch["target_species"]
         source_species = batch["source_species"]
         B, S = target_species.shape
-        N = source_species.shape[-1]
 
         labels = target_species.clone()
 
@@ -502,7 +502,7 @@ class AbsenceMaskCollator(JSDMDataCollator):
         self.base_seed = int(base_seed)
 
     def __call__(self, examples):
-        batch = {k: torch.stack([ex[k] for ex in examples]) for k in examples[0].keys()}
+        batch = {k: torch.stack([ex[k] for ex in examples]) for k in examples[0]}
         target_species = batch["target_species"]
         source_species = batch["source_species"]
         B, S = target_species.shape
@@ -552,7 +552,7 @@ class FixedPValCollator(JSDMDataCollator):
         self.base_seed = int(base_seed)
 
     def __call__(self, examples):
-        batch = {k: torch.stack([ex[k] for ex in examples]) for k in examples[0].keys()}
+        batch = {k: torch.stack([ex[k] for ex in examples]) for k in examples[0]}
         target_species = batch["target_species"]
         source_species = batch["source_species"]
         B, S = target_species.shape
@@ -645,8 +645,8 @@ def grid_block_split(x, y, n_cells=20, train_frac=0.8, test_frac=0.1, seed=42):
     return train_idx, val_idx, test_idx
 
 
-def save_splits(path: str, train_idx, val_idx, test_idx, num_rows: Optional[int] = None,
-                meta: Optional[dict] = None) -> None:
+def save_splits(path: str, train_idx, val_idx, test_idx, num_rows: int | None = None,
+                meta: dict | None = None) -> None:
 
     payload = {
         "num_rows": int(num_rows) if num_rows is not None else None,
@@ -660,8 +660,8 @@ def save_splits(path: str, train_idx, val_idx, test_idx, num_rows: Optional[int]
         json.dump(payload, f)
 
 
-def load_splits(path: str, expected_num_rows: Optional[int] = None
-                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_splits(path: str, expected_num_rows: int | None = None
+                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     
     with open(path) as f:
         payload = json.load(f)
@@ -685,10 +685,10 @@ def h3_block_split(lats, lons, resolution=2, train_frac=0.8, test_frac=0.1, seed
         import h3 as h3lib
     except ImportError:
         raise ImportError(
-            "h3 package required for --fold h3. Install with: pip install h3"
-        )
+            "h3 package required for --fold h3. Install with: uv add h3"
+        ) from None
     cells = np.array([h3lib.latlng_to_cell(float(lat), float(lon), resolution)
-                      for lat, lon in zip(lats, lons)])
+                      for lat, lon in zip(lats, lons, strict=False)])
     unique_cells = np.unique(cells)
     rng = np.random.RandomState(seed)
     perm = rng.permutation(len(unique_cells))
@@ -715,10 +715,10 @@ def create_dataloaders(
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None, spatial_scale_km=None,
     euclidean_coords=False, no_time=False,
-    fold_method="random", resolution: Optional[int] = None,
-    saved_splits: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    fold_method="random", resolution: int | None = None,
+    saved_splits: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     restrict_source_pool_with_saved_splits: bool = True,
-    vocab_path: Optional[str] = None,
+    vocab_path: str | None = None,
 ):
 
     if vocab_path is not None:

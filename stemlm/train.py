@@ -1,31 +1,35 @@
-import argparse
 import csv
+import functools
 import json
 import logging
+import operator
 import os
 import time
 
-from typing import Optional
-
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-from stemlm.model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_cooccurrence_matrix
-from stemlm.data import create_dataloaders, save_splits, load_splits, build_val_loaders_fixed_p
-from stemlm.metric import (
-    compute_per_species_metrics,
-    summarize_per_species_metrics,
-    bagged_evaluate_at_p,
-    gather_logits_at_p,
-    fit_temperature,
-    compute_per_species_ece_from_logits,
+from stemlm.data import (
+    build_val_loaders_fixed_p,
+    create_dataloaders,
+    load_splits,
+    save_splits,
+    seed_worker,
 )
+from stemlm.metric import (
+    bagged_evaluate_at_p,
+    compute_per_species_ece_from_logits,
+    compute_per_species_metrics,
+    fit_temperature,
+    gather_logits_at_p,
+    summarize_per_species_metrics,
+)
+from stemlm.model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_cooccurrence_matrix
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -108,7 +112,7 @@ def log_main(env: "DistEnv", msg: str, level: int = logging.INFO):
 
 
 def _parse_rate(s):
-    if isinstance(s, str) and (s == "unif" or s.startswith("unif:") or s.startswith("beta:")):
+    if isinstance(s, str) and (s == "unif" or s.startswith(("unif:", "beta:"))):
         return s
     return float(s)
 
@@ -155,7 +159,7 @@ def _forward(model, batch, dist_info, loss_weight=None,
 def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
                 loss_weight=None, log_interval=50, max_grad_norm=1.0,
                 amp_dtype=None, grad_scaler=None,
-                grad_accum_steps: int = 1, env: Optional[DistEnv] = None,
+                grad_accum_steps: int = 1, env: DistEnv | None = None,
                 loss_type: str = "bce",
                 focal_alpha: float = 0.25, focal_gamma: float = 2.0):
     """
@@ -251,7 +255,7 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
 
 @torch.no_grad()
 def evaluate(model, loader, device, dist_info, amp_dtype=None,
-             env: Optional[DistEnv] = None,
+             env: DistEnv | None = None,
              loss_type: str = "bce",
              focal_alpha: float = 0.25, focal_gamma: float = 2.0):
 
@@ -296,8 +300,8 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
 
         gathered_preds  = env.all_gather_object(species_preds)
         gathered_labels = env.all_gather_object(species_labels)
-        species_preds  = [sum((g[s] for g in gathered_preds), []) for s in range(S)]
-        species_labels = [sum((g[s] for g in gathered_labels), []) for s in range(S)]
+        species_preds  = [functools.reduce(operator.iadd, (g[s] for g in gathered_preds), []) for s in range(S)]
+        species_labels = [functools.reduce(operator.iadd, (g[s] for g in gathered_labels), []) for s in range(S)]
 
     max_n = max((len(species_labels[s]) for s in range(S)), default=0)
     if max_n == 0:
@@ -532,7 +536,7 @@ def run_train(args):
         logger.info(f"Loading splits from {args.splits_path}")
         saved_splits = load_splits(args.splits_path)
 
-    train_loader, val_loader, test_loader, dataset, dist_info, splits = create_dataloaders(
+    train_loader, val_loader, _test_loader, dataset, dist_info, splits = create_dataloaders(
         csv_path=args.csv_path,
         batch_size=args.batch_size,
         num_source_sites=args.num_source_sites,
@@ -759,14 +763,14 @@ def run_train(args):
             focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
         )
         per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_cbi, per_p_nauc = [], [], [], [], [], []
-        for p, loader in fixed_val_loaders:
-            l, a, summary, per_sp = evaluate(
+        for _p, loader in fixed_val_loaders:
+            loss_v, acc_v, summary, _per_sp = evaluate(
                 model, loader, device, dist_info, amp_dtype=amp_dtype, env=env,
                 loss_type=args.loss_type,
                 focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
             )
-            per_p_loss.append(l)
-            per_p_acc.append(a)
+            per_p_loss.append(loss_v)
+            per_p_acc.append(acc_v)
             per_p_auc.append(summary["mean_auc_roc"])
             per_p_auprc.append(summary["mean_auc_pr"])
             per_p_cbi.append(summary.get("mean_cbi", float("nan")))
@@ -781,9 +785,10 @@ def run_train(args):
 
         if env.is_main:
             per_p_str = " ".join(
-                f"p{p:.2f}(loss={l:.3f},acc={a:.3f},auc={u:.3f},auprc={ap:.3f},cbi={c:.3f},n={n})"
-                for (p, _), l, a, u, ap, c, n in zip(
-                    fixed_val_loaders, per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_cbi, per_p_nauc
+                f"p{p:.2f}(loss={lo:.3f},acc={a:.3f},auc={u:.3f},auprc={ap:.3f},cbi={c:.3f},n={n})"
+                for (p, _), lo, a, u, ap, c, n in zip(
+                    fixed_val_loaders, per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_cbi, per_p_nauc,
+                    strict=False,
                 )
             )
             logger.info(
@@ -793,8 +798,8 @@ def run_train(args):
             )
             with open(log_csv, "a", newline="") as f:
                 row = [epoch, f"{train_loss:.6f}", f"{train_acc:.6f}"]
-                for l, a, u, ap, c in zip(per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_cbi):
-                    row += [f"{l:.6f}", f"{a:.6f}", f"{u:.6f}", f"{ap:.6f}", f"{c:.6f}"]
+                for lo, a, u, ap, c in zip(per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_cbi, strict=False):
+                    row += [f"{lo:.6f}", f"{a:.6f}", f"{u:.6f}", f"{ap:.6f}", f"{c:.6f}"]
                 row += [f"{val_loss_mean:.6f}", f"{val_acc_mean:.6f}",
                         f"{val_auc_mean:.6f}", f"{val_auprc_mean:.6f}",
                         f"{val_cbi_mean:.6f}",

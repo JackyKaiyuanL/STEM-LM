@@ -1,19 +1,19 @@
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import ModelOutput
 
-
 _EARTH_RADIUS_KM = 6371.0
 _SPECIES_ATTN_QUERY_CHUNK = 512
 
 def _haversine_bt_n(lat_a, lon_a, lat_b, lon_b):
-    lat_a_r = torch.deg2rad(lat_a); lon_a_r = torch.deg2rad(lon_a)
-    lat_b_r = torch.deg2rad(lat_b); lon_b_r = torch.deg2rad(lon_b)
+    lat_a_r = torch.deg2rad(lat_a)
+    lon_a_r = torch.deg2rad(lon_a)
+    lat_b_r = torch.deg2rad(lat_b)
+    lon_b_r = torch.deg2rad(lon_b)
     dlat = lat_a_r - lat_b_r
     dlon = lon_a_r - lon_b_r
     a = torch.sin(dlat / 2.0) ** 2 + torch.cos(lat_a_r) * torch.cos(lat_b_r) * torch.sin(dlon / 2.0) ** 2
@@ -48,7 +48,7 @@ class JSDMConfig:
 
     fire_hidden_size: int = 32
 
-    temporal_fire_init_periods: Optional[Tuple[float, ...]] = None
+    temporal_fire_init_periods: tuple[float, ...] | None = None
     fire_zero_init_periodic: bool = True
 
     ablation: str = "full"  # full | no_st | no_env | no_st_env
@@ -92,7 +92,7 @@ class FIREDistanceBias(nn.Module):
 
     def __init__(self, max_dist: float, fire_hidden_size: int = 32,
                  n_frequencies: int = 0,
-                 freq_init_periods: Optional[Tuple[float, ...]] = None,
+                 freq_init_periods: tuple[float, ...] | None = None,
                  zero_init_periodic: bool = True):
         super().__init__()
         self.log_c = nn.Parameter(torch.tensor(0.0))
@@ -246,10 +246,7 @@ class SpeciesSelfAttention(nn.Module):
         self.attention_probs_dropout_prob = config.attention_probs_dropout_prob
 
     def transpose_for_scores(self, x):
-        new_x_shape = x.size()[:-1] + (
-            self.num_attention_heads,
-            self.attention_head_size,
-        )
+        new_x_shape = (*x.size()[:-1], self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
         return x.transpose(-2, -3)
 
@@ -275,7 +272,7 @@ class SpeciesSelfAttention(nn.Module):
                 attn_parts.append(p.mean(dim=-3))
             context = torch.cat(ctx_parts, dim=-2).transpose(-2, -3).contiguous()
             attn_probs = torch.cat(attn_parts, dim=-2)
-            new_shape = context.size()[:-2] + (self.all_head_size,)
+            new_shape = (*context.size()[:-2], self.all_head_size)
             return context.view(*new_shape), attn_probs
 
         context = F.scaled_dot_product_attention(
@@ -284,7 +281,7 @@ class SpeciesSelfAttention(nn.Module):
             scale=scale,
         )
         context = context.transpose(-2, -3).contiguous()
-        new_shape = context.size()[:-2] + (self.all_head_size,)
+        new_shape = (*context.size()[:-2], self.all_head_size)
         return (context.view(*new_shape),)
 
 
@@ -309,7 +306,7 @@ class SpeciesRowAttention(nn.Module):
         self_outputs = self.self_attn(hidden_states, output_attentions)
         output = (self.output(self_outputs[0]),)
         if output_attentions:
-            output = output + (self_outputs[1],)
+            output = (*output, self_outputs[1])
         return output
 
 
@@ -330,10 +327,7 @@ class STCrossAttention(nn.Module):
         self.attention_probs_dropout_prob = config.attention_probs_dropout_prob
 
     def transpose_for_scores(self, x):
-        new_x_shape = x.size()[:-1] + (
-            self.num_attention_heads,
-            self.attention_head_size,
-        )
+        new_x_shape = (*x.size()[:-1], self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
         return x.transpose(-2, -3)
 
@@ -364,7 +358,7 @@ class STCrossAttention(nn.Module):
             )
             context = torch.matmul(attn_probs_drop, value_layer)
             context = context.transpose(-2, -3).contiguous()
-            new_shape = context.size()[:-2] + (self.all_head_size,)
+            new_shape = (*context.size()[:-2], self.all_head_size)
             context = context.view(*new_shape)
             return context, attn_probs
         else:
@@ -375,7 +369,7 @@ class STCrossAttention(nn.Module):
                 scale=1.0 / math.sqrt(self.attention_head_size),
             )
             context = context.transpose(-2, -3).contiguous()
-            new_shape = context.size()[:-2] + (self.all_head_size,)
+            new_shape = (*context.size()[:-2], self.all_head_size)
             context = context.view(*new_shape)
             return (context,)
 
@@ -433,7 +427,7 @@ class STColAttention(nn.Module):
         )
         output = (self.output(cross_outputs[0]),)
         if output_attentions:
-            output = output + (cross_outputs[1],)
+            output = (*output, cross_outputs[1])
         return output
 
 
@@ -454,10 +448,7 @@ class EnvCrossAttention(nn.Module):
         self.attention_probs_dropout_prob = config.attention_probs_dropout_prob
 
     def transpose_for_scores(self, x):
-        new_x_shape = x.size()[:-1] + (
-            self.num_attention_heads,
-            self.attention_head_size,
-        )
+        new_x_shape = (*x.size()[:-1], self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
         return x.transpose(-2, -3)
 
@@ -477,7 +468,7 @@ class EnvCrossAttention(nn.Module):
             )
             context = torch.matmul(attn_probs_drop, value_layer)
             context = context.transpose(-2, -3).contiguous()
-            new_shape = context.size()[:-2] + (self.all_head_size,)
+            new_shape = (*context.size()[:-2], self.all_head_size)
             context = context.view(*new_shape)
             return context, attn_probs
         else:
@@ -487,7 +478,7 @@ class EnvCrossAttention(nn.Module):
                 scale=1.0 / math.sqrt(self.attention_head_size),
             )
             context = context.transpose(-2, -3).contiguous()
-            new_shape = context.size()[:-2] + (self.all_head_size,)
+            new_shape = (*context.size()[:-2], self.all_head_size)
             context = context.view(*new_shape)
             return (context,)
 
@@ -512,7 +503,7 @@ class EnvColAttention(nn.Module):
         cross_outputs = self.cross_attn(hidden_states, env_embeddings, output_attentions)
         output = (self.output(cross_outputs[0]),)
         if output_attentions:
-            output = output + (cross_outputs[1],)
+            output = (*output, cross_outputs[1])
         return output
 
 
@@ -577,8 +568,7 @@ class JSDMAttention(nn.Module):
 
         out = (h,)
         if output_attentions:
-            out = out + (row_output[1] if len(row_output) > 1 else None,
-                         st_attn, env_attn)
+            out = (*out, row_output[1] if len(row_output) > 1 else None, st_attn, env_attn)
         return out
 
 
@@ -622,7 +612,7 @@ class JSDMLayer(nn.Module):
         h = attn_outputs[0]
         h = h + self.ffn(self.ffn_norm(h))
 
-        return (h,) + attn_outputs[1:]
+        return (h, *attn_outputs[1:])
 
 
 class JSDMEncoder(nn.Module):
@@ -645,7 +635,7 @@ class JSDMEncoder(nn.Module):
 
         for layer in self.layers:
             if output_hidden_states:
-                all_hidden = all_hidden + (hidden_states,)
+                all_hidden = (*all_hidden, hidden_states)
             if self.gradient_checkpointing and self.training:
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     layer, hidden_states, st_source_embeddings, env_embeddings,
@@ -660,12 +650,12 @@ class JSDMEncoder(nn.Module):
             hidden_states = layer_outputs[0]
 
             if output_attentions:
-                all_sp_attn = all_sp_attn + (layer_outputs[1],)
-                all_st_attn = all_st_attn + (layer_outputs[2],)
-                all_env_attn = all_env_attn + (layer_outputs[3],)
+                all_sp_attn = (*all_sp_attn, layer_outputs[1])
+                all_st_attn = (*all_st_attn, layer_outputs[2])
+                all_env_attn = (*all_env_attn, layer_outputs[3])
 
         if output_hidden_states:
-            all_hidden = all_hidden + (hidden_states,)
+            all_hidden = (*all_hidden, hidden_states)
 
         return JSDMEncoderOutput(
             last_hidden_state=hidden_states,
@@ -679,10 +669,10 @@ class JSDMEncoder(nn.Module):
 @dataclass
 class JSDMEncoderOutput(ModelOutput):
     last_hidden_state: torch.FloatTensor = None
-    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    species_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
-    st_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
-    env_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    species_attentions: tuple[torch.FloatTensor, ...] | None = None
+    st_attentions: tuple[torch.FloatTensor, ...] | None = None
+    env_attentions: tuple[torch.FloatTensor, ...] | None = None
 
 
 # =============================================================================
@@ -756,12 +746,12 @@ class JSDMModel(nn.Module):
 
 @dataclass
 class JSDMOutput(ModelOutput):
-    loss: Optional[torch.FloatTensor] = None
+    loss: torch.FloatTensor | None = None
     logits: torch.FloatTensor = None
-    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    species_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
-    st_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
-    env_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    species_attentions: tuple[torch.FloatTensor, ...] | None = None
+    st_attentions: tuple[torch.FloatTensor, ...] | None = None
+    env_attentions: tuple[torch.FloatTensor, ...] | None = None
 
 
 class PerSpeciesEnvHead(nn.Module):
@@ -809,7 +799,7 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
                 loss_type: str = "bce",
                 focal_alpha: float = 0.25, focal_gamma: float = 2.0,
                 output_attentions=False, **kwargs):
-        target_env = kwargs.get("target_env", None)
+        target_env = kwargs.get("target_env")
         encoder_out = self.model(output_attentions=output_attentions, **kwargs)
         logits = self.cls(encoder_out.last_hidden_state)  # (B, S, T)
         if self.per_species_env_head is not None and target_env is not None:

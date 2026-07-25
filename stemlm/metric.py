@@ -1,14 +1,14 @@
-from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score, average_precision_score
 from scipy.stats import spearmanr
+from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 from stemlm.data import FixedPValCollator, seed_worker
+
 
 def safe_auc_roc(labels: np.ndarray, preds: np.ndarray) -> float:
     if labels.size == 0 or len(set(labels.tolist())) < 2:
@@ -92,11 +92,11 @@ def safe_cbi(labels: np.ndarray, preds: np.ndarray,
 
 
 def compute_per_species_metrics(probs: np.ndarray,
-                                labels: np.ndarray) -> Dict[str, Dict[int, float]]:
+                                labels: np.ndarray) -> dict[str, dict[int, float]]:
     if probs.shape != labels.shape:
         raise ValueError(f"probs {probs.shape} != labels {labels.shape}")
     S = probs.shape[1]
-    out: Dict[str, Dict[int, float]] = {
+    out: dict[str, dict[int, float]] = {
         "auc_roc": {}, "auc_pr": {}, "cbi": {},
         "brier": {}, "ece": {},
     }
@@ -104,7 +104,7 @@ def compute_per_species_metrics(probs: np.ndarray,
         mask = labels[:, s] != -100
         y = labels[mask, s].astype(np.int64)
         p = probs[mask, s].astype(np.float64)
-        if y.size == 0 or 0 == y.sum() or y.sum() == y.size:
+        if y.size == 0 or y.sum() == 0 or y.sum() == y.size:
             continue
         out["auc_roc"][s] = safe_auc_roc(y, p)
         out["auc_pr"][s] = safe_auc_pr(y, p)
@@ -114,7 +114,7 @@ def compute_per_species_metrics(probs: np.ndarray,
     return out
 
 
-def summarize_per_species_metrics(per_sp: Dict[str, Dict[int, float]]) -> Dict[str, float]:
+def summarize_per_species_metrics(per_sp: dict[str, dict[int, float]]) -> dict[str, float]:
     def _clean(d):
         return [v for v in d.values() if np.isfinite(v)]
     aucs = _clean(per_sp.get("auc_roc", {}))
@@ -168,8 +168,8 @@ def evaluate_loader(model, loader, device, dist_info, amp_dtype=None):
 
     total_loss, num_batches = 0.0, 0
     total_correct, total_masked = 0, 0
-    probs_by_idx: Dict[int, np.ndarray] = {}
-    labels_by_idx: Dict[int, np.ndarray] = {}
+    probs_by_idx: dict[int, np.ndarray] = {}
+    labels_by_idx: dict[int, np.ndarray] = {}
 
     for batch in loader:
         if use_amp:
@@ -214,18 +214,18 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
                          bag_K: int, batch_size: int, device,
                          num_workers: int = 0, base_seed: int = 0,
                          amp_dtype=None, distributed_sampler: bool = False,
-                         collator_cls=None) -> Dict:
+                         collator_cls=None) -> dict:
     model.eval()
     use_amp = amp_dtype is not None and device.type == "cuda"
     dist_info_dev = _move_dist_info(dist_info, device)
 
-    sum_probs: Dict[int, np.ndarray] = {}
-    label_for_idx: Dict[int, np.ndarray] = {}
-    single_pass_probs: Dict[int, np.ndarray] = {}
+    sum_probs: dict[int, np.ndarray] = {}
+    label_for_idx: dict[int, np.ndarray] = {}
+    single_pass_probs: dict[int, np.ndarray] = {}
 
     is_distributed = bool(distributed_sampler) and torch.distributed.is_initialized()
 
-    mask_seed = base_seed + int(round(p_value * 1000))
+    mask_seed = base_seed + round(p_value * 1000)
     cls = collator_cls if collator_cls is not None else FixedPValCollator
     collator = cls(
         p=p_value,
@@ -325,7 +325,7 @@ def gather_logits_at_p(model, dataset, eval_indices, dist_info, p_value: float,
                        batch_size: int, device,
                        num_workers: int = 0, base_seed: int = 0,
                        amp_dtype=None, distributed_sampler: bool = False,
-                       collator_cls=None) -> Tuple[np.ndarray, np.ndarray]:
+                       collator_cls=None) -> tuple[np.ndarray, np.ndarray]:
     """Single-pass forward at fixed mask rate `p_value`; returns
     (logits, labels) aligned by target_site_idx, both shape (N_eval, S).
     Used for Guo-style temperature scaling fitting and T-cal ECE evaluation.
@@ -335,7 +335,7 @@ def gather_logits_at_p(model, dataset, eval_indices, dist_info, p_value: float,
     dist_info_dev = _move_dist_info(dist_info, device)
     is_distributed = bool(distributed_sampler) and torch.distributed.is_initialized()
 
-    mask_seed = base_seed + int(round(p_value * 1000))
+    mask_seed = base_seed + round(p_value * 1000)
     cls = collator_cls if collator_cls is not None else FixedPValCollator
     collator = cls(
         p=p_value,
@@ -359,8 +359,8 @@ def gather_logits_at_p(model, dataset, eval_indices, dist_info, p_value: float,
                             collate_fn=collator, num_workers=num_workers, pin_memory=True,
                             worker_init_fn=seed_worker)
 
-    logits_by_idx: Dict[int, np.ndarray] = {}
-    labels_by_idx: Dict[int, np.ndarray] = {}
+    logits_by_idx: dict[int, np.ndarray] = {}
+    labels_by_idx: dict[int, np.ndarray] = {}
     for batch in loader:
         if use_amp:
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
