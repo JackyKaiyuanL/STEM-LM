@@ -1,18 +1,9 @@
 """
-Regenerate ebutterfly_splits_v2.json from the v2 CSV using the same h3
-spatial-block fold as the original (resolution=2, seed=42, train/val/test
-0.8/0.1/0.1).
-
-Required because phase 1 / 3 can drop a handful of rows whose nearest valid
-WorldClim or MODIS pixel is too far away.
-
 Usage:
   python regen_splits_v2.py \\
       --in_csv  ${REPO_ROOT}/lab/ebutterfly_na_2011_2025_jsdm_v2.csv \\
       --out_json ${REPO_ROOT}/lab/ebutterfly_splits_v2.json \\
       --resolution 2 --seed 42
-
-Self-contained — no model code needed. Mirrors jsdm_data.py:h3_block_split.
 """
 
 import argparse
