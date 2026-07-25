@@ -455,9 +455,12 @@ class EnvCrossAttention(nn.Module):
     def forward(self, hidden_states, env_embeddings, output_attentions=False):
         
         query_layer = self.transpose_for_scores(self.query(hidden_states))
-        env_exp = env_embeddings.unsqueeze(1).expand(-1, hidden_states.size(1), -1, -1)
-        key_layer = self.transpose_for_scores(self.key(env_exp))
-        value_layer = self.transpose_for_scores(self.value(env_exp))
+        # Env keys/values are identical across the species axis S (env_embeddings
+        # does not depend on the species row). Project once on (B, C_env, H) and
+        # add a singleton S axis for SDPA/matmul to broadcast, instead of
+        # expanding to (B, S, C_env, H) and projecting S times.
+        key_layer = self.transpose_for_scores(self.key(env_embeddings)).unsqueeze(1)
+        value_layer = self.transpose_for_scores(self.value(env_embeddings)).unsqueeze(1)
 
         if output_attentions:
             attn_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
