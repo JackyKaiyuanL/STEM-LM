@@ -331,13 +331,33 @@ class STCrossAttention(nn.Module):
         x = x.view(*new_x_shape)
         return x.transpose(-2, -3)
 
+    @staticmethod
+    def _gather_projected(proj, basis, flat_idx):
+        """Project the (3, S, H) basis once, then gather to (B, S, N, all_head)."""
+        table = proj(basis).reshape(-1, proj.out_features)
+        return F.embedding(flat_idx, table)
+
     def forward(
         self, hidden_states, source_embeddings,
         attention_mask=None, st_dist_bias=None, output_attentions=False,
     ):
         query_layer = self.transpose_for_scores(self.query(hidden_states))
-        key_layer = self.transpose_for_scores(self.key(source_embeddings))
-        value_layer = self.transpose_for_scores(self.value(source_embeddings))
+        if isinstance(source_embeddings, tuple):
+            # (basis, ids): project the 3*S distinct source rows, then gather.
+            # Equivalent to projecting the dense (B, S, N, H) tensor — the linear
+            # map is applied to exactly the same vectors — but the big tensor is
+            # never built, so neither is its saved activation for backward.
+            basis, source_ids = source_embeddings
+            S = basis.size(1)
+            flat_idx = (source_ids * S
+                        + torch.arange(S, device=source_ids.device)[None, :, None])
+            key_layer = self.transpose_for_scores(
+                self._gather_projected(self.key, basis, flat_idx))
+            value_layer = self.transpose_for_scores(
+                self._gather_projected(self.value, basis, flat_idx))
+        else:
+            key_layer = self.transpose_for_scores(self.key(source_embeddings))
+            value_layer = self.transpose_for_scores(self.value(source_embeddings))
 
         combined_mask = None
         if attention_mask is not None and st_dist_bias is not None:
@@ -710,8 +730,15 @@ class JSDMModel(nn.Module):
     ):
         hidden_states = self.target_input(input_ids)
 
-        species_emb = self.target_input.species_embedding.weight
-        source_emb = self.target_input.embedding(source_ids) + species_emb[None, :, None, :]
+        # The source K/V inputs would be (B, S, N, H) — hundreds of millions of
+        # elements — but they only ever take 3*S distinct values, since
+        # source_emb[b,s,n] = state_emb[source_ids[b,s,n]] + species_emb[s].
+        # Hand cross-attention that small basis plus the ids and let it gather
+        # after projecting, so the (B, S, N, H) product is never materialised.
+        species_emb = self.target_input.species_embedding.weight        # (S, H)
+        state_emb = self.target_input.embedding.weight                 # (3, H)
+        source_basis = state_emb[:, None, :] + species_emb[None, :, :]  # (3, S, H)
+        source_emb = (source_basis, source_ids)
 
         if self.use_env:
             env_emb = torch.cat([

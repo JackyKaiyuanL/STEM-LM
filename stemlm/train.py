@@ -393,6 +393,11 @@ def add_train_args(parser):
                         help="Wrap the model in torch.compile to fuse kernels and "
                              "cut per-step launch overhead. First steps pay a "
                              "one-time compilation cost.")
+    parser.add_argument("--compile_mode", default="default",
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile mode. 'reduce-overhead' uses CUDA graphs "
+                             "to cut launch gaps; 'max-autotune' also autotunes kernels "
+                             "(long warmup). Only used with --compile.")
     parser.add_argument(
         "--mixed_precision",
         type=str,
@@ -683,8 +688,8 @@ def run_train(args):
         model.model.encoder.gradient_checkpointing = True
 
     if args.compile:
-        model = torch.compile(model)
-        log_main(env, "Model compiled with torch.compile")
+        model = torch.compile(model, mode=args.compile_mode)
+        log_main(env, f"Model compiled with torch.compile (mode={args.compile_mode})")
 
     if env.is_distributed:
         model = DDP(
