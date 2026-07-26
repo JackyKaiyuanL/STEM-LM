@@ -24,7 +24,10 @@ _K_QUERY_OVERFETCH = 4
 
 _FAISS_IVF_MIN = 200_000   # below this, exact flat index (IVF training not worth it)
 _FAISS_NLIST_MAX = 8192
-_FAISS_NPROBE = 32         # 3D coords => recall ~1.0 even at small nprobe (measured)
+_FAISS_NPROBE = 8          # 3D coords => recall is already 1.0 here (measured at
+                           # 71M rows, k=4100: nprobe 8 and 32 both retrieve the
+                           # exact neighbour set, but 8 is 1.8x faster; 4 drops to
+                           # recall 0.9976, so 8 is the floor that stays exact).
 
 
 def _lonlat_to_xyz(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
