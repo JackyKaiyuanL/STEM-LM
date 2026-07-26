@@ -143,6 +143,31 @@ def _normalize_time_col(df: pd.DataFrame, time_col: str, no_time: bool) -> bool:
     return True
 
 
+def _list_column_to_csr_arrays(column) -> tuple[np.ndarray, np.ndarray]:
+    """CSR ``(indptr, indices)`` from an Arrow list column, without copying rows.
+
+    A list array stores one offsets buffer plus one flat values buffer — the same
+    layout CSR wants — so this is buffer arithmetic rather than a per-row loop.
+    """
+    import pyarrow as pa
+
+    arr = column.combine_chunks() if hasattr(column, "combine_chunks") else column
+    if isinstance(arr, pa.ChunkedArray):
+        arr = (arr.chunk(0) if arr.num_chunks == 1
+               else pa.concat_arrays([c for c in arr.iterchunks()]))
+    if arr.null_count:
+        raise ValueError("species_idx contains nulls; expected a list per row")
+
+    offsets = arr.offsets.to_numpy(zero_copy_only=False).astype(np.int64)
+    values = arr.values.to_numpy(zero_copy_only=False)
+    # A sliced array's offsets do not start at 0; rebase so they index `values`.
+    start = int(offsets[0])
+    if start:
+        offsets = offsets - start
+    values = values[start:start + int(offsets[-1])]
+    return offsets, values.astype(np.int32, copy=False)
+
+
 class _SparseSpeciesData:
     def __init__(self, csr):
         self._csr = csr
@@ -402,21 +427,30 @@ class JSDMSparseDataset(JSDMDataset):
         self.num_source_sites = num_source_sites
         self.num_scale_sites = num_scale_sites if num_scale_sites is not None else num_source_sites
 
+        import pyarrow.dataset as pa_ds
+
         if os.path.isdir(parquet_path):
             parts = sorted(os.path.join(parquet_path, f)
                            for f in os.listdir(parquet_path) if f.endswith(".parquet"))
             if not parts:
                 raise FileNotFoundError(f"No .parquet shards in {parquet_path}")
-            df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
         else:
-            df = pd.read_parquet(parquet_path)
+            parts = [parquet_path]
+        table = pa_ds.dataset(parts, format="parquet").to_table()
         with open(vocab_path) as f:
             species_cols = json.load(f)
-        if "species_idx" not in df.columns:
+        if "species_idx" not in table.column_names:
             raise ValueError(
                 "Sparse parquet must have a 'species_idx' column "
-                "(variable-length list<int32> per row). Got: " + ", ".join(df.columns)
+                "(variable-length list<int32> per row). Got: "
+                + ", ".join(table.column_names)
             )
+        # Arrow already stores a list column as offsets + flat values, which is
+        # exactly CSR's indptr + indices — take them directly rather than looping
+        # over every row in Python.
+        indptr, indices = _list_column_to_csr_arrays(table["species_idx"])
+        df = table.drop(["species_idx"]).to_pandas()
+        del table
 
         non_species = [c for c in df.columns if c != "species_idx"]
         if df[non_species].isna().any().any():
@@ -430,14 +464,7 @@ class JSDMSparseDataset(JSDMDataset):
                         if c not in coord_cols and c != "species_idx" and c.startswith("env_")]
 
         from scipy.sparse import csr_matrix
-        idx_lists = df["species_idx"].values
         N_rows = len(df)
-        counts = np.fromiter((len(x) for x in idx_lists), dtype=np.int64, count=N_rows)
-        indptr = np.empty(N_rows + 1, dtype=np.int64)
-        indptr[0] = 0
-        np.cumsum(counts, out=indptr[1:])
-        indices = (np.concatenate([np.asarray(x, dtype=np.int32) for x in idx_lists])
-                   if N_rows else np.array([], dtype=np.int32))
         data = np.ones(indices.size, dtype=np.float32)
         csr = csr_matrix((data, indices, indptr), shape=(N_rows, len(species_cols)))
         species_data = _SparseSpeciesData(csr)
@@ -798,20 +825,24 @@ def h3_block_split(lats, lons, resolution=2, train_frac=0.8, test_frac=0.1, seed
         ) from None
     cells = np.array([h3lib.latlng_to_cell(float(lat), float(lon), resolution)
                       for lat, lon in zip(lats, lons, strict=False)])
-    unique_cells = np.unique(cells)
+    # Label each row by its cell's rank among the sorted unique cells, then work
+    # in those integer codes: membership tests over 71M cell *strings* cost
+    # minutes, over int codes they are milliseconds. codes[i] == j exactly when
+    # cells[i] == unique_cells[j], so the split is unchanged.
+    unique_cells, codes = np.unique(cells, return_inverse=True)
+    codes = codes.astype(np.int32, copy=False).ravel()
     rng = np.random.RandomState(seed)
     perm = rng.permutation(len(unique_cells))
-    unique_cells = unique_cells[perm]
 
     n = len(unique_cells)
     n_test = max(1, round(n * test_frac))
     n_val  = max(1, round(n * (1 - train_frac - test_frac)))
-    test_cells  = set(unique_cells[:n_test])
-    val_cells   = set(unique_cells[n_test : n_test + n_val])
+    test_codes = perm[:n_test]
+    val_codes  = perm[n_test : n_test + n_val]
 
-    train_idx = np.where(~np.isin(cells, list(test_cells | val_cells)))[0]
-    val_idx   = np.where( np.isin(cells, list(val_cells)))[0]
-    test_idx  = np.where( np.isin(cells, list(test_cells)))[0]
+    train_idx = np.where(~np.isin(codes, np.concatenate([test_codes, val_codes])))[0]
+    val_idx   = np.where( np.isin(codes, val_codes))[0]
+    test_idx  = np.where( np.isin(codes, test_codes))[0]
 
     n_cells_train = n - n_test - n_val
     print(f"  H3 res={resolution} | {n} cells → {n_cells_train} train / {n_val} val / {n_test} test cells")
