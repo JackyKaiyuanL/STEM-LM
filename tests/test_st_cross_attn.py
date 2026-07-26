@@ -144,3 +144,46 @@ def test_collapsed_no_source_dependence_on_absent_bins():
     v0 = mod.value(basis[0])  # (S, all_head)
     torch.testing.assert_close(got, v0[None, :, None, :].expand_as(got),
                                rtol=1e-4, atol=1e-5)
+
+
+def test_species_attention_matches_explicit_reference():
+    """Species self-attention folds (B, T) into the batch axis so the fused
+    kernels apply; it must still equal an explicit softmax(QK^T)V."""
+    import math
+
+    import torch.nn.functional as F
+
+    from stemlm.model import SpeciesSelfAttention
+
+    torch.manual_seed(6)
+    cfg = JSDMConfig(hidden_size=64, num_attention_heads=8, num_species=17)
+    mod = SpeciesSelfAttention(cfg).eval()  # dropout off
+    B, T, S, H = 3, 2, 17, 64
+    x = torch.randn(B, T, S, H)
+
+    got = mod(x)[0]
+
+    q = mod.transpose_for_scores(mod.query(x))
+    k = mod.transpose_for_scores(mod.key(x))
+    v = mod.transpose_for_scores(mod.value(x))
+    scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(mod.attention_head_size)
+    ctx = torch.matmul(F.softmax(scores, dim=-1), v).transpose(-2, -3).contiguous()
+    ref = ctx.view(*ctx.size()[:-2], mod.all_head_size)
+
+    assert got.shape == ref.shape == (B, T, S, mod.all_head_size)
+    torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+
+
+def test_species_attention_independent_across_leading_dims():
+    """Folding must not leak information between batch rows or target sites."""
+    from stemlm.model import SpeciesSelfAttention
+
+    torch.manual_seed(7)
+    cfg = JSDMConfig(hidden_size=32, num_attention_heads=4, num_species=9)
+    mod = SpeciesSelfAttention(cfg).eval()
+    x = torch.randn(4, 3, 9, 32)
+    full = mod(x)[0]
+    for b in range(4):
+        for t in range(3):
+            one = mod(x[b:b + 1, t:t + 1])[0]
+            torch.testing.assert_close(one[0, 0], full[b, t], rtol=1e-4, atol=1e-5)
