@@ -1,4 +1,7 @@
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -8,6 +11,10 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 from stemlm.data import FixedPValCollator, seed_worker
+
+# Species metrics are independent; cap the pool so a many-species run does
+# not spawn hundreds of threads on a large node.
+_METRIC_MAX_WORKERS = 32
 
 
 def safe_auc_roc(labels: np.ndarray, preds: np.ndarray) -> float:
@@ -32,6 +39,48 @@ def safe_auc_pr(labels: np.ndarray, preds: np.ndarray) -> float:
         return float("nan")
 
 
+def auc_roc_and_pr(labels: np.ndarray, preds: np.ndarray) -> tuple[float, float]:
+    """AUROC and average precision from a single sort.
+
+    Equivalent to ``safe_auc_roc`` and ``safe_auc_pr`` but shares one argsort and
+    skips sklearn's curve construction: AUROC is the mid-rank Mann-Whitney
+    statistic (identical to trapezoidal ROC integration) and AP is the step-wise
+    sum over thresholds with tied scores grouped, as sklearn does.
+    """
+    n = labels.size
+    n_pos = int(labels.sum())
+    n_neg = n - n_pos
+    if n == 0 or n_pos == 0 or n_neg == 0 or np.isnan(preds).any():
+        return float("nan"), float("nan")
+
+    order = np.argsort(preds)
+    p_sorted = preds[order]
+    y_sorted = labels[order].astype(np.float64)
+
+    # Contiguous runs of equal scores; both metrics treat a run as one threshold.
+    new_run = np.empty(n, dtype=bool)
+    new_run[0] = True
+    np.not_equal(p_sorted[1:], p_sorted[:-1], out=new_run[1:])
+    run_of = np.cumsum(new_run) - 1
+    run_sizes = np.bincount(run_of)
+    run_starts = np.concatenate(([0], np.cumsum(run_sizes)[:-1]))
+
+    # AUROC: mean rank of the positives, ties sharing their average rank.
+    mid_ranks = run_starts + (run_sizes + 1) / 2.0
+    rank_sum = float(np.dot(mid_ranks[run_of], y_sorted))
+    auroc = (rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+    # AP: walk thresholds from the highest score down, one point per run.
+    pos_upto = np.cumsum(y_sorted)[run_starts + run_sizes - 1]
+    n_upto = run_starts + run_sizes
+    tp = n_pos - np.concatenate(([0.0], pos_upto[:-1]))
+    predicted = n - np.concatenate(([0], n_upto[:-1]))
+    recall = np.concatenate((tp / n_pos, [0.0]))
+    precision = np.concatenate((tp / predicted, [1.0]))
+    ap = float(-np.sum(np.diff(recall) * precision[:-1]))
+    return float(auroc), ap
+
+
 def safe_brier(labels: np.ndarray, preds: np.ndarray) -> float:
     if labels.size == 0 or np.isnan(preds).any():
         return float("nan")
@@ -43,14 +92,13 @@ def safe_ece(labels: np.ndarray, preds: np.ndarray, n_bins: int = 15) -> float:
         return float("nan")
     edges = np.linspace(0.0, 1.0, n_bins + 1)
     idx = np.clip(np.digitize(preds, edges) - 1, 0, n_bins - 1)
-    err = 0.0
-    n = preds.size
-    for b in range(n_bins):
-        m = idx == b
-        if not m.any():
-            continue
-        err += (m.sum() / n) * abs(labels[m].mean() - preds[m].mean())
-    return float(err)
+    # Bin sums in one pass instead of one boolean mask per bin.
+    counts = np.bincount(idx, minlength=n_bins).astype(np.float64)
+    label_sums = np.bincount(idx, weights=labels.astype(np.float64), minlength=n_bins)
+    pred_sums = np.bincount(idx, weights=preds.astype(np.float64), minlength=n_bins)
+    nz = counts > 0
+    gap = np.abs(label_sums[nz] - pred_sums[nz]) / counts[nz]
+    return float(np.sum((counts[nz] / preds.size) * gap))
 
 
 def safe_cbi(labels: np.ndarray, preds: np.ndarray,
@@ -73,14 +121,19 @@ def safe_cbi(labels: np.ndarray, preds: np.ndarray,
         return float("nan")
     half_w = 0.5 * bin_width_frac * (hi - lo)
     centers = np.linspace(lo, hi, n_windows)
+    # Sort once, then every window's inclusive count is a pair of searchsorted
+    # lookups — no rescan of the predictions per window.
+    pres_sorted = np.sort(pres_preds)
+    bg_sorted = np.sort(bg_preds)
+    lo_i, hi_i = centers - half_w, centers + half_w
+    e_count = (np.searchsorted(bg_sorted, hi_i, side="right")
+               - np.searchsorted(bg_sorted, lo_i, side="left"))
+    p_count = (np.searchsorted(pres_sorted, hi_i, side="right")
+               - np.searchsorted(pres_sorted, lo_i, side="left"))
     pe = np.full(n_windows, np.nan, dtype=np.float64)
-    for i, ctr in enumerate(centers):
-        lo_i, hi_i = ctr - half_w, ctr + half_w
-        e_frac = ((bg_preds >= lo_i) & (bg_preds <= hi_i)).sum() / bg_preds.size
-        if e_frac == 0:
-            continue
-        p_frac = ((pres_preds >= lo_i) & (pres_preds <= hi_i)).sum() / pres_preds.size
-        pe[i] = p_frac / e_frac
+    hit = e_count > 0
+    pe[hit] = ((p_count[hit] / pres_preds.size)
+               / (e_count[hit] / bg_preds.size))
     ok = np.isfinite(pe)
     if ok.sum() < 3 or np.unique(pe[ok]).size < 2:
         return float("nan")
@@ -91,26 +144,46 @@ def safe_cbi(labels: np.ndarray, preds: np.ndarray,
         return float("nan")
 
 
+def _species_metrics(probs: np.ndarray, labels: np.ndarray, s: int):
+    mask = labels[:, s] != -100
+    y = labels[mask, s].astype(np.int64)
+    p = probs[mask, s].astype(np.float64)
+    if y.size == 0 or y.sum() == 0 or y.sum() == y.size:
+        return None
+    auc_roc, auc_pr = auc_roc_and_pr(y, p)
+    return auc_roc, auc_pr, safe_cbi(y, p), safe_brier(y, p), safe_ece(y, p)
+
+
 def compute_per_species_metrics(probs: np.ndarray,
-                                labels: np.ndarray) -> dict[str, dict[int, float]]:
+                                labels: np.ndarray,
+                                max_workers: int | None = None,
+                                ) -> dict[str, dict[int, float]]:
+    """Per-species metrics, computed across species in parallel.
+
+    Species are independent, and the work is numpy sorts and reductions that
+    release the GIL, so threads give real speedup without copying the (rows x
+    species) arrays into worker processes.
+    """
     if probs.shape != labels.shape:
         raise ValueError(f"probs {probs.shape} != labels {labels.shape}")
     S = probs.shape[1]
-    out: dict[str, dict[int, float]] = {
-        "auc_roc": {}, "auc_pr": {}, "cbi": {},
-        "brier": {}, "ece": {},
-    }
-    for s in range(S):
-        mask = labels[:, s] != -100
-        y = labels[mask, s].astype(np.int64)
-        p = probs[mask, s].astype(np.float64)
-        if y.size == 0 or y.sum() == 0 or y.sum() == y.size:
+    if max_workers is None:
+        max_workers = min(_METRIC_MAX_WORKERS, os.cpu_count() or 1, max(S, 1))
+
+    if max_workers <= 1:
+        results = [_species_metrics(probs, labels, s) for s in range(S)]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            results = list(pool.map(lambda s: _species_metrics(probs, labels, s),
+                                    range(S)))
+
+    names = ("auc_roc", "auc_pr", "cbi", "brier", "ece")
+    out: dict[str, dict[int, float]] = {name: {} for name in names}
+    for s, res in enumerate(results):
+        if res is None:
             continue
-        out["auc_roc"][s] = safe_auc_roc(y, p)
-        out["auc_pr"][s] = safe_auc_pr(y, p)
-        out["cbi"][s] = safe_cbi(y, p)
-        out["brier"][s] = safe_brier(y, p)
-        out["ece"][s] = safe_ece(y, p)
+        for name, value in zip(names, res, strict=True):
+            out[name][s] = value
     return out
 
 
