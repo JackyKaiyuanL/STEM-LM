@@ -10,7 +10,7 @@ Only NEUS is used. The four other NW Atlantic surveys in FISHGLOB (SCS, GSL-N, G
 
 ## Pipeline (run in order)
 
-1. **`prepare_neus.py`** — extracts hauls and occurrences from the RData compilation via Rscript, filters years, drops hauls with incomplete date or covariates, zero-fills to presence/absence over taxa with ≥50 hauls, and attaches the three in-survey covariates.
+1. **`prepare_neus.py`** — extracts hauls and occurrences from the RData compilation via Rscript, filters years, drops hauls with incomplete date or covariates, zero-fills to presence/absence over taxa with ≥100 hauls, and attaches the three in-survey covariates.
    - Output: `neus_nefsc.csv` (the file STEM-LM consumes).
 
 2. **`regen_splits.py`** — H3 spatial-block split, seed 42, 80/10/10.
