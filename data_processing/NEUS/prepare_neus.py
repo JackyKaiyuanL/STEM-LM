@@ -27,7 +27,7 @@ Usage:
       --fishglob ${REPO_ROOT}/data/FishGlob_data/outputs/Compiled_data/FishGlob_public_clean.RData \\
       --workdir  ${REPO_ROOT}/data/_neus_tmp \\
       --out      ${REPO_ROOT}/data/neus_nefsc.csv \\
-      --year_min 1970 --year_max 2019 --min_presences 50 --zero_temp_is_missing
+      --year_min 1970 --year_max 2019 --zero_temp_is_missing
 """
 
 import argparse
@@ -124,7 +124,7 @@ if __name__ == "__main__":
     p.add_argument("--fishglob", required=True)
     p.add_argument("--workdir", required=True, help="scratch dir for the R extraction")
     p.add_argument("--out", required=True)
-    p.add_argument("--min_presences", type=int, default=50)
+    p.add_argument("--min_presences", type=int, default=100)
     p.add_argument("--year_min", type=int, default=1963)
     p.add_argument("--year_max", type=int, default=2019)
     p.add_argument("--force_extract", action="store_true")
