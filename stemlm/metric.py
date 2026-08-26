@@ -97,19 +97,12 @@ def safe_ece(labels: np.ndarray, preds: np.ndarray, n_bins: int = 15) -> float:
 
 def safe_cbi(labels: np.ndarray, preds: np.ndarray,
              n_windows: int = 101, bin_width_frac: float = 0.1) -> float:
-    # Continuous Boyce Index (Hirzel et al. 2006). Moving windows span the observed
-    # prediction range [min, max]; each window has width bin_width_frac of that range.
-    # P/E is the presence fraction over the absence (background) fraction per window;
-    # CBI is the Spearman correlation between window center and P/E. Windows with no
-    # background points are dropped.
     if labels.size == 0 or labels.sum() == 0 or labels.sum() == labels.size:
         return float("nan")
     if np.isnan(preds).any():
         return float("nan")
     pres_preds = preds[labels == 1]
-    bg_preds = preds[labels == 0]
-    if bg_preds.size == 0 or pres_preds.size == 0:
-        return float("nan")
+    all_preds = preds
     lo, hi = float(preds.min()), float(preds.max())
     if hi <= lo:
         return float("nan")
@@ -118,16 +111,16 @@ def safe_cbi(labels: np.ndarray, preds: np.ndarray,
     # Sort once, then every window's inclusive count is a pair of searchsorted
     # lookups — no rescan of the predictions per window.
     pres_sorted = np.sort(pres_preds)
-    bg_sorted = np.sort(bg_preds)
+    all_sorted = np.sort(all_preds)
     lo_i, hi_i = centers - half_w, centers + half_w
-    e_count = (np.searchsorted(bg_sorted, hi_i, side="right")
-               - np.searchsorted(bg_sorted, lo_i, side="left"))
+    e_count = (np.searchsorted(all_sorted, hi_i, side="right")
+               - np.searchsorted(all_sorted, lo_i, side="left"))
     p_count = (np.searchsorted(pres_sorted, hi_i, side="right")
                - np.searchsorted(pres_sorted, lo_i, side="left"))
     pe = np.full(n_windows, np.nan, dtype=np.float64)
     hit = e_count > 0
     pe[hit] = ((p_count[hit] / pres_preds.size)
-               / (e_count[hit] / bg_preds.size))
+               / (e_count[hit] / all_preds.size))
     ok = np.isfinite(pe)
     if ok.sum() < 3 or np.unique(pe[ok]).size < 2:
         return float("nan")

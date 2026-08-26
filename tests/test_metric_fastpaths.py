@@ -36,14 +36,14 @@ def _ece_maskwise(labels, preds, n_bins=15):
 
 def _cbi_looped(labels, preds, n_windows=101, bin_width_frac=0.1):
     """The previous CBI: rescan both arrays for every window."""
-    pres, bg = preds[labels == 1], preds[labels == 0]
+    pres = preds[labels == 1]
     lo, hi = float(preds.min()), float(preds.max())
     half_w = 0.5 * bin_width_frac * (hi - lo)
     centers = np.linspace(lo, hi, n_windows)
     pe = np.full(n_windows, np.nan)
     for i, ctr in enumerate(centers):
         a, b = ctr - half_w, ctr + half_w
-        e = ((bg >= a) & (bg <= b)).sum() / bg.size
+        e = ((preds >= a) & (preds <= b)).sum() / preds.size
         if e == 0:
             continue
         pe[i] = (((pres >= a) & (pres <= b)).sum() / pres.size) / e

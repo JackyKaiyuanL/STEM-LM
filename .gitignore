@@ -230,3 +230,6 @@ __marimo__/
 # macOS
 .DS_Store
 
+# Lib
+dump/
+res_log/
