@@ -19,24 +19,20 @@ def _haversine_bt_n(lat_a, lon_a, lat_b, lon_b):
     return _EARTH_RADIUS_KM * 2.0 * torch.asin(torch.sqrt(a.clamp(min=0.0)))
 
 
-# =============================================================================
-# Configuration
-# =============================================================================
-
 @dataclass
 class JSDMConfig:
-    
+
     num_species: int = 100
-    
+
     num_source_sites: int = 64
-    
+
     max_spatial_dist: float = 180.0
     max_temporal_dist: float = 365.0
     use_temporal: bool = True
-    
+
     num_env_vars: int = 10
     num_env_groups: int = 5
-    
+
     hidden_size: int = 256
     num_attention_heads: int = 8
     num_hidden_layers: int = 4
@@ -72,7 +68,7 @@ class JSDMConfig:
             raise ValueError(
                 f"ablation must be one of full/no_st/no_env/no_st_env; got {self.ablation!r}"
             )
-        
+
         tfp = self.temporal_fire_init_periods
         if tfp is not None:
             tfp = tuple(float(p) for p in tfp) or None
@@ -82,10 +78,6 @@ class JSDMConfig:
     def n_temporal_fire_freqs(self) -> int:
         return len(self.temporal_fire_init_periods) if self.temporal_fire_init_periods else 0
 
-
-# =============================================================================
-# FIRE Distance Bias
-# =============================================================================
 
 class FIREDistanceBias(nn.Module):
 
@@ -126,11 +118,6 @@ class FIREDistanceBias(nn.Module):
         return self.mlp(feats).squeeze(-1)
 
 
-
-# =============================================================================
-# RMSNorm
-# =============================================================================
-
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -142,10 +129,6 @@ class RMSNorm(nn.Module):
         return (x / rms) * self.weight
 
 
-# =============================================================================
-# Target Input
-# =============================================================================
-
 class TargetInput(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
@@ -153,22 +136,10 @@ class TargetInput(nn.Module):
         self.species_embedding = nn.Embedding(config.num_species, config.hidden_size)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            input_ids: (B, S, T) long tensor — 0=absent, 1=present, 2=mask
-        Returns:
-            (B, S, T, H)
-        """
-        state_emb = self.embedding(input_ids)  # (B, S, T, H)
-        species_idx = torch.arange(input_ids.size(1), device=input_ids.device)
-        species_emb = self.species_embedding(species_idx)  # (S, H)
+        state_emb = self.embedding(input_ids)          # (B, S, T, H)
+        species_emb = self.species_embedding.weight    # (S, H)
         return state_emb + species_emb[None, :, None, :]
 
-
-
-# =============================================================================
-# Target Environment Module
-# =============================================================================
 
 class TargetEnvModule(nn.Module):
     def __init__(self, config: JSDMConfig):
@@ -186,15 +157,7 @@ class TargetEnvModule(nn.Module):
         return self.out_norm(x).unsqueeze(1)
 
 
-# =============================================================================
-# Environmental Source Module
-# =============================================================================
-
 class EnvSourceModule(nn.Module):
-    """
-    Encodes environmental covariates from source sites, pooled into groups.
-    Provides environmental context for cross-attention 2.
-    """
 
     def __init__(self, config: JSDMConfig):
         super().__init__()
@@ -222,12 +185,7 @@ class EnvSourceModule(nn.Module):
         return self.layer_norm(self.out_proj(pooled))
 
 
-# =============================================================================
-# Row Self-Attention along species axis
-# =============================================================================
-
-class SpeciesSelfAttention(nn.Module):
-
+class Attention(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads // 2
@@ -242,8 +200,24 @@ class SpeciesSelfAttention(nn.Module):
 
     def transpose_for_scores(self, x):
         new_x_shape = (*x.size()[:-1], self.num_attention_heads, self.attention_head_size)
-        x = x.view(*new_x_shape)
-        return x.transpose(-2, -3)
+        return x.view(*new_x_shape).transpose(-2, -3)
+
+    def _merge_heads(self, context):
+        context = context.transpose(-2, -3).contiguous()
+        return context.view(*context.size()[:-2], self.all_head_size)
+
+
+class AttentionOutput(nn.Module):
+    def __init__(self, config: JSDMConfig):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size // 2, config.hidden_size)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+    def forward(self, hidden_states):
+        return self.dropout(self.dense(hidden_states))
+
+
+class SpeciesSelfAttention(Attention):
 
     def forward(self, hidden_states, output_attentions=False):
         query_layer = self.transpose_for_scores(self.query(hidden_states))
@@ -265,10 +239,8 @@ class SpeciesSelfAttention(nn.Module):
                 )
                 ctx_parts.append(torch.matmul(p, value_layer))
                 attn_parts.append(p.mean(dim=-3))
-            context = torch.cat(ctx_parts, dim=-2).transpose(-2, -3).contiguous()
-            attn_probs = torch.cat(attn_parts, dim=-2)
-            new_shape = (*context.size()[:-2], self.all_head_size)
-            return context.view(*new_shape), attn_probs
+            context = self._merge_heads(torch.cat(ctx_parts, dim=-2))
+            return context, torch.cat(attn_parts, dim=-2)
 
         # q/k/v are (B, T, heads, S, head_dim). The fused attention kernels only
         # accept 4-D inputs, so a 5-D call silently falls back to the math backend
@@ -285,27 +257,14 @@ class SpeciesSelfAttention(nn.Module):
             scale=scale,
         )
         context = context.reshape(*lead, *context.shape[-3:])
-        context = context.transpose(-2, -3).contiguous()
-        new_shape = (*context.size()[:-2], self.all_head_size)
-        return (context.view(*new_shape),)
-
-
-
-class SpeciesSelfOutput(nn.Module):
-    def __init__(self, config: JSDMConfig):
-        super().__init__()
-        self.dense = nn.Linear(config.hidden_size // 2, config.hidden_size)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def forward(self, hidden_states):
-        return self.dropout(self.dense(hidden_states))
+        return (self._merge_heads(context),)
 
 
 class SpeciesRowAttention(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         self.self_attn = SpeciesSelfAttention(config)
-        self.output = SpeciesSelfOutput(config)
+        self.output = AttentionOutput(config)
 
     def forward(self, hidden_states, output_attentions=False):
         self_outputs = self.self_attn(hidden_states, output_attentions)
@@ -315,35 +274,10 @@ class SpeciesRowAttention(nn.Module):
         return output
 
 
-# =============================================================================
-# ST Cross-Attention: target species attend to source-site tokens
-# =============================================================================
-
-class STCrossAttention(nn.Module):
-    def __init__(self, config: JSDMConfig):
-        super().__init__()
-        self.num_attention_heads = config.num_attention_heads // 2
-        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
-        self.all_head_size = self.num_attention_heads * self.attention_head_size
-
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
-        self.attention_probs_dropout_prob = config.attention_probs_dropout_prob
-
-    def transpose_for_scores(self, x):
-        new_x_shape = (*x.size()[:-1], self.num_attention_heads, self.attention_head_size)
-        x = x.view(*new_x_shape)
-        return x.transpose(-2, -3)
-
-    @staticmethod
-    def _gather_projected(proj, basis, flat_idx):
-        """Project the (3, S, H) basis once, then gather to (B, S, N, all_head)."""
-        table = proj(basis).reshape(-1, proj.out_features)
-        return F.embedding(flat_idx, table)
+class STCrossAttention(Attention):
 
     def _collapsed_forward(self, query_layer, basis, source_ids,
-                           combined_mask, output_attentions):
+                           st_dist_bias, output_attentions):
         """Attend over source sites without ever materialising K or V.
 
         Keys and values take only ``basis.size(0) * S`` distinct values, so the
@@ -368,10 +302,10 @@ class STCrossAttention(nn.Module):
         # index as a view, so no (B, S, h, T, N) index tensor is materialised.
         B, _, _, T, _ = qk.shape
         N = source_ids.size(-1)
-        idx = source_ids.long()[:, :, None, None, :].expand(B, S, h, T, N)
+        idx = source_ids[:, :, None, None, :].expand(B, S, h, T, N)
         attn_scores = torch.gather(qk, -1, idx)
-        if combined_mask is not None:
-            attn_scores = attn_scores + combined_mask
+        if st_dist_bias is not None:
+            attn_scores = attn_scores + st_dist_bias
         attn_probs = F.softmax(attn_scores, dim=-1)
         weights = F.dropout(attn_probs, p=self.attention_probs_dropout_prob,
                             training=self.training)
@@ -383,89 +317,52 @@ class STCrossAttention(nn.Module):
             dim=-1,
         )                                                   # (B, S, h, T, n_bins)
         context = torch.einsum("bshti,ishd->bshtd", bins, v_tab)
-        context = context.transpose(-2, -3).contiguous()
-        context = context.view(*context.size()[:-2], self.all_head_size)
+        context = self._merge_heads(context)
         return (context, attn_probs) if output_attentions else (context,)
 
     def forward(
         self, hidden_states, source_embeddings,
-        attention_mask=None, st_dist_bias=None, output_attentions=False,
+        st_dist_bias=None, output_attentions=False,
     ):
         query_layer = self.transpose_for_scores(self.query(hidden_states))
-        collapse = None
-        if isinstance(source_embeddings, tuple) and len(source_embeddings) == 3:
-            # (basis, flat_idx, ids): keys/values stay collapsed to their few
+        if st_dist_bias is not None:
+            st_dist_bias = st_dist_bias.to(query_layer.dtype)
+
+        if isinstance(source_embeddings, tuple):
+            # (basis, ids): keys/values stay collapsed to their few
             # distinct rows — see _collapsed_forward.
-            basis, _flat_idx, source_ids = source_embeddings
-            collapse = (basis, source_ids)
-        elif isinstance(source_embeddings, tuple):
-            # (basis, flat_idx): project the 3*S distinct source rows, then gather.
-            # Equivalent to projecting the dense (B, S, N, H) tensor — the linear
-            # map is applied to exactly the same vectors — but the big tensor is
-            # never built, so neither is its saved activation for backward.
-            basis, flat_idx = source_embeddings
-            key_layer = self.transpose_for_scores(
-                self._gather_projected(self.key, basis, flat_idx))
-            value_layer = self.transpose_for_scores(
-                self._gather_projected(self.value, basis, flat_idx))
-        else:
-            key_layer = self.transpose_for_scores(self.key(source_embeddings))
-            value_layer = self.transpose_for_scores(self.value(source_embeddings))
+            return self._collapsed_forward(query_layer, *source_embeddings,
+                                           st_dist_bias, output_attentions)
 
-        combined_mask = None
-        if attention_mask is not None and st_dist_bias is not None:
-            combined_mask = attention_mask + st_dist_bias.to(query_layer.dtype)
-        elif attention_mask is not None:
-            combined_mask = attention_mask
-        elif st_dist_bias is not None:
-            combined_mask = st_dist_bias.to(query_layer.dtype)
-
-        if collapse is not None:
-            return self._collapsed_forward(query_layer, *collapse,
-                                           combined_mask, output_attentions)
+        key_layer = self.transpose_for_scores(self.key(source_embeddings))
+        value_layer = self.transpose_for_scores(self.value(source_embeddings))
 
         if output_attentions:
             attn_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
             attn_scores = attn_scores / math.sqrt(self.attention_head_size)
-            if combined_mask is not None:
-                attn_scores = attn_scores + combined_mask
+            if st_dist_bias is not None:
+                attn_scores = attn_scores + st_dist_bias
             attn_probs = F.softmax(attn_scores, dim=-1)
             attn_probs_drop = F.dropout(
                 attn_probs, p=self.attention_probs_dropout_prob, training=self.training
             )
             context = torch.matmul(attn_probs_drop, value_layer)
-            context = context.transpose(-2, -3).contiguous()
-            new_shape = (*context.size()[:-2], self.all_head_size)
-            context = context.view(*new_shape)
-            return context, attn_probs
+            return self._merge_heads(context), attn_probs
         else:
             context = F.scaled_dot_product_attention(
                 query_layer, key_layer, value_layer,
-                attn_mask=combined_mask,
+                attn_mask=st_dist_bias,
                 dropout_p=self.attention_probs_dropout_prob if self.training else 0.0,
                 scale=1.0 / math.sqrt(self.attention_head_size),
             )
-            context = context.transpose(-2, -3).contiguous()
-            new_shape = (*context.size()[:-2], self.all_head_size)
-            context = context.view(*new_shape)
-            return (context,)
-
-
-class STCrossOutput(nn.Module):
-    def __init__(self, config: JSDMConfig):
-        super().__init__()
-        self.dense = nn.Linear(config.hidden_size // 2, config.hidden_size)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def forward(self, hidden_states):
-        return self.dropout(self.dense(hidden_states))
+            return (self._merge_heads(context),)
 
 
 class STColAttention(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         self.cross_attn = STCrossAttention(config)
-        self.output = STCrossOutput(config)
+        self.output = AttentionOutput(config)
         self.use_temporal = config.use_temporal
         self.fire_spatial = FIREDistanceBias(
             config.max_spatial_dist, config.fire_hidden_size, n_frequencies=0,
@@ -482,10 +379,8 @@ class STColAttention(nn.Module):
         if self.use_temporal:
             self.species_temporal_log_scale = nn.Parameter(torch.zeros(config.num_species))
 
-    def forward(
-        self, hidden_states, source_embeddings,
-        attention_mask=None, st_dist=None, output_attentions=False,
-    ):
+    def forward(self, hidden_states, source_embeddings,
+                st_dist=None, output_attentions=False):
         st_dist_bias = None
         if st_dist is not None:
             spatial_bias = self.fire_spatial(st_dist[..., 0])
@@ -500,7 +395,7 @@ class STColAttention(nn.Module):
             st_dist_bias = st_dist_bias[:, :, None, :, :]
 
         cross_outputs = self.cross_attn(
-            hidden_states, source_embeddings, attention_mask, st_dist_bias, output_attentions,
+            hidden_states, source_embeddings, st_dist_bias, output_attentions,
         )
         output = (self.output(cross_outputs[0]),)
         if output_attentions:
@@ -508,29 +403,9 @@ class STColAttention(nn.Module):
         return output
 
 
-# =============================================================================
-# Environmental Cross-Attention
-# =============================================================================
-
-class EnvCrossAttention(nn.Module):
-    def __init__(self, config: JSDMConfig):
-        super().__init__()
-        self.num_attention_heads = config.num_attention_heads // 2
-        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
-        self.all_head_size = self.num_attention_heads * self.attention_head_size
-
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
-        self.attention_probs_dropout_prob = config.attention_probs_dropout_prob
-
-    def transpose_for_scores(self, x):
-        new_x_shape = (*x.size()[:-1], self.num_attention_heads, self.attention_head_size)
-        x = x.view(*new_x_shape)
-        return x.transpose(-2, -3)
+class EnvCrossAttention(Attention):
 
     def forward(self, hidden_states, env_embeddings, output_attentions=False):
-        
         query_layer = self.transpose_for_scores(self.query(hidden_states))
         # Env keys/values are identical across the species axis S (env_embeddings
         # does not depend on the species row). Project once on (B, C_env, H) and
@@ -547,37 +422,21 @@ class EnvCrossAttention(nn.Module):
                 attn_probs, p=self.attention_probs_dropout_prob, training=self.training
             )
             context = torch.matmul(attn_probs_drop, value_layer)
-            context = context.transpose(-2, -3).contiguous()
-            new_shape = (*context.size()[:-2], self.all_head_size)
-            context = context.view(*new_shape)
-            return context, attn_probs
+            return self._merge_heads(context), attn_probs
         else:
             context = F.scaled_dot_product_attention(
                 query_layer, key_layer, value_layer,
                 dropout_p=self.attention_probs_dropout_prob if self.training else 0.0,
                 scale=1.0 / math.sqrt(self.attention_head_size),
             )
-            context = context.transpose(-2, -3).contiguous()
-            new_shape = (*context.size()[:-2], self.all_head_size)
-            context = context.view(*new_shape)
-            return (context,)
-
-
-class EnvCrossOutput(nn.Module):
-    def __init__(self, config: JSDMConfig):
-        super().__init__()
-        self.dense = nn.Linear(config.hidden_size // 2, config.hidden_size)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def forward(self, hidden_states):
-        return self.dropout(self.dense(hidden_states))
+            return (self._merge_heads(context),)
 
 
 class EnvColAttention(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         self.cross_attn = EnvCrossAttention(config)
-        self.output = EnvCrossOutput(config)
+        self.output = AttentionOutput(config)
 
     def forward(self, hidden_states, env_embeddings, output_attentions=False):
         cross_outputs = self.cross_attn(hidden_states, env_embeddings, output_attentions)
@@ -586,10 +445,6 @@ class EnvColAttention(nn.Module):
             output = (*output, cross_outputs[1])
         return output
 
-
-# =============================================================================
-# Combined Attention
-# =============================================================================
 
 class JSDMAttention(nn.Module):
     def __init__(self, config: JSDMConfig):
@@ -610,8 +465,7 @@ class JSDMAttention(nn.Module):
 
     def forward(
         self, hidden_states, st_source_embeddings, env_embeddings,
-        st_attention_mask=None, st_dist=None,
-        output_attentions=False,
+        st_dist=None, output_attentions=False,
     ):
         row_output = self.row_attention(
             hidden_states=self.row_norm(hidden_states).transpose(-2, -3),
@@ -625,22 +479,15 @@ class JSDMAttention(nn.Module):
         if self.use_st or self.use_env:
             h_normed = self.cross_norm(h)
 
-        if self.use_st and self.use_env:
-            st_out  = self.st_col_attention(
-                h_normed, st_source_embeddings, st_attention_mask, st_dist, output_attentions,
-            )
-            env_out = self.env_col_attention(h_normed, env_embeddings, output_attentions)
-            h = h + st_out[0] + env_out[0]
-            if output_attentions:
-                st_attn, env_attn = st_out[1], env_out[1]
-        elif self.use_st:
+        if self.use_st:
             st_out = self.st_col_attention(
-                h_normed, st_source_embeddings, st_attention_mask, st_dist, output_attentions,
+                h_normed, st_source_embeddings, st_dist, output_attentions,
             )
             h = h + st_out[0]
             if output_attentions:
                 st_attn = st_out[1]
-        elif self.use_env:
+
+        if self.use_env:
             env_out = self.env_col_attention(h_normed, env_embeddings, output_attentions)
             h = h + env_out[0]
             if output_attentions:
@@ -652,12 +499,8 @@ class JSDMAttention(nn.Module):
         return out
 
 
-# =============================================================================
-# FFN
-# =============================================================================
-
 class FeedForward(nn.Module):
-    
+
     def __init__(self, config: JSDMConfig):
         super().__init__()
         self.gate = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
@@ -669,10 +512,6 @@ class FeedForward(nn.Module):
         return self.dropout(self.down(F.silu(self.gate(x)) * self.up(x)))
 
 
-# =============================================================================
-# JSDM Layer, Encoder, Model, ForMaskedPrediction
-# =============================================================================
-
 class JSDMLayer(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
@@ -682,12 +521,11 @@ class JSDMLayer(nn.Module):
 
     def forward(
         self, hidden_states, st_source_embeddings, env_embeddings,
-        st_attention_mask=None, st_dist=None,
-        output_attentions=False,
+        st_dist=None, output_attentions=False,
     ):
         attn_outputs = self.attention(
             hidden_states, st_source_embeddings, env_embeddings,
-            st_attention_mask, st_dist, output_attentions,
+            st_dist, output_attentions,
         )
         h = attn_outputs[0]
         h = h + self.ffn(self.ffn_norm(h))
@@ -705,8 +543,7 @@ class JSDMEncoder(nn.Module):
 
     def forward(
         self, hidden_states, st_source_embeddings, env_embeddings,
-        st_attention_mask=None, st_dist=None,
-        output_attentions=False, output_hidden_states=False,
+        st_dist=None, output_attentions=False, output_hidden_states=False,
     ):
         all_hidden = () if output_hidden_states else None
         all_sp_attn = () if output_attentions else None
@@ -719,13 +556,13 @@ class JSDMEncoder(nn.Module):
             if self.gradient_checkpointing and self.training:
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     layer, hidden_states, st_source_embeddings, env_embeddings,
-                    st_attention_mask, st_dist, output_attentions,
+                    st_dist, output_attentions,
                     use_reentrant=False,
                 )
             else:
                 layer_outputs = layer(
                     hidden_states, st_source_embeddings, env_embeddings,
-                    st_attention_mask, st_dist, output_attentions,
+                    st_dist, output_attentions,
                 )
             hidden_states = layer_outputs[0]
 
@@ -754,10 +591,6 @@ class JSDMEncoderOutput:
     st_attentions: tuple[torch.FloatTensor, ...] | None = None
     env_attentions: tuple[torch.FloatTensor, ...] | None = None
 
-
-# =============================================================================
-# Full Model
-# =============================================================================
 
 class JSDMModel(nn.Module):
     def __init__(self, config: JSDMConfig):
@@ -795,14 +628,7 @@ class JSDMModel(nn.Module):
         species_emb = self.target_input.species_embedding.weight        # (S, H)
         state_emb = self.target_input.embedding.weight                 # (3, H)
         source_basis = state_emb[:, None, :] + species_emb[None, :, :]  # (3, S, H)
-        # Flatten (state, species) into one index up front — every layer reuses it,
-        # and this is where a narrow (uint8) source_ids gets widened, on-device.
-        S_src = source_basis.size(1)
-        source_flat_idx = (
-            source_ids.long() * S_src
-            + torch.arange(S_src, device=source_ids.device)[None, :, None]
-        )
-        source_emb = (source_basis, source_flat_idx, source_ids)
+        source_emb = (source_basis, source_ids.long())
 
         if self.use_env:
             env_emb = torch.cat([
@@ -827,16 +653,12 @@ class JSDMModel(nn.Module):
 
         encoder_out = self.encoder(
             hidden_states, source_emb, env_emb,
-            st_attention_mask=None, st_dist=st_dist,
+            st_dist=st_dist,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
         return encoder_out
 
-
-# =============================================================================
-# Masked prediction
-# =============================================================================
 
 @dataclass
 class JSDMOutput:
@@ -944,10 +766,6 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
             env_attentions=encoder_out.env_attentions,
         )
 
-
-# =============================================================================
-# Extract cooccurrence matrix
-# =============================================================================
 
 def extract_cooccurrence_matrix(output: JSDMOutput, layer_idx: int = -1) -> torch.Tensor:
     if output.species_attentions is None:

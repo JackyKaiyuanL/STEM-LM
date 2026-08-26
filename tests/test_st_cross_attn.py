@@ -12,55 +12,12 @@ import torch
 from stemlm.model import JSDMConfig, JSDMModel, STCrossAttention
 
 
-def _flat_idx(basis, source_ids):
-    """Build the (state, species) flat index exactly as JSDMModel does."""
-    S = basis.size(1)
-    return (source_ids.long() * S
-            + torch.arange(S, device=source_ids.device)[None, :, None])
-
-
 def _dense_source_emb(basis, source_ids):
     """The (B, S, N, H) tensor the gather path avoids building."""
-    flat = _flat_idx(basis, source_ids).reshape(-1)
+    S = basis.size(1)
+    flat = (source_ids.long() * S
+            + torch.arange(S, device=source_ids.device)[None, :, None]).reshape(-1)
     return basis.reshape(-1, basis.size(-1))[flat].view(*source_ids.shape, -1)
-
-
-def test_gather_matches_dense_projection():
-    torch.manual_seed(0)
-    cfg = JSDMConfig(hidden_size=64, num_attention_heads=8, num_species=10,
-                     num_source_sites=7)
-    mod = STCrossAttention(cfg).eval()
-
-    B, S, N, T, H = 3, 10, 7, 1, 64
-    hidden_states = torch.randn(B, S, T, H)
-    basis = torch.randn(3, S, H)
-    source_ids = torch.randint(0, 3, (B, S, N))
-    bias = torch.randn(B, S, 1, T, N)
-
-    dense = _dense_source_emb(basis, source_ids)
-    ref = mod(hidden_states, dense, st_dist_bias=bias)[0]
-    got = mod(hidden_states, (basis, _flat_idx(basis, source_ids)), st_dist_bias=bias)[0]
-
-    assert got.shape == ref.shape
-    torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
-
-
-def test_gather_matches_dense_with_attentions():
-    """The output_attentions path must agree too (it takes a different branch)."""
-    torch.manual_seed(1)
-    cfg = JSDMConfig(hidden_size=32, num_attention_heads=4, num_species=6,
-                     num_source_sites=5)
-    mod = STCrossAttention(cfg).eval()
-    B, S, N, T, H = 2, 6, 5, 1, 32
-    hidden_states = torch.randn(B, S, T, H)
-    basis = torch.randn(3, S, H)
-    source_ids = torch.randint(0, 3, (B, S, N))
-
-    dense = mod(hidden_states, _dense_source_emb(basis, source_ids), output_attentions=True)
-    gathered = mod(hidden_states, (basis, _flat_idx(basis, source_ids)),
-                   output_attentions=True)
-    for a, b in zip(dense, gathered, strict=True):
-        torch.testing.assert_close(b, a, rtol=1e-4, atol=1e-5)
 
 
 def test_full_model_forward_runs_with_gather():
@@ -103,9 +60,7 @@ def test_collapsed_matches_dense_projection():
 
     ref = mod(hidden_states, _dense_source_emb(basis, source_ids.long()),
               st_dist_bias=bias)[0]
-    got = mod(hidden_states,
-              (basis, _flat_idx(basis, source_ids), source_ids),
-              st_dist_bias=bias)[0]
+    got = mod(hidden_states, (basis, source_ids.long()), st_dist_bias=bias)[0]
     assert got.shape == ref.shape
     torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
 
@@ -123,8 +78,7 @@ def test_collapsed_matches_dense_attention_probs():
 
     ref = mod(hidden_states, _dense_source_emb(basis, source_ids.long()),
               output_attentions=True)
-    got = mod(hidden_states, (basis, _flat_idx(basis, source_ids), source_ids),
-              output_attentions=True)
+    got = mod(hidden_states, (basis, source_ids.long()), output_attentions=True)
     for a, b in zip(ref, got, strict=True):
         torch.testing.assert_close(b, a, rtol=1e-4, atol=1e-5)
 
@@ -140,7 +94,7 @@ def test_collapsed_no_source_dependence_on_absent_bins():
     source_ids = torch.zeros(B, S, N, dtype=torch.uint8)
     basis = torch.randn(3, S, H)
     hidden_states = torch.randn(B, S, 1, H)
-    got = mod(hidden_states, (basis, _flat_idx(basis, source_ids), source_ids))[0]
+    got = mod(hidden_states, (basis, source_ids.long()))[0]
     v0 = mod.value(basis[0])  # (S, all_head)
     torch.testing.assert_close(got, v0[None, :, None, :].expand_as(got),
                                rtol=1e-4, atol=1e-5)
