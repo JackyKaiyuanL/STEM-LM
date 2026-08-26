@@ -4,7 +4,9 @@ Joint species distribution model with masked-species pretraining.
 
 **Input CSV**: `time, latitude, longitude, env_*, species_*` — one row per
 site–time observation. Species are 0/1; env columns must be prefixed `env_*`
-or passed via `--env_cols`. Dataset preparation pipelines (eButterfly, sPlotOpen) live under `data_processing/<dataset>/` with per-source download instructions.
+or passed via `--env_cols`. Preparation pipelines for eButterfly, sPlotOpen,
+NEUS, and Monarch live under `data_processing/<dataset>/`, each with its own
+download instructions.
 
 ## Files
 
@@ -37,10 +39,9 @@ stemlm train data.csv \
 Defaults to focal loss (α=0.25, γ=2.0). Saves two checkpoints
 (`best_model.pt` by val-AUROC, `best_model_by_cbi.pt` by val-CBI), evaluates
 both, and reports per-p AUROC / AUPRC / CBI / Brier / ECE on a uniform-mask
-block AND a presence-only (absence-mask) block.
+block and a presence-only (absence-mask) block.
 
-To use BCE instead, pass `--loss_type bce`. Focal trades a small AUROC for big
-CBI gains; γ=2 maximizes CBI at the cost of slight decrease in AUROC.
+For BCE, pass `--loss_type bce`.
 
 ## Key options
 
@@ -65,7 +66,7 @@ CBI gains; γ=2 maximizes CBI at the cost of slight decrease in AUROC.
 - `--num_source_sites 64`
 
 **Model**
-- `--hidden_size 256 --num_attention_heads 8 --num_hidden_layers 4 --intermediate_size 512`
+- `--hidden_size 256 --num_attention_heads 4 --num_hidden_layers 3 --intermediate_size 1024`
 - `--num_env_groups 5 --dropout 0.1`
 - `--temporal_fire_init_periods 365 182 ...` periods (days) for sin/cos input added to FIRE temporal bias. Omit to disable.
 - `--per_species_env_rank 8` parallel per-species env head (low-rank A·B + bias on raw target_env).
@@ -75,7 +76,7 @@ CBI gains; γ=2 maximizes CBI at the cost of slight decrease in AUROC.
 **Training**
 - `--batch_size 32 --num_epochs 50 --learning_rate 1e-4 --weight_decay 0.01`
 - `--max_grad_norm 1.0 --gradient_checkpointing`
-- `--mixed_precision {none,bf16,fp16}` `none`. `bf16`
+- `--mixed_precision {none,bf16,fp16}` `none`
 - `--grad_accum_steps 1` effective batch = `batch_size × grad_accum_steps × world_size`.
 - `--test_bag_K 10` K-pass bagging at end of training.
 

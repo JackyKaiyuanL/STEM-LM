@@ -115,14 +115,6 @@ def _bbox_max_distance(lats: np.ndarray, lons: np.ndarray, times: np.ndarray,
     return max_sp, max_tp
 
 
-def _resolve_scale(value: float | None, fallback: float, name: str) -> float:
-    if value is None:
-        return 1.0 if fallback <= 0 else float(fallback)
-    if value <= 0:
-        raise ValueError(f"{name} must be > 0, got {value}")
-    return float(value)
-
-
 def _positive_floor(d: np.ndarray, scale: float) -> float:
     pos = d[d > 0]
     return float(pos.min()) if pos.size else scale * 1e-6
@@ -154,7 +146,7 @@ def _list_column_to_csr_arrays(column) -> tuple[np.ndarray, np.ndarray]:
     """
     import pyarrow as pa
 
-    arr = column.combine_chunks() if hasattr(column, "combine_chunks") else column
+    arr = column.combine_chunks()
     if isinstance(arr, pa.ChunkedArray):
         arr = (arr.chunk(0) if arr.num_chunks == 1
                else pa.concat_arrays([c for c in arr.iterchunks()]))
@@ -197,7 +189,6 @@ class JSDMDataset(Dataset):
         lat_col: str = "latitude",
         lon_col: str = "longitude",
         env_cols: list[str] | None = None,
-        spatial_scale_km: float | None = None,
         euclidean_coords: bool = False,
         no_time: bool = False,
     ):
@@ -224,11 +215,11 @@ class JSDMDataset(Dataset):
         species_data = df[species_cols].values.astype(np.float32)
         self._setup_post_load(df, species_data, species_cols, env_cols,
                               time_col, lat_col, lon_col, has_time,
-                              spatial_scale_km, euclidean_coords)
+                              euclidean_coords)
 
     def _setup_post_load(self, df, species_data, species_cols, env_cols,
                          time_col, lat_col, lon_col, has_time,
-                         spatial_scale_km, euclidean_coords):
+                         euclidean_coords):
         self.species_cols = species_cols
         self.env_cols = env_cols
         self.num_species = len(species_cols)
@@ -256,7 +247,6 @@ class JSDMDataset(Dataset):
         print(f"Dataset: {N} observations, {self.num_species} species, {self.num_env_vars} env vars")
         max_sp, max_tp = _bbox_max_distance(self.lats, self.lons, self.times,
                                             euclidean=self.euclidean_coords)
-        self.spatial_scale_km = _resolve_scale(spatial_scale_km, max_sp, "spatial_scale_km")
         self._max_spatial = max_sp
         self._max_temporal = max_tp if has_time else 0.0
 
@@ -422,7 +412,6 @@ class JSDMSparseDataset(JSDMDataset):
         lat_col: str = "latitude",
         lon_col: str = "longitude",
         env_cols: list[str] | None = None,
-        spatial_scale_km: float | None = None,
         euclidean_coords: bool = False,
         no_time: bool = False,
     ):
@@ -474,7 +463,7 @@ class JSDMSparseDataset(JSDMDataset):
 
         self._setup_post_load(df, species_data, species_cols, env_cols,
                               time_col, lat_col, lon_col, has_time,
-                              spatial_scale_km, euclidean_coords)
+                              euclidean_coords)
 
 
 def csv_to_sparse_parquet(
@@ -503,26 +492,8 @@ def csv_to_sparse_parquet(
 
 
 class JSDMDataCollator:
-    def __init__(self, p=0.15,
-                 site_lats=None, site_lons=None, site_times=None,
-                 spatial_scale_km=1.0,
-                 euclidean=False,
-                 mask_token_prob=1.0, seed=None):
-
+    def __init__(self, p=0.15, seed=None):
         self.p = self._canonicalize(p)
-        def _to_np(x):
-            if x is None:
-                return None
-            if isinstance(x, torch.Tensor):
-                return x.detach().cpu().numpy()
-            return np.asarray(x)
-        self.site_lats = _to_np(site_lats)
-        self.site_lons = _to_np(site_lons)
-        self.site_times = _to_np(site_times)
-        self.spatial_scale_km = float(spatial_scale_km)
-        self.euclidean = bool(euclidean)
-        self._has_coords = self.site_lats is not None and self.site_lons is not None and self.site_times is not None
-        self.mask_token_prob = mask_token_prob
         self.generator = (torch.Generator().manual_seed(int(seed))
                           if seed is not None else None)
 
@@ -571,155 +542,79 @@ class JSDMDataCollator:
                 return torch.from_numpy(np.random.beta(a, b, size=B).astype(np.float32))
         return torch.full((B,), float(r))
 
-    def __call__(self, examples):
-        batch = {
-            key: torch.stack([ex[key] for ex in examples])
-            for key in examples[0]
-        }
+    @staticmethod
+    def _stack(examples):
+        return {k: torch.stack([ex[k] for ex in examples]) for k in examples[0]}
 
-        target_species = batch["target_species"]
-        source_species = batch["source_species"]
-        B, S = target_species.shape
+    @staticmethod
+    def _force_one_masked(masked, generator):
+        B, S = masked.shape
+        for b in range(B):
+            if not masked[b].any():
+                masked[b, torch.randint(S, (1,), generator=generator)] = True
 
+    @staticmethod
+    def _finalize(batch, masked):
+        target_species = batch.pop("target_species")
+        target_ids = target_species.long()
+        target_ids[masked] = 2
         labels = target_species.clone()
+        labels[~masked] = -100
+
+        batch["input_ids"] = target_ids.unsqueeze(-1)
+        batch["source_ids"] = batch.pop("source_species").to(torch.uint8)
+        batch["labels"] = labels.unsqueeze(-1)
+        batch["env_data"] = batch.pop("source_env")
+        batch["target_site_idx"] = batch.pop("target_idx").unsqueeze(-1)
+        return batch
+
+    def __call__(self, examples):
+        batch = self._stack(examples)
+        B, S = batch["target_species"].shape
 
         p_row = self._sample_row_rates(B, self.p)
         probability_matrix = p_row[:, None].expand(B, S)
-        masked_indices = torch.bernoulli(probability_matrix, generator=self.generator).bool()
-        for b in range(B):
-            if not masked_indices[b].any():
-                masked_indices[b, torch.randint(S, (1,), generator=self.generator)] = True
-        
-        target_ids = target_species.long()
-        if self.mask_token_prob >= 1.0:
-            indices_replaced = masked_indices
-        else:
-            indices_replaced = (
-                torch.bernoulli(torch.full((B, S), self.mask_token_prob),
-                                generator=self.generator).bool()
-                & masked_indices
-            )
-        target_ids[indices_replaced] = 2
-
-        # 0/1 presence: keep it uint8 through worker IPC and the host copy
-        # (int64 would be 8x the bytes for a tensor that is ~99% zeros);
-        # the model widens it on-device where the gather needs an index.
-        source_ids = source_species.to(torch.uint8)
-
-        labels[~masked_indices] = -100
-
-        batch["input_ids"] = target_ids.unsqueeze(-1)
-        batch["source_ids"] = source_ids
-        batch["labels"] = labels.unsqueeze(-1)
-        batch["env_data"] = batch.pop("source_env")
-        batch["target_site_idx"] = batch.pop("target_idx").unsqueeze(-1)
-
-        del batch["target_species"]
-        del batch["source_species"]
-
-        return batch
+        masked = torch.bernoulli(probability_matrix, generator=self.generator).bool()
+        self._force_one_masked(masked, self.generator)
+        return self._finalize(batch, masked)
 
 
-class AbsenceMaskCollator(JSDMDataCollator):
-    """Mask all absences + p fraction of presences."""
-    def __init__(self, p,
-                 site_lats=None, site_lons=None, site_times=None,
-                 spatial_scale_km=1.0, euclidean=False,
-                 base_seed=0):
-        super().__init__(p=p,
-                         site_lats=site_lats, site_lons=site_lons, site_times=site_times,
-                         spatial_scale_km=spatial_scale_km,
-                         euclidean=euclidean,
-                         mask_token_prob=1.0)
-        self.p = float(p)
+class _PerBatchSeededCollator(JSDMDataCollator):
+    def __init__(self, p, base_seed=0):
+        super().__init__(p=p)
         self.base_seed = int(base_seed)
 
+    def _generator(self, batch):
+        return torch.Generator().manual_seed(
+            self.base_seed + int(batch["target_idx"][0].item()))
+
+
+class AbsenceMaskCollator(_PerBatchSeededCollator):
+    """Mask all absences + p fraction of presences."""
+
     def __call__(self, examples):
-        batch = {k: torch.stack([ex[k] for ex in examples]) for k in examples[0]}
+        batch = self._stack(examples)
         target_species = batch["target_species"]
-        source_species = batch["source_species"]
         B, S = target_species.shape
+        g = self._generator(batch)
 
-        seed = self.base_seed + int(batch["target_idx"][0].item())
-        g = torch.Generator().manual_seed(seed)
-
-        is_absence = (target_species == 0)
-        is_presence = (target_species == 1)
-        presence_mask = is_presence & torch.bernoulli(
+        presence_mask = (target_species == 1) & torch.bernoulli(
             torch.full((B, S), self.p), generator=g
         ).bool()
-        masked = is_absence | presence_mask
-        for b in range(B):
-            if not masked[b].any():
-                masked[b, torch.randint(S, (1,), generator=g)] = True
-
-        target_ids = target_species.long()
-        target_ids[masked] = 2
-
-        # 0/1 presence: keep it uint8 through worker IPC and the host copy
-        # (int64 would be 8x the bytes for a tensor that is ~99% zeros);
-        # the model widens it on-device where the gather needs an index.
-        source_ids = source_species.to(torch.uint8)
-
-        labels = target_species.clone()
-        labels[~masked] = -100
-
-        batch["input_ids"] = target_ids.unsqueeze(-1)
-        batch["source_ids"] = source_ids
-        batch["labels"] = labels.unsqueeze(-1)
-        batch["env_data"] = batch.pop("source_env")
-        batch["target_site_idx"] = batch.pop("target_idx").unsqueeze(-1)
-        del batch["target_species"]
-        del batch["source_species"]
-        return batch
+        masked = (target_species == 0) | presence_mask
+        self._force_one_masked(masked, g)
+        return self._finalize(batch, masked)
 
 
-class FixedPValCollator(JSDMDataCollator):
-    def __init__(self, p,
-                 site_lats=None, site_lons=None, site_times=None,
-                 spatial_scale_km=1.0, euclidean=False,
-                 base_seed=0):
-        super().__init__(p=p,
-                         site_lats=site_lats, site_lons=site_lons, site_times=site_times,
-                         spatial_scale_km=spatial_scale_km,
-                         euclidean=euclidean,
-                         mask_token_prob=1.0)
-        self.p = float(p)
-        self.base_seed = int(base_seed)
-
+class FixedPValCollator(_PerBatchSeededCollator):
     def __call__(self, examples):
-        batch = {k: torch.stack([ex[k] for ex in examples]) for k in examples[0]}
-        target_species = batch["target_species"]
-        source_species = batch["source_species"]
-        B, S = target_species.shape
-
-        seed = self.base_seed + int(batch["target_idx"][0].item())
-        g = torch.Generator().manual_seed(seed)
+        batch = self._stack(examples)
+        B, S = batch["target_species"].shape
+        g = self._generator(batch)
 
         masked = torch.bernoulli(torch.full((B, S), self.p), generator=g).bool()
-        for b in range(B):
-            if not masked[b].any():
-                masked[b, torch.randint(S, (1,), generator=g)] = True
-
-        target_ids = target_species.long()
-        target_ids[masked] = 2
-
-        # 0/1 presence: keep it uint8 through worker IPC and the host copy
-        # (int64 would be 8x the bytes for a tensor that is ~99% zeros);
-        # the model widens it on-device where the gather needs an index.
-        source_ids = source_species.to(torch.uint8)
-
-        labels = target_species.clone()
-        labels[~masked] = -100
-
-        batch["input_ids"] = target_ids.unsqueeze(-1)
-        batch["source_ids"] = source_ids
-        batch["labels"] = labels.unsqueeze(-1)
-        batch["env_data"] = batch.pop("source_env")
-        batch["target_site_idx"] = batch.pop("target_idx").unsqueeze(-1)
-        del batch["target_species"]
-        del batch["source_species"]
-        return batch
+        self._force_one_masked(masked, g)
+        return self._finalize(batch, masked)
 
 
 def build_val_loaders_fixed_p(dataset, val_indices, dist_info, p_values,
@@ -728,15 +623,7 @@ def build_val_loaders_fixed_p(dataset, val_indices, dist_info, p_values,
     subset = Subset(dataset, val_indices)
     loaders = []
     for i, p in enumerate(p_values):
-        col = FixedPValCollator(
-            p=p,
-            site_lats=dist_info["site_lats"],
-            site_lons=dist_info["site_lons"],
-            site_times=dist_info["site_times"],
-            spatial_scale_km=dist_info["spatial_scale_km"],
-            euclidean=dist_info.get("euclidean", False),
-            base_seed=base_seed + 1000 * i,
-        )
+        col = FixedPValCollator(p=p, base_seed=base_seed + 1000 * i)
         loaders.append((float(p), DataLoader(
             subset, batch_size=batch_size, shuffle=False,
             collate_fn=col, num_workers=num_workers, pin_memory=True,
@@ -753,15 +640,14 @@ def compute_dist_info(dataset: "JSDMDataset") -> dict:
         "euclidean":  dataset.euclidean_coords,
         "max_spatial_dist": float(dataset._max_spatial),
         "max_temporal_dist": float(dataset._max_temporal),
-        "spatial_scale_km": dataset.spatial_scale_km,
     }
 
 
 def grid_block_split(x, y, n_cells=20, train_frac=0.8, test_frac=0.1, seed=42):
 
     x, y = np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
-    xi = np.floor((x - x.min()) / (x.ptp() + 1e-9) * n_cells).clip(0, n_cells - 1).astype(int)
-    yi = np.floor((y - y.min()) / (y.ptp() + 1e-9) * n_cells).clip(0, n_cells - 1).astype(int)
+    xi = np.floor((x - x.min()) / (np.ptp(x) + 1e-9) * n_cells).clip(0, n_cells - 1).astype(int)
+    yi = np.floor((y - y.min()) / (np.ptp(y) + 1e-9) * n_cells).clip(0, n_cells - 1).astype(int)
     cell_ids = xi * n_cells + yi
     unique_cells = np.unique(cell_ids)
 
@@ -856,7 +742,7 @@ def create_dataloaders(
     csv_path, batch_size=32, num_source_sites=64, num_scale_sites=None,
     p=0.15,
     train_frac=0.8, test_frac=0.1, num_workers=0,
-    seed=42, env_cols=None, spatial_scale_km=None,
+    seed=42, env_cols=None,
     euclidean_coords=False, no_time=False,
     fold_method="random", resolution: int | None = None,
     saved_splits: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
@@ -871,7 +757,6 @@ def create_dataloaders(
             num_source_sites=num_source_sites,
             num_scale_sites=num_scale_sites,
             env_cols=env_cols,
-            spatial_scale_km=spatial_scale_km,
             euclidean_coords=euclidean_coords,
             no_time=no_time,
         )
@@ -881,7 +766,6 @@ def create_dataloaders(
             num_source_sites=num_source_sites,
             num_scale_sites=num_scale_sites,
             env_cols=env_cols,
-            spatial_scale_km=spatial_scale_km,
             euclidean_coords=euclidean_coords,
             no_time=no_time,
         )
@@ -944,15 +828,7 @@ def create_dataloaders(
     val_dataset   = torch.utils.data.Subset(dataset, val_indices)
     test_dataset  = torch.utils.data.Subset(dataset, test_indices) if len(test_indices) > 0 else None
 
-    collator = JSDMDataCollator(
-        p=p,
-        site_lats=dataset.lats,
-        site_lons=dataset.lons,
-        site_times=dataset.times,
-        spatial_scale_km=dataset.spatial_scale_km,
-        euclidean=dataset.euclidean_coords,
-        seed=seed,
-    )
+    collator = JSDMDataCollator(p=p, seed=seed)
 
     train_shuffle_gen = torch.Generator().manual_seed(int(seed))
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,

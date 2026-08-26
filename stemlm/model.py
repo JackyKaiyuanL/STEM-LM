@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.modeling_outputs import ModelOutput
 
 _EARTH_RADIUS_KM = 6371.0
 _SPECIES_ATTN_QUERY_CHUNK = 512
@@ -105,10 +104,6 @@ class FIREDistanceBias(nn.Module):
             nn.Linear(fire_hidden_size, 1, bias=False),
         )
         if self.n_frequencies > 0:
-            if freq_init_periods is None or len(freq_init_periods) != self.n_frequencies:
-                raise ValueError(
-                    f"freq_init_periods must have exactly n_frequencies={self.n_frequencies} entries."
-                )
             periods = torch.tensor([float(p) for p in freq_init_periods], dtype=torch.float32)
             if (periods <= 0).any():
                 raise ValueError("all freq_init_periods must be > 0.")
@@ -752,7 +747,7 @@ class JSDMEncoder(nn.Module):
 
 
 @dataclass
-class JSDMEncoderOutput(ModelOutput):
+class JSDMEncoderOutput:
     last_hidden_state: torch.FloatTensor = None
     hidden_states: tuple[torch.FloatTensor, ...] | None = None
     species_attentions: tuple[torch.FloatTensor, ...] | None = None
@@ -844,7 +839,7 @@ class JSDMModel(nn.Module):
 # =============================================================================
 
 @dataclass
-class JSDMOutput(ModelOutput):
+class JSDMOutput:
     loss: torch.FloatTensor | None = None
     logits: torch.FloatTensor = None
     hidden_states: tuple[torch.FloatTensor, ...] | None = None

@@ -22,10 +22,7 @@ def safe_auc_roc(labels: np.ndarray, preds: np.ndarray) -> float:
         return float("nan")
     if np.isnan(preds).any():
         return float("nan")
-    try:
-        return float(roc_auc_score(labels, preds))
-    except Exception:
-        return float("nan")
+    return float(roc_auc_score(labels, preds))
 
 
 def safe_auc_pr(labels: np.ndarray, preds: np.ndarray) -> float:
@@ -33,10 +30,7 @@ def safe_auc_pr(labels: np.ndarray, preds: np.ndarray) -> float:
         return float("nan")
     if np.isnan(preds).any():
         return float("nan")
-    try:
-        return float(average_precision_score(labels, preds))
-    except Exception:
-        return float("nan")
+    return float(average_precision_score(labels, preds))
 
 
 def auc_roc_and_pr(labels: np.ndarray, preds: np.ndarray) -> tuple[float, float]:
@@ -137,11 +131,8 @@ def safe_cbi(labels: np.ndarray, preds: np.ndarray,
     ok = np.isfinite(pe)
     if ok.sum() < 3 or np.unique(pe[ok]).size < 2:
         return float("nan")
-    try:
-        rho = spearmanr(centers[ok], pe[ok]).statistic
-        return float(rho) if np.isfinite(rho) else float("nan")
-    except Exception:
-        return float("nan")
+    rho = spearmanr(centers[ok], pe[ok]).statistic
+    return float(rho) if np.isfinite(rho) else float("nan")
 
 
 def _species_metrics(probs: np.ndarray, labels: np.ndarray, s: int):
@@ -228,58 +219,8 @@ def run_forward(model, batch, dist_info, device, output_attentions=False):
 def _move_dist_info(dist_info, device):
     out = dict(dist_info)
     for k in ("site_lats", "site_lons", "site_times"):
-        if hasattr(out[k], "to"):
-            out[k] = out[k].to(device)
+        out[k] = out[k].to(device)
     return out
-
-
-@torch.no_grad()
-def evaluate_loader(model, loader, device, dist_info, amp_dtype=None):
-    model.eval()
-    use_amp = amp_dtype is not None and device.type == "cuda"
-    dist_info_dev = _move_dist_info(dist_info, device)
-
-    total_loss, num_batches = 0.0, 0
-    total_correct, total_masked = 0, 0
-    probs_by_idx: dict[int, np.ndarray] = {}
-    labels_by_idx: dict[int, np.ndarray] = {}
-
-    for batch in loader:
-        if use_amp:
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                out = run_forward(model, batch, dist_info_dev, device)
-        else:
-            out = run_forward(model, batch, dist_info_dev, device)
-
-        if out.loss is not None:
-            total_loss += out.loss.item()
-            num_batches += 1
-
-        probs = torch.sigmoid(out.logits.float().squeeze(-1)).cpu().numpy()
-        labels = batch["labels"].squeeze(-1).cpu().numpy() if "labels" in batch \
-                 else np.full_like(probs, fill_value=-100, dtype=np.int64)
-        target_idx = batch["target_site_idx"].squeeze(-1).cpu().numpy()
-
-        mask_arr = labels != -100
-        total_correct += int(((probs > 0.5) == labels)[mask_arr].sum())
-        total_masked += int(mask_arr.sum())
-
-        for b, ti in enumerate(target_idx):
-            ti = int(ti)
-            probs_by_idx[ti] = probs[b]
-            labels_by_idx[ti] = labels[b]
-
-    indices = sorted(probs_by_idx.keys())
-    if indices:
-        probs_arr = np.stack([probs_by_idx[i] for i in indices], axis=0)
-        labels_arr = np.stack([labels_by_idx[i] for i in indices], axis=0)
-        per_sp = compute_per_species_metrics(probs_arr, labels_arr)
-    else:
-        per_sp = {}
-    summary = summarize_per_species_metrics(per_sp)
-    avg_loss = total_loss / max(num_batches, 1)
-    acc = total_correct / max(total_masked, 1)
-    return avg_loss, acc, summary, per_sp, probs_by_idx, labels_by_idx
 
 
 @torch.no_grad()
@@ -294,21 +235,12 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
 
     sum_probs: dict[int, np.ndarray] = {}
     label_for_idx: dict[int, np.ndarray] = {}
-    single_pass_probs: dict[int, np.ndarray] = {}
 
     is_distributed = bool(distributed_sampler) and torch.distributed.is_initialized()
 
     mask_seed = base_seed + round(p_value * 1000)
     cls = collator_cls if collator_cls is not None else FixedPValCollator
-    collator = cls(
-        p=p_value,
-        site_lats=dist_info["site_lats"],
-        site_lons=dist_info["site_lons"],
-        site_times=dist_info["site_times"],
-        spatial_scale_km=dist_info["spatial_scale_km"],
-        euclidean=dist_info.get("euclidean", False),
-        base_seed=mask_seed,
-    )
+    collator = cls(p=p_value, base_seed=mask_seed)
     subset = Subset(dataset, eval_indices)
 
     for k in range(bag_K):
@@ -338,58 +270,36 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
                 if ti not in sum_probs:
                     sum_probs[ti] = probs[b].astype(np.float64)
                     label_for_idx[ti] = labels[b]
-                    if k == 0:
-                        single_pass_probs[ti] = probs[b].copy()
                 else:
                     sum_probs[ti] += probs[b]
 
     if is_distributed:
         objs = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(objs, (sum_probs, label_for_idx, single_pass_probs))
-        merged_sum, merged_lab, merged_single = {}, {}, {}
-        for sp, lb, sg in objs:
+        torch.distributed.all_gather_object(objs, (sum_probs, label_for_idx))
+        merged_sum, merged_lab = {}, {}
+        for sp, lb in objs:
             for ti, p in sp.items():
                 if ti not in merged_sum:
                     merged_sum[ti] = p.copy()
                     merged_lab[ti] = lb[ti]
-                    if ti in sg:
-                        merged_single[ti] = sg[ti]
                 else:
                     merged_sum[ti] += p
-        sum_probs, label_for_idx, single_pass_probs = merged_sum, merged_lab, merged_single
+        sum_probs, label_for_idx = merged_sum, merged_lab
 
     indices = sorted(sum_probs.keys())
     if not indices:
-        empty = {"mean_auc_roc": float("nan"), "mean_auc_pr": float("nan"),
-                 "mean_cbi": float("nan"),
-                 "mean_brier": float("nan"), "mean_ece": float("nan"),
-                 "auc_roc_q25": float("nan"), "auc_roc_q50": float("nan"),
-                 "auc_roc_q75": float("nan"),
-                 "n_species": 0}
-        return {"p": p_value, "K": bag_K, "summary": empty, "per_species": {},
-                "single_pass_summary": empty}
+        return {"p": float(p_value), "K": int(bag_K),
+                "summary": summarize_per_species_metrics({}), "per_species": {}}
 
     avg_probs = np.stack([sum_probs[i] / bag_K for i in indices], axis=0)
     labels_arr = np.stack([label_for_idx[i] for i in indices], axis=0)
     per_sp_bag = compute_per_species_metrics(avg_probs, labels_arr)
-    summary_bag = summarize_per_species_metrics(per_sp_bag)
-
-    if single_pass_probs:
-        sp_indices = sorted(single_pass_probs.keys())
-        sp_probs = np.stack([single_pass_probs[i] for i in sp_indices], axis=0)
-        sp_labels = np.stack([label_for_idx[i] for i in sp_indices], axis=0)
-        summary_single = summarize_per_species_metrics(
-            compute_per_species_metrics(sp_probs, sp_labels)
-        )
-    else:
-        summary_single = summary_bag
 
     return {
         "p": float(p_value),
         "K": int(bag_K),
-        "summary": summary_bag,
+        "summary": summarize_per_species_metrics(per_sp_bag),
         "per_species": per_sp_bag,
-        "single_pass_summary": summary_single,
     }
 
 
@@ -410,15 +320,7 @@ def gather_logits_at_p(model, dataset, eval_indices, dist_info, p_value: float,
 
     mask_seed = base_seed + round(p_value * 1000)
     cls = collator_cls if collator_cls is not None else FixedPValCollator
-    collator = cls(
-        p=p_value,
-        site_lats=dist_info["site_lats"],
-        site_lons=dist_info["site_lons"],
-        site_times=dist_info["site_times"],
-        spatial_scale_km=dist_info["spatial_scale_km"],
-        euclidean=dist_info.get("euclidean", False),
-        base_seed=mask_seed,
-    )
+    collator = cls(p=p_value, base_seed=mask_seed)
     subset = Subset(dataset, eval_indices)
     np.random.seed(mask_seed)
     torch.manual_seed(mask_seed)
@@ -459,7 +361,7 @@ def gather_logits_at_p(model, dataset, eval_indices, dist_info, p_value: float,
 
     indices = sorted(logits_by_idx.keys())
     if not indices:
-        S = dataset[0]["labels"].shape[-1] if hasattr(dataset, "__len__") else 0
+        S = dataset.num_species
         return np.zeros((0, S), dtype=np.float32), np.zeros((0, S), dtype=np.int64)
     logits_arr = np.stack([logits_by_idx[i] for i in indices], axis=0).astype(np.float32)
     labels_arr = np.stack([labels_by_idx[i] for i in indices], axis=0).astype(np.int64)

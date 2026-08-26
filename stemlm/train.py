@@ -1,8 +1,6 @@
 import csv
-import functools
 import json
 import logging
-import operator
 import os
 import time
 
@@ -171,7 +169,7 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
     if env is None:
         env = DistEnv()
 
-    if env.is_distributed and hasattr(loader.sampler, "set_epoch"):
+    if env.is_distributed:
         loader.sampler.set_epoch(epoch)
 
     model.train()
@@ -280,10 +278,10 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
         env = DistEnv()
 
     model.eval()
-    total_loss, num_batches = 0.0, 0
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    num_batches = 0
     S = (model.module if isinstance(model, DDP) else model).config.num_species
-    species_preds  = [[] for _ in range(S)]
-    species_labels = [[] for _ in range(S)]
+    batch_probs, batch_labels = [], []
     use_amp = amp_dtype is not None and device.type == "cuda"
 
     for batch in loader:
@@ -298,50 +296,40 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
                               loss_type=loss_type,
                               focal_alpha=focal_alpha, focal_gamma=focal_gamma)
 
-        total_loss += output.loss.item()
+        loss_sum += output.loss.detach().double()
         num_batches += 1
 
-        probs  = torch.sigmoid(output.logits.float()).squeeze(-1).cpu().numpy()
-        labels = batch["labels"].squeeze(-1).cpu().numpy()
-        mask   = labels != -100
-        for s in range(S):
-            b_mask = mask[:, s]
-            if b_mask.any():
-                species_preds[s].extend(probs[b_mask, s].tolist())
-                species_labels[s].extend(labels[b_mask, s].tolist())
+        batch_probs.append(
+            torch.sigmoid(output.logits.float()).squeeze(-1).double().cpu().numpy())
+        batch_labels.append(batch["labels"].squeeze(-1).cpu().numpy())
+
+    total_loss = loss_sum.item()
+    probs = (np.concatenate(batch_probs, axis=0) if batch_probs
+             else np.zeros((0, S), dtype=np.float64))
+    labels = (np.concatenate(batch_labels, axis=0) if batch_labels
+              else np.zeros((0, S), dtype=np.int64))
 
     if env.is_distributed:
         agg = torch.tensor([total_loss, num_batches], dtype=torch.float64, device=device)
         dist.all_reduce(agg, op=dist.ReduceOp.SUM)
         total_loss, num_batches = agg.tolist()
 
-        gathered_preds  = env.all_gather_object(species_preds)
-        gathered_labels = env.all_gather_object(species_labels)
-        species_preds  = [functools.reduce(operator.iadd, (g[s] for g in gathered_preds), []) for s in range(S)]
-        species_labels = [functools.reduce(operator.iadd, (g[s] for g in gathered_labels), []) for s in range(S)]
+        probs = np.concatenate(env.all_gather_object(probs), axis=0)
+        labels = np.concatenate(env.all_gather_object(labels), axis=0)
 
-    max_n = max((len(species_labels[s]) for s in range(S)), default=0)
+    mask = labels != -100
+    counts = mask.sum(axis=0)
+    max_n = int(counts.max())
     if max_n == 0:
-        empty = {"mean_auc_roc": float("nan"), "mean_auc_pr": float("nan"),
-                 "mean_cbi": float("nan"),
-                 "mean_brier": float("nan"), "mean_ece": float("nan"),
-                 "auc_roc_q25": float("nan"), "auc_roc_q50": float("nan"),
-                 "auc_roc_q75": float("nan"),
-                 "n_species": 0}
-        return total_loss / max(num_batches, 1), 0.0, empty, {}
-    probs_arr  = np.full((max_n, S), 0.0, dtype=np.float64)
-    labels_arr = np.full((max_n, S), -100, dtype=np.int64)
-    total_correct, total_masked = 0, 0
-    for s in range(S):
-        n_s = len(species_labels[s])
-        if n_s == 0:
-            continue
-        arr_p = np.asarray(species_preds[s],  dtype=np.float64)
-        arr_l = np.asarray(species_labels[s], dtype=np.int64)
-        probs_arr[:n_s, s]  = arr_p
-        labels_arr[:n_s, s] = arr_l
-        total_correct += int(((arr_p > 0.5) == arr_l).sum())
-        total_masked  += n_s
+        return (total_loss / max(num_batches, 1), 0.0,
+                summarize_per_species_metrics({}), {})
+
+    order = np.argsort(~mask, axis=0, kind="stable")[:max_n]
+    probs_arr = np.take_along_axis(probs, order, axis=0)
+    labels_arr = np.take_along_axis(labels, order, axis=0)
+
+    total_correct = int(((probs > 0.5) == labels)[mask].sum())
+    total_masked = int(counts.sum())
 
     per_sp = compute_per_species_metrics(probs_arr, labels_arr)
     summary = summarize_per_species_metrics(per_sp)
@@ -480,7 +468,7 @@ def add_train_args(parser):
                              "alongside the shared env encoder. Reads raw target_env "
                              "via low-rank A∈(E,r)·B∈(r,S) (A zero-init, monotone safe) "
                              "+ per-species bias. Active in full / no_st ablations; "
-                             "silent in no_env / no_st_env. Default 0 (disabled).")
+                             "silent in no_env / no_st_env. 0 disables it.")
     parser.add_argument("--loss_type", choices=["bce", "focal"], default="focal",
                         help="Loss function. 'focal' = sigmoid focal loss "
                              "(Lin et al. 2017; default, alpha=0.25, gamma=2.0 "
@@ -518,20 +506,8 @@ def add_train_args(parser):
 
 
 def run_train(args):
-    if args.splits_path is None:
-        if args.fold == "random":
-            if args.resolution is not None:
-                raise ValueError("--resolution is not valid with --fold random.")
-        elif args.fold == "h3":
-            if args.resolution is None:
-                args.resolution = 2
-            if not (0 <= int(args.resolution) <= 15):
-                raise ValueError("--resolution for --fold h3 must be an integer in [0, 15].")
-        else:  # grid
-            if args.resolution is None:
-                args.resolution = 20
-            if int(args.resolution) < 1:
-                raise ValueError("--resolution for --fold grid must be a positive integer.")
+    if args.splits_path is None and args.resolution is None:
+        args.resolution = {"h3": 2, "grid": 20}.get(args.fold)
 
     env = DistEnv()
     env.setup(backend="nccl")
