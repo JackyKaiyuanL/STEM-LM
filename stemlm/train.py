@@ -150,7 +150,6 @@ def _forward(model, batch, dist_info, loss_weight=None,
         site_lats=dist_info["site_lats"],
         site_lons=dist_info["site_lons"],
         site_times=dist_info["site_times"],
-        euclidean=dist_info.get("euclidean", False),
     )
 
 
@@ -406,9 +405,6 @@ def add_train_args(parser):
     parser.add_argument("--no_time", action="store_true",
                         help="Disable temporal FIRE bias. Set automatically when all "
                              "time values in the CSV are identical (static datasets).")
-    parser.add_argument("--euclidean_coords", action="store_true",
-                        help="Use Euclidean distance instead of haversine. "
-                             "For simulated or arbitrary 2D coordinates (not geographic degrees).")
     parser.add_argument(
         "--class_weighting",
         type=float,
@@ -424,15 +420,12 @@ def add_train_args(parser):
                         help="Explicit list of env column names. If not set, columns with 'env_' "
                              "prefix are used. Useful for datasets with non-prefixed env columns "
                              "(e.g. annualtemp, annualprec).")
-    parser.add_argument("--fold", choices=["random", "h3", "grid"], default="h3",
+    parser.add_argument("--fold", choices=["random", "h3"], default="h3",
                         help="Train/val/test split strategy. 'h3' (default): spatial blocks via "
-                             "H3 hexagonal grid (real lat/lon only). 'grid': spatial blocks via "
-                             "regular 2D grid (euclidean_coords only). 'random': shuffled rows.")
+                             "H3 hexagonal grid. 'random': shuffled rows.")
     parser.add_argument("--resolution", type=int, default=None,
-                        help="Block resolution for spatial splits. For --fold h3, this is the H3 "
-                             "resolution in [0, 15] (default 2 ≈ 183 km edge). For --fold grid, "
-                             "this is the grid side length (default 20 → 20×20 cells). Not valid "
-                             "with --fold random.")
+                        help="H3 resolution in [0, 15] for --fold h3 (default 2 ≈ 183 km edge). "
+                             "Not valid with --fold random.")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                         help="Gradient clipping max norm (default 1.0).")
     parser.add_argument("--cooccurrence_extract_batches", type=int, default=20,
@@ -507,7 +500,7 @@ def add_train_args(parser):
 
 def run_train(args):
     if args.splits_path is None and args.resolution is None:
-        args.resolution = {"h3": 2, "grid": 20}.get(args.fold)
+        args.resolution = 2 if args.fold == "h3" else None
 
     env = DistEnv()
     env.setup(backend="nccl")
@@ -554,7 +547,6 @@ def run_train(args):
         num_workers=args.num_workers,
         seed=args.seed,
         env_cols=args.env_cols,
-        euclidean_coords=args.euclidean_coords,
         no_time=args.no_time,
         fold_method=args.fold,
         resolution=args.resolution,
@@ -1209,7 +1201,6 @@ def run_train(args):
                     site_lats=dist_info["site_lats"],
                     site_lons=dist_info["site_lons"],
                     site_times=dist_info["site_times"],
-                    euclidean=dist_info.get("euclidean", False),
                     output_attentions=True,
                 )
                 cooccurrences.append(extract_cooccurrence_matrix(output).cpu())

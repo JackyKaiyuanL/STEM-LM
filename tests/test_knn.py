@@ -94,7 +94,7 @@ def test_faiss_candidates_match_bruteforce(dataset):
     """FAISS (exact Flat at this N) must return exactly the brute-force
     haversine nearest-in-pool — validates the xyz L2 == great-circle ordering."""
     for idx in [3, 8, 40, 99, 158]:
-        cand, sp = dataset._candidates_scalar(idx)
+        cand, sp = dataset._knn_candidates(idx)
         expected = _bruteforce_candidates(dataset, idx)
         assert set(cand.tolist()) == set(expected.tolist()), f"candidate set differs at {idx}"
         assert np.all(np.diff(sp) >= -1e-3), "candidates not sorted by distance"

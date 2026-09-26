@@ -614,7 +614,6 @@ class JSDMModel(nn.Module):
         site_lats,       # (N_total,) deg
         site_lons,       # (N_total,) deg
         site_times,      # (N_total,) days
-        euclidean=False,
         output_attentions=False,
         output_hidden_states=False,
     ):
@@ -644,10 +643,7 @@ class JSDMModel(nn.Module):
         lat_s = site_lats[source_idx][:, None, :]
         lon_s = site_lons[source_idx][:, None, :]
         ti_s  = site_times[source_idx][:, None, :]
-        if euclidean:
-            sp_dist = torch.sqrt((lat_t - lat_s) ** 2 + (lon_t - lon_s) ** 2)
-        else:
-            sp_dist = _haversine_bt_n(lat_t, lon_t, lat_s, lon_s)
+        sp_dist = _haversine_bt_n(lat_t, lon_t, lat_s, lon_s)
         tp_dist = (ti_t - ti_s).abs()
         st_dist = torch.stack([sp_dist, tp_dist], dim=-1)
 

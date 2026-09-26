@@ -59,8 +59,8 @@ For BCE, pass `--loss_type bce`.
 - `--temperature_scaling` adds Guo 2017 post-hoc temperature scaling: fit T\* on val logits at p=1.00, apply at every test p. Saves `temperature.json` (T\* + per-p T-cal ECE) and a `tcal_ece` column in `test_results.csv`. Apply at inference with `sigmoid(logits / T*)`.
 
 **Splits** (block CV by default)
-- `--fold {h3,grid,random}` `h3`
-- `--resolution` block resolution (H3: `0..15`, default `2`; grid: side length, default `20`).
+- `--fold {h3,random}` `h3`
+- `--resolution` H3 block resolution (`0..15`, default `2`).
 - `--splits_path` reuse a prior `splits.json` (keeps train/val/test identical across runs).
 - `--train_frac 0.8 --test_frac 0.1` (val = remainder)
 - `--num_source_sites 64`
@@ -71,7 +71,6 @@ For BCE, pass `--loss_type bce`.
 - `--temporal_fire_init_periods 365 182 ...` periods (days) for sin/cos input added to FIRE temporal bias. Omit to disable.
 - `--per_species_env_rank 8` parallel per-species env head (low-rank A·B + bias on raw target_env).
 - `--no_time` purely spatial.
-- `--euclidean_coords` non-geographic 2D coords.
 
 **Training**
 - `--batch_size 32 --num_epochs 50 --learning_rate 1e-4 --weight_decay 0.01`

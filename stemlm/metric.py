@@ -204,7 +204,6 @@ def run_forward(model, batch, dist_info, device, output_attentions=False):
         site_lats=dist_info["site_lats"],
         site_lons=dist_info["site_lons"],
         site_times=dist_info["site_times"],
-        euclidean=dist_info.get("euclidean", False),
         output_attentions=output_attentions,
     )
 
