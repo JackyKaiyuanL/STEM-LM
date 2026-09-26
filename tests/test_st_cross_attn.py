@@ -1,27 +1,27 @@
-"""Equivalence guard for the STCrossAttention source K/V gather.
+import math
 
-The dense source embedding is (B, S, N, H) — hundreds of millions of elements at
-training shapes — yet it only takes 3*S distinct values, because
-    source_emb[b, s, n] = state_emb[source_ids[b, s, n]] + species_emb[s]
-So cross-attention is handed the small (3, S, H) basis plus the ids and gathers
-after projecting. This test pins that the gather path equals feeding the dense
-tensor, so the optimisation can't silently change the model.
-"""
 import torch
+import torch.nn.functional as F
 
-from stemlm.model import JSDMConfig, JSDMModel, STCrossAttention
+from stemlm.model import JSDMConfig, JSDMModel, STColAttention, STCrossAttention
 
 
-def _dense_source_emb(basis, source_ids):
-    """The (B, S, N, H) tensor the gather path avoids building."""
+def _reference(mod, hidden_states, basis, source_ids, bias):
+    q = mod.transpose_for_scores(mod.query(hidden_states))
     S = basis.size(1)
     flat = (source_ids.long() * S
             + torch.arange(S, device=source_ids.device)[None, :, None]).reshape(-1)
-    return basis.reshape(-1, basis.size(-1))[flat].view(*source_ids.shape, -1)
+    emb = basis.reshape(-1, basis.size(-1))[flat].view(*source_ids.shape, -1)
+    k = mod.transpose_for_scores(mod.key(emb))
+    v = mod.transpose_for_scores(mod.value(emb))
+    scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(mod.attention_head_size)
+    if bias is not None:
+        scores = scores + bias
+    probs = F.softmax(scores, dim=-1)
+    return mod._merge_heads(torch.matmul(probs, v)), probs
 
 
 def test_full_model_forward_runs_with_gather():
-    """End-to-end: JSDMModel builds the basis internally and trains through it."""
     torch.manual_seed(2)
     S, N, E, NTOT = 8, 5, 3, 50
     cfg = JSDMConfig(num_species=S, num_source_sites=N, num_env_vars=E,
@@ -46,8 +46,7 @@ def test_full_model_forward_runs_with_gather():
     assert grad is not None and torch.isfinite(grad).all()
 
 
-def test_collapsed_matches_dense_projection():
-    """The collapsed path (no K/V materialised) must equal the dense reference."""
+def test_collapsed_matches_explicit_reference():
     torch.manual_seed(3)
     cfg = JSDMConfig(hidden_size=64, num_attention_heads=8, num_species=10,
                      num_source_sites=7)
@@ -58,55 +57,52 @@ def test_collapsed_matches_dense_projection():
     source_ids = torch.randint(0, 3, (B, S, N), dtype=torch.uint8)
     bias = torch.randn(B, S, 1, T, N)
 
-    ref = mod(hidden_states, _dense_source_emb(basis, source_ids.long()),
-              st_dist_bias=bias)[0]
-    got = mod(hidden_states, (basis, source_ids.long()), st_dist_bias=bias)[0]
-    assert got.shape == ref.shape
-    torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+    for b in (bias, None):
+        ref_ctx, ref_probs = _reference(mod, hidden_states, basis, source_ids, b)
+        got_ctx, got_probs = mod(hidden_states, (basis, source_ids.long()),
+                                 st_dist_bias=b, output_attentions=True)
+        torch.testing.assert_close(got_ctx, ref_ctx, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(got_probs, ref_probs, rtol=1e-4, atol=1e-5)
 
 
-def test_collapsed_matches_dense_attention_probs():
-    """output_attentions must return the same probs as the dense path."""
-    torch.manual_seed(4)
-    cfg = JSDMConfig(hidden_size=32, num_attention_heads=4, num_species=6,
-                     num_source_sites=5)
-    mod = STCrossAttention(cfg).eval()
-    B, S, N, T, H = 2, 6, 5, 1, 32
-    hidden_states = torch.randn(B, S, T, H)
-    basis = torch.randn(3, S, H)
-    source_ids = torch.randint(0, 3, (B, S, N), dtype=torch.uint8)
-
-    ref = mod(hidden_states, _dense_source_emb(basis, source_ids.long()),
-              output_attentions=True)
-    got = mod(hidden_states, (basis, source_ids.long()), output_attentions=True)
-    for a, b in zip(ref, got, strict=True):
-        torch.testing.assert_close(b, a, rtol=1e-4, atol=1e-5)
-
-
-def test_collapsed_no_source_dependence_on_absent_bins():
-    """Sanity: bin weights sum to 1 across bins, so context is a convex mix."""
+def test_gate_threshold_scales_the_context():
     torch.manual_seed(5)
     cfg = JSDMConfig(hidden_size=32, num_attention_heads=4, num_species=5,
-                     num_source_sites=9)
-    mod = STCrossAttention(cfg).eval()
+                     num_source_sites=9, temporal_fire_init_periods=(365.0,))
+    mod = STColAttention(cfg).eval()
     B, S, N, H = 2, 5, 9, 32
-    # All sources absent => context must equal V[0, s] exactly.
-    source_ids = torch.zeros(B, S, N, dtype=torch.uint8)
     basis = torch.randn(3, S, H)
+    source_ids = torch.randint(0, 2, (B, S, N))
     hidden_states = torch.randn(B, S, 1, H)
-    got = mod(hidden_states, (basis, source_ids.long()))[0]
-    v0 = mod.value(basis[0])  # (S, all_head)
-    torch.testing.assert_close(got, v0[None, :, None, :].expand_as(got),
-                               rtol=1e-4, atol=1e-5)
+    st_dist = torch.stack([torch.rand(B, 1, N) * 100.0, torch.rand(B, 1, N) * 365.0], dim=-1)
+
+    with torch.no_grad():
+        mod.species_gate_threshold.fill_(-50.0)
+    open_gate = mod(hidden_states, (basis, source_ids), st_dist=st_dist)[0]
+    with torch.no_grad():
+        mod.species_gate_threshold.fill_(50.0)
+    closed_gate = mod(hidden_states, (basis, source_ids), st_dist=st_dist)[0]
+    ungated = mod(hidden_states, (basis, source_ids), st_dist=None)[0]
+
+    torch.testing.assert_close(closed_gate, mod.output(torch.zeros(B, S, 1, mod.output.dense.in_features)),
+                               rtol=0, atol=1e-6)
+    assert not torch.allclose(open_gate, closed_gate, atol=1e-6)
+    assert not torch.allclose(open_gate, ungated, atol=1e-6)
+
+
+def test_gate_responds_to_a_uniform_bias_shift():
+    torch.manual_seed(6)
+    cfg = JSDMConfig(hidden_size=32, num_attention_heads=4, num_species=5,
+                     num_source_sites=6, use_temporal=False)
+    mod = STColAttention(cfg).eval()
+    B, S, N = 2, 5, 6
+    bias = torch.randn(B, S, 1, N)
+    g_a = torch.sigmoid(mod.species_gate_threshold[None, :, None] - torch.logsumexp(bias, dim=-1))
+    g_b = torch.sigmoid(mod.species_gate_threshold[None, :, None] - torch.logsumexp(bias - 3.0, dim=-1))
+    assert (g_b > g_a).all()
 
 
 def test_species_attention_matches_explicit_reference():
-    """Species self-attention folds (B, T) into the batch axis so the fused
-    kernels apply; it must still equal an explicit softmax(QK^T)V."""
-    import math
-
-    import torch.nn.functional as F
-
     from stemlm.model import SpeciesSelfAttention
 
     torch.manual_seed(6)
@@ -129,7 +125,6 @@ def test_species_attention_matches_explicit_reference():
 
 
 def test_species_attention_independent_across_leading_dims():
-    """Folding must not leak information between batch rows or target sites."""
     from stemlm.model import SpeciesSelfAttention
 
     torch.manual_seed(7)

@@ -46,7 +46,7 @@ class JSDMConfig:
     temporal_fire_init_periods: tuple[float, ...] | None = None
     fire_zero_init_periodic: bool = True
 
-    ablation: str = "full"  # full | no_st | no_env | no_st_env
+    ablation: str = "full"  # full | no_st | no_env | no_st_env  
 
     per_species_env_rank: int = 8
 
@@ -278,23 +278,12 @@ class STCrossAttention(Attention):
 
     def _collapsed_forward(self, query_layer, basis, source_ids,
                            st_dist_bias, output_attentions):
-        """Attend over source sites without ever materialising K or V.
-
-        Keys and values take only ``basis.size(0) * S`` distinct values, so the
-        query-key products reduce to one per (bin, species) and the context is a
-        weighted sum of the few distinct value vectors:
-
-            out = sum_n a_n V[id_n, s] = sum_i (sum_{n: id_n = i} a_n) V[i, s]
-
-        Only the (B, S, heads, T, N) attention weights are built — the dense K/V
-        would be (B, S, N, all_head), tens of times larger.
-        """
+        """Attend over source sites without ever materialising K or V."""
         n_bins, S, _ = basis.shape
         h, hd = self.num_attention_heads, self.attention_head_size
         k_tab = self.key(basis).view(n_bins, S, h, hd)
         v_tab = self.value(basis).view(n_bins, S, h, hd)
 
-        # One query-key product per bin: (B, S, h, T, n_bins)
         qk = torch.einsum("bshtd,ishd->bshti", query_layer, k_tab)
         qk = qk / math.sqrt(hd)
 
@@ -310,7 +299,6 @@ class STCrossAttention(Attention):
         weights = F.dropout(attn_probs, p=self.attention_probs_dropout_prob,
                             training=self.training)
 
-        # Total weight landing on each bin, then combine the distinct values.
         bins = torch.stack(
             [(weights * (source_ids == i)[:, :, None, None, :]).sum(-1)
              for i in range(n_bins)],
@@ -328,34 +316,8 @@ class STCrossAttention(Attention):
         if st_dist_bias is not None:
             st_dist_bias = st_dist_bias.to(query_layer.dtype)
 
-        if isinstance(source_embeddings, tuple):
-            # (basis, ids): keys/values stay collapsed to their few
-            # distinct rows — see _collapsed_forward.
-            return self._collapsed_forward(query_layer, *source_embeddings,
-                                           st_dist_bias, output_attentions)
-
-        key_layer = self.transpose_for_scores(self.key(source_embeddings))
-        value_layer = self.transpose_for_scores(self.value(source_embeddings))
-
-        if output_attentions:
-            attn_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-            attn_scores = attn_scores / math.sqrt(self.attention_head_size)
-            if st_dist_bias is not None:
-                attn_scores = attn_scores + st_dist_bias
-            attn_probs = F.softmax(attn_scores, dim=-1)
-            attn_probs_drop = F.dropout(
-                attn_probs, p=self.attention_probs_dropout_prob, training=self.training
-            )
-            context = torch.matmul(attn_probs_drop, value_layer)
-            return self._merge_heads(context), attn_probs
-        else:
-            context = F.scaled_dot_product_attention(
-                query_layer, key_layer, value_layer,
-                attn_mask=st_dist_bias,
-                dropout_p=self.attention_probs_dropout_prob if self.training else 0.0,
-                scale=1.0 / math.sqrt(self.attention_head_size),
-            )
-            return (self._merge_heads(context),)
+        return self._collapsed_forward(query_layer, *source_embeddings,
+                                       st_dist_bias, output_attentions)
 
 
 class STColAttention(nn.Module):
@@ -378,10 +340,12 @@ class STColAttention(nn.Module):
         self.species_spatial_log_scale = nn.Parameter(torch.zeros(config.num_species))
         if self.use_temporal:
             self.species_temporal_log_scale = nn.Parameter(torch.zeros(config.num_species))
+        self.species_gate_threshold = nn.Parameter(torch.zeros(config.num_species))
 
     def forward(self, hidden_states, source_embeddings,
                 st_dist=None, output_attentions=False):
         st_dist_bias = None
+        gate = None
         if st_dist is not None:
             spatial_bias = self.fire_spatial(st_dist[..., 0])
             s_scale = F.softplus(self.species_spatial_log_scale) + 1e-4
@@ -392,12 +356,17 @@ class STColAttention(nn.Module):
                 t_scale = F.softplus(self.species_temporal_log_scale) + 1e-4
                 st_dist_bias = st_dist_bias + temporal_bias[:, None, :, :] * t_scale[None, :, None, None]
 
+            gate = torch.sigmoid(self.species_gate_threshold[None, :, None]
+                                 - torch.logsumexp(st_dist_bias.float(), dim=-1))
             st_dist_bias = st_dist_bias[:, :, None, :, :]
 
         cross_outputs = self.cross_attn(
             hidden_states, source_embeddings, st_dist_bias, output_attentions,
         )
-        output = (self.output(cross_outputs[0]),)
+        context = cross_outputs[0]
+        if gate is not None:
+            context = context * (1.0 - gate).unsqueeze(-1).to(context.dtype)
+        output = (self.output(context),)
         if output_attentions:
             output = (*output, cross_outputs[1])
         return output
@@ -625,8 +594,8 @@ class JSDMModel(nn.Module):
         # Hand cross-attention that small basis plus the ids and let it gather
         # after projecting, so the (B, S, N, H) product is never materialised.
         species_emb = self.target_input.species_embedding.weight        # (S, H)
-        state_emb = self.target_input.embedding.weight                 # (3, H)
-        source_basis = state_emb[:, None, :] + species_emb[None, :, :]  # (3, S, H)
+        state_emb = self.target_input.embedding.weight
+        source_basis = state_emb[:, None, :] + species_emb[None, :, :]
         source_emb = (source_basis, source_ids.long())
 
         if self.use_env:
