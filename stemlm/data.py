@@ -125,6 +125,8 @@ def _normalize_time_col(df: pd.DataFrame, time_col: str, no_time: bool) -> bool:
     if not has_time:
         reason = "--no_time" if no_time else f"column '{time_col}' not found"
         print(f"  Time ignored ({reason}) — purely spatial model")
+        if time_col in df.columns:
+            df.drop(columns=[time_col], inplace=True)
         return False
     col = df[time_col]
     is_stringlike = (col.dtype == "object"
