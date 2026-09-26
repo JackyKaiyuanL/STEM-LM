@@ -100,6 +100,45 @@ def test_faiss_candidates_match_bruteforce(dataset):
         assert np.all(np.diff(sp) >= -1e-3), "candidates not sorted by distance"
 
 
+def test_random_exclusion_keeps_batched_equal_to_sequential(dataset):
+    dataset.random_exclusion_rows = np.arange(0, 160, 3)
+    try:
+        indices = [3, 8, 15, 22, 40, 41, 42, 99, 100, 158]
+        ref = _sequential_source_idx(dataset, indices, seed=5)
+        got = _batched_source_idx(dataset, indices, seed=5)
+        for r, g in zip(ref, got, strict=True):
+            np.testing.assert_array_equal(r, g)
+    finally:
+        dataset._random_exclusion_mask = None
+
+
+def test_random_exclusion_draws_positive_radii(dataset):
+    dataset.random_exclusion_rows = np.arange(160)
+    try:
+        np.random.seed(11)
+        radii = [dataset._exclusion_radius(i, dataset._knn_candidates(i)[1]) for i in range(160)]
+        assert 0 < np.mean(np.array(radii) > 0) < 1
+        for i in range(0, 160, 5):
+            cand, sp = dataset._knn_candidates(i)
+            r = dataset._exclusion_radius(i, sp)
+            assert r <= sp.max()
+    finally:
+        dataset._random_exclusion_mask = None
+
+
+def test_eval_exclusion_removes_near_sources(dataset):
+    dataset.eval_exclusion_km = 300.0
+    try:
+        np.random.seed(2)
+        for i in [3, 40, 99]:
+            src = dataset[i]["source_idx"].numpy()
+            d = haversine_pairs_np(dataset.lats[i], dataset.lons[i],
+                                   dataset.lats[src], dataset.lons[src])
+            assert (d >= 300.0).all()
+    finally:
+        dataset.eval_exclusion_km = 0.0
+
+
 def test_batched_matches_sequential_full_pool(tmp_path_factory):
     csv = tmp_path_factory.mktemp("knn2") / "data.csv"
     _write_synthetic_csv(csv, n=120, seed=3)

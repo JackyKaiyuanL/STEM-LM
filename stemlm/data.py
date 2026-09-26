@@ -246,6 +246,8 @@ class JSDMDataset(Dataset):
         self._knn_index = _HaversineKNNIndex(self.lats, self.lons)
         self._source_pool = None
         self._source_pool_mask = None
+        self._random_exclusion_mask = None
+        self.eval_exclusion_km = 0.0
 
     @property
     def source_pool(self):
@@ -261,10 +263,20 @@ class JSDMDataset(Dataset):
             mask[np.asarray(value)] = True
             self._source_pool_mask = mask
 
+    @property
+    def random_exclusion_rows(self):
+        return self._random_exclusion_mask
+
+    @random_exclusion_rows.setter
+    def random_exclusion_rows(self, value):
+        mask = np.zeros(len(self.lats), dtype=bool)
+        mask[np.asarray(value)] = True
+        self._random_exclusion_mask = mask
+
     def __len__(self):
         return len(self.species_data)
 
-    def _knn_candidates(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
+    def _knn_candidates(self, idx: int, min_dist: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
         N_total = len(self.lats)
         pool_mask = self._source_pool_mask
         k_query = min(_K_MAX + 1, N_total)
@@ -274,16 +286,26 @@ class JSDMDataset(Dataset):
         while True:
             neigh = self._knn_index.query(self.coords[idx:idx + 1], k_query)[0]
             neigh = neigh[neigh >= 0]
-            keep = neigh != idx
+            sp = haversine_pairs_np(self.lats[idx], self.lons[idx],
+                                    self.lats[neigh], self.lons[neigh])
+            keep = (neigh != idx) & (sp >= min_dist)
             if pool_mask is not None:
                 keep &= pool_mask[neigh]
-            neigh = neigh[keep]
+            neigh, sp = neigh[keep], sp[keep]
             if len(neigh) >= max(self.num_source_sites, self.num_scale_sites) or k_query >= N_total:
                 break
             k_query = min(k_query * 2, N_total)
-        sp = haversine_pairs_np(self.lats[idx], self.lons[idx],
-                                self.lats[neigh], self.lons[neigh])
         return neigh, sp
+
+    def _exclusion_radius(self, idx: int, sp: np.ndarray) -> float:
+        if self._random_exclusion_mask is None or not self._random_exclusion_mask[idx]:
+            return self.eval_exclusion_km
+        u = np.random.random()
+        positive = sp[sp > 0]
+        if u < 0.5 or positive.size == 0:
+            return 0.0
+        lo, hi = np.log(positive.min()), np.log(sp.max())
+        return float(np.exp(lo + (2.0 * u - 1.0) * (hi - lo)))
 
     def _candidates_batch(self, indices: list[int]) -> list[tuple[np.ndarray, np.ndarray]]:
         """Neighbour indices + distances for a batch via ONE FAISS query.
@@ -326,6 +348,13 @@ class JSDMDataset(Dataset):
         ``np.random.choice`` — callers must invoke in a fixed index order to keep
         draws reproducible."""
         N = self.num_source_sites
+        r = self._exclusion_radius(idx, sp)
+        if r > 0:
+            keep = sp >= r
+            if keep.sum() < max(N, self.num_scale_sites):
+                cand_idx, sp = self._knn_candidates(idx, min_dist=r)
+            else:
+                cand_idx, sp = cand_idx[keep], sp[keep]
         if self.has_time:
             tp = np.abs(self.times[cand_idx] - self.times[idx]).astype(np.float32)
         else:
@@ -686,9 +715,9 @@ def create_dataloaders(
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None,
     no_time=False,
+    train_exclusion=False, eval_exclusion_km=0.0,
     fold_method="random", resolution: int | None = None,
     saved_splits: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
-    restrict_source_pool_with_saved_splits: bool = True,
     vocab_path: str | None = None,
 ):
 
@@ -719,7 +748,6 @@ def create_dataloaders(
         train_indices = np.asarray(train_indices, dtype=np.int64)
         val_indices   = np.asarray(val_indices,   dtype=np.int64)
         test_indices  = np.asarray(test_indices,  dtype=np.int64)
-        source_pool_restricted = restrict_source_pool_with_saved_splits
         split_origin = "saved"
     elif fold_method == "h3":
         if resolution is None:
@@ -731,7 +759,6 @@ def create_dataloaders(
             resolution=resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
         )
         split_origin = "h3"
-        source_pool_restricted = True
     else:
         if resolution is not None:
             raise ValueError("--resolution is only valid with --fold h3.")
@@ -743,11 +770,12 @@ def create_dataloaders(
         train_indices = indices[:n_train]
         val_indices   = indices[n_train : n - n_test if n_test > 0 else n]
         test_indices  = indices[n - n_test:] if n_test > 0 else np.array([], dtype=int)
-        source_pool_restricted = False
         split_origin = "random"
 
-    if source_pool_restricted:
-        dataset.source_pool = train_indices
+    dataset.source_pool = train_indices
+    if train_exclusion:
+        dataset.random_exclusion_rows = train_indices
+    dataset.eval_exclusion_km = eval_exclusion_km
 
     train_dataset = torch.utils.data.Subset(dataset, train_indices)
     val_dataset   = torch.utils.data.Subset(dataset, val_indices)

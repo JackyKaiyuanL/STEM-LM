@@ -405,6 +405,13 @@ def add_train_args(parser):
     parser.add_argument("--no_time", action="store_true",
                         help="Disable temporal FIRE bias. Set automatically when all "
                              "time values in the CSV are identical (static datasets).")
+    parser.add_argument("--train_exclusion", action="store_true",
+                        help="Per training target, with probability 1/2, remove candidate "
+                             "sources within a radius drawn log-uniformly between the nearest "
+                             "candidate and the candidate pool's extent.")
+    parser.add_argument("--eval_exclusion_km", type=float, default=0.0,
+                        help="Remove training sources within this radius of every validation "
+                             "and test target.")
     parser.add_argument(
         "--class_weighting",
         type=float,
@@ -548,6 +555,8 @@ def run_train(args):
         seed=args.seed,
         env_cols=args.env_cols,
         no_time=args.no_time,
+        train_exclusion=args.train_exclusion,
+        eval_exclusion_km=args.eval_exclusion_km,
         fold_method=args.fold,
         resolution=args.resolution,
         saved_splits=saved_splits,
