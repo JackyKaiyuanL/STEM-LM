@@ -216,16 +216,16 @@ def _move_dist_info(dist_info, device):
 
 
 @torch.no_grad()
-def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float,
-                         bag_K: int, batch_size: int, device,
-                         num_workers: int = 0, base_seed: int = 0,
-                         amp_dtype=None, distributed_sampler: bool = False,
-                         collator_cls=None) -> dict:
+def evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float,
+                  batch_size: int, device,
+                  num_workers: int = 0, base_seed: int = 0,
+                  amp_dtype=None, distributed_sampler: bool = False,
+                  collator_cls=None) -> dict:
     model.eval()
     use_amp = amp_dtype is not None and device.type == "cuda"
     dist_info_dev = _move_dist_info(dist_info, device)
 
-    sum_probs: dict[int, np.ndarray] = {}
+    probs_for_idx: dict[int, np.ndarray] = {}
     label_for_idx: dict[int, np.ndarray] = {}
 
     is_distributed = bool(distributed_sampler) and torch.distributed.is_initialized()
@@ -235,63 +235,52 @@ def bagged_evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float
     collator = cls(p=p_value, base_seed=mask_seed)
     subset = Subset(dataset, eval_indices)
 
-    for k in range(bag_K):
-        np.random.seed(mask_seed + 7919 * k)
-        torch.manual_seed(mask_seed + 7919 * k)
-        if is_distributed:
-            sampler = DistributedSampler(subset, shuffle=False)
-            loader = DataLoader(subset, batch_size=batch_size, sampler=sampler,
-                                collate_fn=collator, num_workers=num_workers, pin_memory=True,
-                                worker_init_fn=seed_worker)
-        else:
-            loader = DataLoader(subset, batch_size=batch_size, shuffle=False,
-                                collate_fn=collator, num_workers=num_workers, pin_memory=True,
-                                worker_init_fn=seed_worker)
+    np.random.seed(mask_seed)
+    torch.manual_seed(mask_seed)
+    if is_distributed:
+        sampler = DistributedSampler(subset, shuffle=False)
+        loader = DataLoader(subset, batch_size=batch_size, sampler=sampler,
+                            collate_fn=collator, num_workers=num_workers, pin_memory=True,
+                            worker_init_fn=seed_worker)
+    else:
+        loader = DataLoader(subset, batch_size=batch_size, shuffle=False,
+                            collate_fn=collator, num_workers=num_workers, pin_memory=True,
+                            worker_init_fn=seed_worker)
 
-        for batch in loader:
-            if use_amp:
-                with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                    out = run_forward(model, batch, dist_info_dev, device)
-            else:
+    for batch in loader:
+        if use_amp:
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 out = run_forward(model, batch, dist_info_dev, device)
-            probs = torch.sigmoid(out.logits.float().squeeze(-1)).cpu().numpy()
-            labels = batch["labels"].squeeze(-1).cpu().numpy()
-            target_idx = batch["target_site_idx"].squeeze(-1).cpu().numpy()
-            for b, ti in enumerate(target_idx):
-                ti = int(ti)
-                if ti not in sum_probs:
-                    sum_probs[ti] = probs[b].astype(np.float64)
-                    label_for_idx[ti] = labels[b]
-                else:
-                    sum_probs[ti] += probs[b]
+        else:
+            out = run_forward(model, batch, dist_info_dev, device)
+        probs = torch.sigmoid(out.logits.float().squeeze(-1)).cpu().numpy()
+        labels = batch["labels"].squeeze(-1).cpu().numpy()
+        target_idx = batch["target_site_idx"].squeeze(-1).cpu().numpy()
+        for b, ti in enumerate(target_idx):
+            probs_for_idx[int(ti)] = probs[b].astype(np.float64)
+            label_for_idx[int(ti)] = labels[b]
 
     if is_distributed:
         objs = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(objs, (sum_probs, label_for_idx))
-        merged_sum, merged_lab = {}, {}
-        for sp, lb in objs:
-            for ti, p in sp.items():
-                if ti not in merged_sum:
-                    merged_sum[ti] = p.copy()
-                    merged_lab[ti] = lb[ti]
-                else:
-                    merged_sum[ti] += p
-        sum_probs, label_for_idx = merged_sum, merged_lab
+        torch.distributed.all_gather_object(objs, (probs_for_idx, label_for_idx))
+        probs_for_idx, label_for_idx = {}, {}
+        for pr, lb in objs:
+            probs_for_idx.update(pr)
+            label_for_idx.update(lb)
 
-    indices = sorted(sum_probs.keys())
+    indices = sorted(probs_for_idx.keys())
     if not indices:
-        return {"p": float(p_value), "K": int(bag_K),
+        return {"p": float(p_value),
                 "summary": summarize_per_species_metrics({}), "per_species": {}}
 
-    avg_probs = np.stack([sum_probs[i] / bag_K for i in indices], axis=0)
+    probs_arr = np.stack([probs_for_idx[i] for i in indices], axis=0)
     labels_arr = np.stack([label_for_idx[i] for i in indices], axis=0)
-    per_sp_bag = compute_per_species_metrics(avg_probs, labels_arr)
+    per_sp = compute_per_species_metrics(probs_arr, labels_arr)
 
     return {
         "p": float(p_value),
-        "K": int(bag_K),
-        "summary": summarize_per_species_metrics(per_sp_bag),
-        "per_species": per_sp_bag,
+        "summary": summarize_per_species_metrics(per_sp),
+        "per_species": per_sp,
     }
 
 

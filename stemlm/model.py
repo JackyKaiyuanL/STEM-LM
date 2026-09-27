@@ -44,7 +44,6 @@ class JSDMConfig:
     fire_hidden_size: int = 32
 
     temporal_fire_init_periods: tuple[float, ...] | None = None
-    fire_zero_init_periodic: bool = True
 
     ablation: str = "full"  # full | no_st | no_env | no_st_env  
 
@@ -83,8 +82,7 @@ class FIREDistanceBias(nn.Module):
 
     def __init__(self, max_dist: float, fire_hidden_size: int = 32,
                  n_frequencies: int = 0,
-                 freq_init_periods: tuple[float, ...] | None = None,
-                 zero_init_periodic: bool = True):
+                 freq_init_periods: tuple[float, ...] | None = None):
         super().__init__()
         self.log_c = nn.Parameter(torch.tensor(0.0))
         self.max_dist = max_dist
@@ -100,9 +98,8 @@ class FIREDistanceBias(nn.Module):
             if (periods <= 0).any():
                 raise ValueError("all freq_init_periods must be > 0.")
             self.log_omega = nn.Parameter(torch.log(2.0 * math.pi / periods))
-            if zero_init_periodic:
-                with torch.no_grad():
-                    self.mlp[0].weight[:, 1:].zero_()
+            with torch.no_grad():
+                self.mlp[0].weight[:, 1:].zero_()
 
     def forward(self, dist: torch.Tensor):
         d = dist.unsqueeze(-1).float()
@@ -335,7 +332,6 @@ class STColAttention(nn.Module):
                 config.max_temporal_dist, config.fire_hidden_size,
                 n_frequencies=len(periods) if periods else 0,
                 freq_init_periods=periods,
-                zero_init_periodic=config.fire_zero_init_periodic,
             )
         self.species_spatial_log_scale = nn.Parameter(torch.zeros(config.num_species))
         if self.use_temporal:
@@ -676,7 +672,7 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
         else:
             self.per_species_env_head = None
 
-    def forward(self, labels=None, loss_weight=None,
+    def forward(self, labels=None,
                 loss_type: str = "bce",
                 focal_alpha: float = 0.25, focal_gamma: float = 2.0,
                 output_attentions=False, **kwargs):
@@ -691,16 +687,9 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
             mask = labels != -100
             if mask.any():
                 if loss_type == "bce":
-                    if loss_weight is None:
-                        loss = F.binary_cross_entropy_with_logits(
-                            logits[mask].float(), labels[mask].float()
-                        )
-                    else:
-                        per_el = F.binary_cross_entropy_with_logits(
-                            logits[mask].float(), labels[mask].float(), reduction="none"
-                        )
-                        w = loss_weight.unsqueeze(-1).expand_as(labels)[mask]
-                        loss = (per_el * w).sum() / w.sum()
+                    loss = F.binary_cross_entropy_with_logits(
+                        logits[mask].float(), labels[mask].float()
+                    )
                 elif loss_type == "focal":
                     # Sigmoid focal loss (Lin et al. 2017, RetinaNet form)
                     x = logits[mask].float()
@@ -714,11 +703,7 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
                         per_el = alpha_t * modulator * ce
                     else:
                         per_el = modulator * ce
-                    if loss_weight is None:
-                        loss = per_el.mean()
-                    else:
-                        w = loss_weight.unsqueeze(-1).expand_as(labels)[mask]
-                        loss = (per_el * w).sum() / w.sum()
+                    loss = per_el.mean()
                 else:
                     raise ValueError(f"Unknown loss_type: {loss_type!r} "
                                      f"(expected 'bce' or 'focal')")
@@ -730,10 +715,3 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
             st_attentions=encoder_out.st_attentions,
             env_attentions=encoder_out.env_attentions,
         )
-
-
-def extract_cooccurrence_matrix(output: JSDMOutput, layer_idx: int = -1) -> torch.Tensor:
-    if output.species_attentions is None:
-        raise ValueError("Run with output_attentions=True")
-    attn = output.species_attentions[layer_idx]
-    return attn.squeeze(1)

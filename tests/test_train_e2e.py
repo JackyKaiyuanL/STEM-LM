@@ -16,7 +16,6 @@ EXPECTED_ARTIFACTS = [
     "training_log.csv",
     "test_results.csv",
     "per_species_auc.csv",
-    "cooccurrence_matrix.npy",
     "ablation_summary.json",
 ]
 
@@ -34,11 +33,6 @@ def test_config_matches_dataset(trained_run):
 def test_species_names_preserved(trained_run):
     names = json.loads((trained_run / "species_names.json").read_text())
     assert names == SPECIES
-
-
-def test_cooccurrence_matrix_shape(trained_run):
-    matrix = np.load(trained_run / "cooccurrence_matrix.npy")
-    assert matrix.shape == (len(SPECIES), len(SPECIES))
 
 
 def test_training_log_has_two_epochs(trained_run):

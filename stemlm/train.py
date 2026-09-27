@@ -20,14 +20,14 @@ from stemlm.data import (
     seed_worker,
 )
 from stemlm.metric import (
-    bagged_evaluate_at_p,
     compute_per_species_ece_from_logits,
     compute_per_species_metrics,
+    evaluate_at_p,
     fit_temperature,
     gather_logits_at_p,
     summarize_per_species_metrics,
 )
-from stemlm.model import JSDMConfig, JSDMForMaskedSpeciesPrediction, extract_cooccurrence_matrix
+from stemlm.model import JSDMConfig, JSDMForMaskedSpeciesPrediction
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -122,17 +122,7 @@ def move_dist_info_to_device(dist_info, device):
     return out
 
 
-def compute_class_weights(species_data, train_indices, beta=0.999):
-    if not (0.0 < beta < 1.0):
-        raise ValueError(f"class_weighting_beta must be in (0, 1), got {beta}")
-    n_s = species_data[train_indices].sum(axis=0).clip(min=1)
-    effective_n = (1 - beta ** n_s) / (1 - beta)
-    w = 1.0 / effective_n
-    w = w / w.mean()
-    return torch.tensor(w, dtype=torch.float32)
-
-
-def _forward(model, batch, dist_info, loss_weight=None,
+def _forward(model, batch, dist_info,
              loss_type: str = "bce",
              focal_alpha: float = 0.25, focal_gamma: float = 2.0):
     return model(
@@ -143,7 +133,6 @@ def _forward(model, batch, dist_info, loss_weight=None,
         env_data=batch["env_data"],
         target_env=batch["target_env"],
         labels=batch["labels"],
-        loss_weight=loss_weight,
         loss_type=loss_type,
         focal_alpha=focal_alpha,
         focal_gamma=focal_gamma,
@@ -154,7 +143,7 @@ def _forward(model, batch, dist_info, loss_weight=None,
 
 
 def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
-                loss_weight=None, log_interval=50, max_grad_norm=1.0,
+                log_interval=50, max_grad_norm=1.0,
                 amp_dtype=None, grad_scaler=None,
                 grad_accum_steps: int = 1, env: DistEnv | None = None,
                 loss_type: str = "bce",
@@ -180,24 +169,19 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch,
     masked_sum = torch.zeros((), device=device, dtype=torch.long)
     num_batches = 0
     use_amp = amp_dtype is not None and device.type == "cuda"
-    # Class weights are constant across steps — move to device once, not per step.
-    loss_weight_dev = loss_weight.to(device) if loss_weight is not None else None
 
     optimizer.zero_grad()
     for batch_idx, batch in enumerate(loader):
         batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-        B = batch["input_ids"].shape[0]
-        w = loss_weight_dev[None, :].expand(B, -1) if loss_weight_dev is not None else None
-
         if use_amp:
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                output = _forward(model, batch, dist_info, loss_weight=w,
+                output = _forward(model, batch, dist_info,
                                   loss_type=loss_type,
                                   focal_alpha=focal_alpha, focal_gamma=focal_gamma)
                 loss = output.loss
         else:
-            output = _forward(model, batch, dist_info, loss_weight=w,
+            output = _forward(model, batch, dist_info,
                               loss_type=loss_type,
                               focal_alpha=focal_alpha, focal_gamma=focal_gamma)
             loss = output.loss
@@ -416,17 +400,6 @@ def add_train_args(parser):
     parser.add_argument("--causal_context", action="store_true",
                         help="Sources must precede the target in time; time windows then count "
                              "days before the target only.")
-    parser.add_argument(
-        "--class_weighting",
-        type=float,
-        nargs="?",
-        const=0.999,
-        default=None,
-        help="Effective-number class weighting beta in (0,1). Off by default; "
-             "pass '--class_weighting' (alone, uses beta=0.999) or "
-             "'--class_weighting 0.99' to enable. Recommended for BCE only; "
-             "with focal it's redundant and hurts AUC.",
-    )
     parser.add_argument("--env_cols", nargs="+", default=None,
                         help="Explicit list of env column names. If not set, columns with 'env_' "
                              "prefix are used. Useful for datasets with non-prefixed env columns "
@@ -439,9 +412,6 @@ def add_train_args(parser):
                              "Not valid with --fold random.")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                         help="Gradient clipping max norm (default 1.0).")
-    parser.add_argument("--cooccurrence_extract_batches", type=int, default=20,
-                        help="Number of val batches used to estimate the species "
-                             "cooccurrence matrix at the end of training (default 20).")
     parser.add_argument("--splits_path", type=str, default=None,
                         help="Path to a splits.json (written by a previous training run). "
                              "When set, overrides --fold / --resolution / "
@@ -463,10 +433,6 @@ def add_train_args(parser):
                              "FIRE temporal distance bias on ST attention scores. "
                              "Periodic on Δt directly; per-species scales (if enabled) "
                              "rescale Δt before the cos/sin. Omit to disable.")
-    parser.add_argument("--fire_no_zero_init_periodic", action="store_true",
-                        help="Disable zero-init of the periodic columns of FIRE's input "
-                             "linear. By default the periodic contribution starts at zero "
-                             "so the monotone bias is unaffected at step 0.")
     parser.add_argument("--per_species_env_rank", type=int, default=8,
                         help="Rank of the parallel per-species env head bolted in "
                              "alongside the shared env encoder. Reads raw target_env "
@@ -485,20 +451,11 @@ def add_train_args(parser):
                         help="Focal loss focusing parameter. 0 reduces to "
                              "weighted BCE. Ignored when --loss_type=bce. "
                              "Default 2.0 (RetinaNet).")
-    parser.add_argument("--absence_mask_eval", action="store_true",
-                        help="(Default ON; this flag is a no-op kept for "
-                             "backward compat.) Run absence-mask test block "
-                             "(mask all absences + p presences; presence-only "
-                             "scenario). Use --no_absence_mask_eval to skip.")
     parser.add_argument("--no_absence_mask_eval", action="store_true",
                         help="Skip the absence-mask test block.")
     parser.add_argument("--absence_mask_p_list", type=float, nargs="+",
                         default=[0.25, 0.5, 0.75, 1.0],
                         help="Presence-mask rates for absence-mask eval.")
-    parser.add_argument("--test_bag_K", type=int, default=1,
-                        help="Evaluation passes averaged per masking rate. Sources are the K "
-                             "nearest training rows and masks are seeded per batch, so passes "
-                             "are identical; 1 is exact.")
     parser.add_argument("--temperature_scaling", action="store_true",
                         help="After test eval, fit Guo et al. 2017 temperature scalar T* on "
                              "validation logits at p=1.00 by L-BFGS on NLL, apply at every "
@@ -525,7 +482,7 @@ def run_train(args):
     final_artifacts = [
         os.path.join(args.output_dir, "test_results.csv"),
         os.path.join(args.output_dir, "per_species_auc.csv"),
-        os.path.join(args.output_dir, "cooccurrence_matrix.npy"),
+        os.path.join(args.output_dir, "species_names.json"),
     ]
     if all(os.path.exists(p) for p in final_artifacts):
         log_main(env, f"All final artifacts already exist in {args.output_dir}; skipping.")
@@ -611,17 +568,6 @@ def run_train(args):
         logger.info(f"Splits saved to {splits_out}")
     env.barrier()
 
-    loss_weight = None
-    if args.class_weighting is not None:
-        beta = args.class_weighting
-        loss_weight = compute_class_weights(
-            dataset.species_data, train_loader.dataset.indices, beta=beta
-        )
-        log_main(env,
-            f"Class weighting (beta={beta:.3f}): weight range "
-            f"[{loss_weight.min().item():.3f}, {loss_weight.max().item():.3f}]"
-        )
-
     if args.loss_type == "focal":
         log_main(env,
             f"Loss: focal (alpha={args.focal_alpha}, gamma={args.focal_gamma})"
@@ -651,7 +597,6 @@ def run_train(args):
             tuple(args.temporal_fire_init_periods)
             if args.temporal_fire_init_periods else None
         ),
-        fire_zero_init_periodic=(not args.fire_no_zero_init_periodic),
         ablation=args.ablation,
         p=args.p,
         per_species_env_rank=args.per_species_env_rank,
@@ -771,7 +716,7 @@ def run_train(args):
         t0 = time.time()
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, scheduler, device, dist_info, epoch,
-            loss_weight=loss_weight, max_grad_norm=args.max_grad_norm,
+            max_grad_norm=args.max_grad_norm,
             amp_dtype=amp_dtype, grad_scaler=grad_scaler,
             grad_accum_steps=args.grad_accum_steps,
             env=env,
@@ -873,10 +818,7 @@ def run_train(args):
 
     eval_split   = "test" if len(splits["test"]) > 0 else "val (no test set)"
     eval_indices = splits["test"] if len(splits["test"]) > 0 else splits["val"]
-    log_main(env,
-        f"Evaluating best model on fixed-p {eval_split} set "
-        f"(K={args.test_bag_K} bagging passes per p)..."
-    )
+    log_main(env, f"Evaluating best model on fixed-p {eval_split} set...")
 
     best_state = torch.load(os.path.join(args.output_dir, "best_model.pt"), map_location=device)
     unwrap(model).load_state_dict(best_state)
@@ -891,9 +833,9 @@ def run_train(args):
     per_p_q75 = {}
     per_p_per_species: dict = {}
     for p in args.val_p_list:
-        result = bagged_evaluate_at_p(
+        result = evaluate_at_p(
             unwrap(model), dataset, eval_indices, dist_info,
-            p_value=p, bag_K=args.test_bag_K,
+            p_value=p,
             batch_size=args.batch_size, device=device,
             num_workers=args.num_workers,
             base_seed=args.seed + 10_000,
@@ -911,7 +853,7 @@ def run_train(args):
         per_p_q75[p]    = s.get("auc_roc_q75", float("nan"))
         per_p_per_species[p] = result["per_species"]
         log_main(env,
-            f"{eval_split} p={p:.2f}  bag(K={args.test_bag_K}) "
+            f"{eval_split} p={p:.2f}  "
             f"AUC={s['mean_auc_roc']:.4f}  "
             f"AUCq25/50/75={per_p_q25[p]:.3f}/{per_p_q50[p]:.3f}/{per_p_q75[p]:.3f}  "
             f"AUPRC={s['mean_auc_pr']:.4f}  "
@@ -936,12 +878,12 @@ def run_train(args):
     cbi_sel_mean_cbi = float("nan")
     cbi_ckpt_path = os.path.join(args.output_dir, "best_model_by_cbi.pt")
     if os.path.exists(cbi_ckpt_path):
-        log_main(env, f"Evaluating CBI-selected model on {eval_split} (K={args.test_bag_K})...")
+        log_main(env, f"Evaluating CBI-selected model on {eval_split}...")
         unwrap(model).load_state_dict(torch.load(cbi_ckpt_path, map_location=device))
         for p in args.val_p_list:
-            result = bagged_evaluate_at_p(
+            result = evaluate_at_p(
                 unwrap(model), dataset, eval_indices, dist_info,
-                p_value=p, bag_K=args.test_bag_K,
+                p_value=p,
                 batch_size=args.batch_size, device=device,
                 num_workers=args.num_workers,
                 base_seed=args.seed + 10_000,
@@ -983,8 +925,7 @@ def run_train(args):
     if not args.no_absence_mask_eval:
         from stemlm.data import AbsenceMaskCollator
         log_main(env,
-            f"Absence-mask eval on {eval_split} (mask all absences + p "
-            f"presences, K={args.test_bag_K})..."
+            f"Absence-mask eval on {eval_split} (mask all absences + p presences)..."
         )
         for p in args.absence_mask_p_list:
             if p == 1.0 and 1.0 in per_p_auc:
@@ -998,9 +939,9 @@ def run_train(args):
                 absmask_per_p_q75[p]   = per_p_q75[p]
                 log_main(env, f"absmask p={p:.2f}  (= uniform p=1.00, reused)")
                 continue
-            result = bagged_evaluate_at_p(
+            result = evaluate_at_p(
                 unwrap(model), dataset, eval_indices, dist_info,
-                p_value=p, bag_K=args.test_bag_K,
+                p_value=p,
                 batch_size=args.batch_size, device=device,
                 num_workers=args.num_workers,
                 base_seed=args.seed + 20_000,
@@ -1018,7 +959,7 @@ def run_train(args):
             absmask_per_p_q50[p]   = s.get("auc_roc_q50", float("nan"))
             absmask_per_p_q75[p]   = s.get("auc_roc_q75", float("nan"))
             log_main(env,
-                f"absmask p={p:.2f}  bag(K={args.test_bag_K}) "
+                f"absmask p={p:.2f}  "
                 f"AUC={s['mean_auc_roc']:.4f}  "
                 f"AUCq25/50/75={absmask_per_p_q25[p]:.3f}/{absmask_per_p_q50[p]:.3f}/{absmask_per_p_q75[p]:.3f}  "
                 f"AUPRC={s['mean_auc_pr']:.4f}  "
@@ -1141,7 +1082,6 @@ def run_train(args):
             "num_params":         num_params,
             "best_val_auprc_mean": best_val_auprc_mean,
             "best_val_auc_mean":   best_val_auc_mean,
-            "test_bag_K":         int(args.test_bag_K),
             "test_mean_auprc":    best_mean_auprc,
             "test_mean_auc":      best_mean_auc,
             "test_mean_cbi":      best_mean_cbi,
@@ -1197,30 +1137,6 @@ def run_train(args):
             json.dump(summary, f, indent=2)
             
     if env.is_main:
-        logger.info("Extracting species cooccurrence matrix...")
-        unwrap(model).eval()
-        cooccurrences = []
-        with torch.no_grad():
-            for i, batch in enumerate(val_loader):
-                if i >= args.cooccurrence_extract_batches:
-                    break
-                batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                output = unwrap(model)(
-                    input_ids=batch["input_ids"], source_ids=batch["source_ids"],
-                    source_idx=batch["source_idx"],
-                    target_site_idx=batch["target_site_idx"], env_data=batch["env_data"],
-                    target_env=batch["target_env"],
-                    labels=batch["labels"],
-                    site_lats=dist_info["site_lats"],
-                    site_lons=dist_info["site_lons"],
-                    site_times=dist_info["site_times"],
-                    output_attentions=True,
-                )
-                cooccurrences.append(extract_cooccurrence_matrix(output).cpu())
-
-        cooccurrence_matrix = torch.cat(cooccurrences, dim=0).mean(dim=0).float().numpy()
-        np.save(os.path.join(args.output_dir, "cooccurrence_matrix.npy"), cooccurrence_matrix)
-
         with open(os.path.join(args.output_dir, "species_names.json"), "w") as f:
             json.dump(dataset.species_cols, f)
 
