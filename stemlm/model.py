@@ -44,9 +44,8 @@ class JSDMConfig:
     fire_hidden_size: int = 32
 
     temporal_fire_init_periods: tuple[float, ...] | None = None
-    fire_zero_init_periodic: bool = True
 
-    ablation: str = "full"  # full | no_st | no_env | no_st_env
+    ablation: str = "full"  # full | no_st | no_env | no_st_env  
 
     per_species_env_rank: int = 8
 
@@ -83,8 +82,7 @@ class FIREDistanceBias(nn.Module):
 
     def __init__(self, max_dist: float, fire_hidden_size: int = 32,
                  n_frequencies: int = 0,
-                 freq_init_periods: tuple[float, ...] | None = None,
-                 zero_init_periodic: bool = True):
+                 freq_init_periods: tuple[float, ...] | None = None):
         super().__init__()
         self.log_c = nn.Parameter(torch.tensor(0.0))
         self.max_dist = max_dist
@@ -100,9 +98,8 @@ class FIREDistanceBias(nn.Module):
             if (periods <= 0).any():
                 raise ValueError("all freq_init_periods must be > 0.")
             self.log_omega = nn.Parameter(torch.log(2.0 * math.pi / periods))
-            if zero_init_periodic:
-                with torch.no_grad():
-                    self.mlp[0].weight[:, 1:].zero_()
+            with torch.no_grad():
+                self.mlp[0].weight[:, 1:].zero_()
 
     def forward(self, dist: torch.Tensor):
         d = dist.unsqueeze(-1).float()
@@ -145,14 +142,13 @@ class TargetEnvModule(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         E = config.num_env_vars
-        self.env_norm = nn.LayerNorm(E)
         self.proj1    = nn.Linear(E, config.hidden_size)
         self.act      = nn.SiLU()
         self.proj2    = nn.Linear(config.hidden_size, config.hidden_size)
         self.out_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, target_env: torch.Tensor) -> torch.Tensor:
-        x = self.proj1(self.env_norm(target_env))
+        x = self.proj1(target_env)
         x = self.proj2(self.act(x))
         return self.out_norm(x).unsqueeze(1)
 
@@ -163,7 +159,6 @@ class EnvSourceModule(nn.Module):
         super().__init__()
         E = config.num_env_vars
         self.num_env_groups = config.num_env_groups
-        self.env_norm = nn.LayerNorm(E)
         self.proj = nn.Linear(E, config.hidden_size)
         self.group_query = nn.Parameter(
             torch.randn(config.num_env_groups, config.hidden_size) * 0.02
@@ -175,7 +170,7 @@ class EnvSourceModule(nn.Module):
 
     def forward(self, env_data: torch.Tensor) -> torch.Tensor:
         B = env_data.size(0)
-        site_emb = self.proj(self.env_norm(env_data))  # (B, N, H)
+        site_emb = self.proj(env_data)  # (B, N, H)
         k = self.key_proj(site_emb)
         v = self.value_proj(site_emb)
         q = self.group_query.unsqueeze(0).expand(B, -1, -1)  # (B, C_env, H)
@@ -278,23 +273,12 @@ class STCrossAttention(Attention):
 
     def _collapsed_forward(self, query_layer, basis, source_ids,
                            st_dist_bias, output_attentions):
-        """Attend over source sites without ever materialising K or V.
-
-        Keys and values take only ``basis.size(0) * S`` distinct values, so the
-        query-key products reduce to one per (bin, species) and the context is a
-        weighted sum of the few distinct value vectors:
-
-            out = sum_n a_n V[id_n, s] = sum_i (sum_{n: id_n = i} a_n) V[i, s]
-
-        Only the (B, S, heads, T, N) attention weights are built — the dense K/V
-        would be (B, S, N, all_head), tens of times larger.
-        """
+        """Attend over source sites without ever materialising K or V."""
         n_bins, S, _ = basis.shape
         h, hd = self.num_attention_heads, self.attention_head_size
         k_tab = self.key(basis).view(n_bins, S, h, hd)
         v_tab = self.value(basis).view(n_bins, S, h, hd)
 
-        # One query-key product per bin: (B, S, h, T, n_bins)
         qk = torch.einsum("bshtd,ishd->bshti", query_layer, k_tab)
         qk = qk / math.sqrt(hd)
 
@@ -310,7 +294,6 @@ class STCrossAttention(Attention):
         weights = F.dropout(attn_probs, p=self.attention_probs_dropout_prob,
                             training=self.training)
 
-        # Total weight landing on each bin, then combine the distinct values.
         bins = torch.stack(
             [(weights * (source_ids == i)[:, :, None, None, :]).sum(-1)
              for i in range(n_bins)],
@@ -328,34 +311,8 @@ class STCrossAttention(Attention):
         if st_dist_bias is not None:
             st_dist_bias = st_dist_bias.to(query_layer.dtype)
 
-        if isinstance(source_embeddings, tuple):
-            # (basis, ids): keys/values stay collapsed to their few
-            # distinct rows — see _collapsed_forward.
-            return self._collapsed_forward(query_layer, *source_embeddings,
-                                           st_dist_bias, output_attentions)
-
-        key_layer = self.transpose_for_scores(self.key(source_embeddings))
-        value_layer = self.transpose_for_scores(self.value(source_embeddings))
-
-        if output_attentions:
-            attn_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-            attn_scores = attn_scores / math.sqrt(self.attention_head_size)
-            if st_dist_bias is not None:
-                attn_scores = attn_scores + st_dist_bias
-            attn_probs = F.softmax(attn_scores, dim=-1)
-            attn_probs_drop = F.dropout(
-                attn_probs, p=self.attention_probs_dropout_prob, training=self.training
-            )
-            context = torch.matmul(attn_probs_drop, value_layer)
-            return self._merge_heads(context), attn_probs
-        else:
-            context = F.scaled_dot_product_attention(
-                query_layer, key_layer, value_layer,
-                attn_mask=st_dist_bias,
-                dropout_p=self.attention_probs_dropout_prob if self.training else 0.0,
-                scale=1.0 / math.sqrt(self.attention_head_size),
-            )
-            return (self._merge_heads(context),)
+        return self._collapsed_forward(query_layer, *source_embeddings,
+                                       st_dist_bias, output_attentions)
 
 
 class STColAttention(nn.Module):
@@ -373,15 +330,16 @@ class STColAttention(nn.Module):
                 config.max_temporal_dist, config.fire_hidden_size,
                 n_frequencies=len(periods) if periods else 0,
                 freq_init_periods=periods,
-                zero_init_periodic=config.fire_zero_init_periodic,
             )
         self.species_spatial_log_scale = nn.Parameter(torch.zeros(config.num_species))
         if self.use_temporal:
             self.species_temporal_log_scale = nn.Parameter(torch.zeros(config.num_species))
+        self.species_gate_threshold = nn.Parameter(torch.zeros(config.num_species))
 
     def forward(self, hidden_states, source_embeddings,
                 st_dist=None, output_attentions=False):
         st_dist_bias = None
+        gate = None
         if st_dist is not None:
             spatial_bias = self.fire_spatial(st_dist[..., 0])
             s_scale = F.softplus(self.species_spatial_log_scale) + 1e-4
@@ -392,12 +350,17 @@ class STColAttention(nn.Module):
                 t_scale = F.softplus(self.species_temporal_log_scale) + 1e-4
                 st_dist_bias = st_dist_bias + temporal_bias[:, None, :, :] * t_scale[None, :, None, None]
 
+            gate = torch.sigmoid(self.species_gate_threshold[None, :, None]
+                                 - torch.logsumexp(st_dist_bias.float(), dim=-1))
             st_dist_bias = st_dist_bias[:, :, None, :, :]
 
         cross_outputs = self.cross_attn(
             hidden_states, source_embeddings, st_dist_bias, output_attentions,
         )
-        output = (self.output(cross_outputs[0]),)
+        context = cross_outputs[0]
+        if gate is not None:
+            context = context * (1.0 - gate).unsqueeze(-1).to(context.dtype)
+        output = (self.output(context),)
         if output_attentions:
             output = (*output, cross_outputs[1])
         return output
@@ -614,7 +577,6 @@ class JSDMModel(nn.Module):
         site_lats,       # (N_total,) deg
         site_lons,       # (N_total,) deg
         site_times,      # (N_total,) days
-        euclidean=False,
         output_attentions=False,
         output_hidden_states=False,
     ):
@@ -626,8 +588,8 @@ class JSDMModel(nn.Module):
         # Hand cross-attention that small basis plus the ids and let it gather
         # after projecting, so the (B, S, N, H) product is never materialised.
         species_emb = self.target_input.species_embedding.weight        # (S, H)
-        state_emb = self.target_input.embedding.weight                 # (3, H)
-        source_basis = state_emb[:, None, :] + species_emb[None, :, :]  # (3, S, H)
+        state_emb = self.target_input.embedding.weight
+        source_basis = state_emb[:, None, :] + species_emb[None, :, :]
         source_emb = (source_basis, source_ids.long())
 
         if self.use_env:
@@ -644,10 +606,7 @@ class JSDMModel(nn.Module):
         lat_s = site_lats[source_idx][:, None, :]
         lon_s = site_lons[source_idx][:, None, :]
         ti_s  = site_times[source_idx][:, None, :]
-        if euclidean:
-            sp_dist = torch.sqrt((lat_t - lat_s) ** 2 + (lon_t - lon_s) ** 2)
-        else:
-            sp_dist = _haversine_bt_n(lat_t, lon_t, lat_s, lon_s)
+        sp_dist = _haversine_bt_n(lat_t, lon_t, lat_s, lon_s)
         tp_dist = (ti_t - ti_s).abs()
         st_dist = torch.stack([sp_dist, tp_dist], dim=-1)
 
@@ -711,7 +670,7 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
         else:
             self.per_species_env_head = None
 
-    def forward(self, labels=None, loss_weight=None,
+    def forward(self, labels=None,
                 loss_type: str = "bce",
                 focal_alpha: float = 0.25, focal_gamma: float = 2.0,
                 output_attentions=False, **kwargs):
@@ -726,16 +685,9 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
             mask = labels != -100
             if mask.any():
                 if loss_type == "bce":
-                    if loss_weight is None:
-                        loss = F.binary_cross_entropy_with_logits(
-                            logits[mask].float(), labels[mask].float()
-                        )
-                    else:
-                        per_el = F.binary_cross_entropy_with_logits(
-                            logits[mask].float(), labels[mask].float(), reduction="none"
-                        )
-                        w = loss_weight.unsqueeze(-1).expand_as(labels)[mask]
-                        loss = (per_el * w).sum() / w.sum()
+                    loss = F.binary_cross_entropy_with_logits(
+                        logits[mask].float(), labels[mask].float()
+                    )
                 elif loss_type == "focal":
                     # Sigmoid focal loss (Lin et al. 2017, RetinaNet form)
                     x = logits[mask].float()
@@ -749,11 +701,7 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
                         per_el = alpha_t * modulator * ce
                     else:
                         per_el = modulator * ce
-                    if loss_weight is None:
-                        loss = per_el.mean()
-                    else:
-                        w = loss_weight.unsqueeze(-1).expand_as(labels)[mask]
-                        loss = (per_el * w).sum() / w.sum()
+                    loss = per_el.mean()
                 else:
                     raise ValueError(f"Unknown loss_type: {loss_type!r} "
                                      f"(expected 'bce' or 'focal')")
@@ -765,10 +713,3 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
             st_attentions=encoder_out.st_attentions,
             env_attentions=encoder_out.env_attentions,
         )
-
-
-def extract_cooccurrence_matrix(output: JSDMOutput, layer_idx: int = -1) -> torch.Tensor:
-    if output.species_attentions is None:
-        raise ValueError("Run with output_attentions=True")
-    attn = output.species_attentions[layer_idx]
-    return attn.squeeze(1)

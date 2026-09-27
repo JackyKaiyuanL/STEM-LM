@@ -121,3 +121,25 @@ def test_sparse_dataset_loads_from_directory(tmp_path):
     item = ds[0]
     assert item["source_species"].shape == (6, 4)
     assert item["target_species"].shape == (6,)
+
+
+def test_no_time_drops_time_column_from_species(tmp_path):
+    """A static dataset keeps its time column out of the species set."""
+    from stemlm.data import JSDMDataset
+
+    rng = np.random.default_rng(4)
+    n = 40
+    df = pd.DataFrame({
+        "time": np.zeros(n),
+        "latitude": rng.uniform(25, 55, n),
+        "longitude": rng.uniform(-120, -70, n),
+        "env_a": rng.normal(size=n),
+        "sp_0": rng.integers(0, 2, n),
+        "sp_1": rng.integers(0, 2, n),
+    })
+    df.to_csv(tmp_path / "static.csv", index=False)
+
+    ds = JSDMDataset(str(tmp_path / "static.csv"), num_source_sites=4, no_time=True)
+    assert ds.species_cols == ["sp_0", "sp_1"]
+    assert ds.env_cols == ["env_a"]
+    assert not ds.has_time

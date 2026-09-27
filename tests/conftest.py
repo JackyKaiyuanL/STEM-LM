@@ -24,8 +24,6 @@ TRAIN_ARGS = [
     "--intermediate_size", "32",
     "--num_source_sites", "8",
     "--fold", "random",
-    "--test_bag_K", "1",
-    "--cooccurrence_extract_batches", "1",
     "--val_p_list", "0.5", "1.0",
     "--absence_mask_p_list", "0.5", "1.0",
     "--seed", "0",

@@ -10,7 +10,6 @@ Data source: iDiv sPlotOpen v76 (Sabatini et al. 2021)
   - Time: 0.0 for all plots (static env dataset; Date_of_recording is unreliable)
   - No env features in this version — add later via a separate raster extract
 
-No observation dates in SatButterfly (time=0 everywhere).
 sPlotOpen has Date_of_recording for all consensus plots:
   - Global range: 1888–2015
   - US subset range: 1972–2013

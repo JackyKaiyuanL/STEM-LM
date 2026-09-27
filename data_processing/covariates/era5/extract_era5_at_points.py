@@ -18,7 +18,7 @@ Usage:
     --obs_csv ${REPO_ROOT}/lab/eButterfly/ebutterfly_na_2011_2025_jsdm.csv \\
     --out ebutterfly_na_era5.parquet \\
     --id_col __index__ --lat_col latitude --lon_col longitude --date_col time \\
-    --dem_vrt ${REPO_ROOT}/Examples/env_vars/dem/COP30_hh.vrt \\
+    --dem_vrt ${REPO_ROOT}/data_processing/covariates/copernicus_dem/COP30_hh_vsicurl.vrt \\
     --workers 12
 
 With --dem_vrt set, 2m temperature and dewpoint are corrected by the dry-adiabatic

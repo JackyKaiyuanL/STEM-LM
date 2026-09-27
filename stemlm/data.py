@@ -98,26 +98,17 @@ def haversine_pairs_torch(lat_a: torch.Tensor, lon_a: torch.Tensor,
     return EARTH_RADIUS_KM * 2.0 * torch.asin(torch.sqrt(a.clamp(min=0.0)))
 
 
-def _bbox_max_distance(lats: np.ndarray, lons: np.ndarray, times: np.ndarray,
-                       euclidean: bool):
+def _bbox_max_distance(lats: np.ndarray, lons: np.ndarray, times: np.ndarray):
     lat_min = float(lats.min())
     lat_max = float(lats.max())
     lon_min = float(lons.min())
     lon_max = float(lons.max())
-    if euclidean:
-        max_sp = float(np.hypot(lat_max - lat_min, lon_max - lon_min))
-    else:
-        c_lat = np.array([lat_min, lat_min, lat_max, lat_max], dtype=np.float64)
-        c_lon = np.array([lon_min, lon_max, lon_min, lon_max], dtype=np.float64)
-        i, j = np.triu_indices(4, k=1)
-        max_sp = float(haversine_pairs_np(c_lat[i], c_lon[i], c_lat[j], c_lon[j]).max())
+    c_lat = np.array([lat_min, lat_min, lat_max, lat_max], dtype=np.float64)
+    c_lon = np.array([lon_min, lon_max, lon_min, lon_max], dtype=np.float64)
+    i, j = np.triu_indices(4, k=1)
+    max_sp = float(haversine_pairs_np(c_lat[i], c_lon[i], c_lat[j], c_lon[j]).max())
     max_tp = float(times.max() - times.min()) if len(times) else 0.0
     return max_sp, max_tp
-
-
-def _positive_floor(d: np.ndarray, scale: float) -> float:
-    pos = d[d > 0]
-    return float(pos.min()) if pos.size else scale * 1e-6
 
 
 def _normalize_time_col(df: pd.DataFrame, time_col: str, no_time: bool) -> bool:
@@ -125,6 +116,8 @@ def _normalize_time_col(df: pd.DataFrame, time_col: str, no_time: bool) -> bool:
     if not has_time:
         reason = "--no_time" if no_time else f"column '{time_col}' not found"
         print(f"  Time ignored ({reason}) — purely spatial model")
+        if time_col in df.columns:
+            df.drop(columns=[time_col], inplace=True)
         return False
     col = df[time_col]
     is_stringlike = (col.dtype == "object"
@@ -184,17 +177,14 @@ class JSDMDataset(Dataset):
         self,
         csv_path: str,
         num_source_sites: int = 64,
-        num_scale_sites: int | None = None,
         time_col: str = "time",
         lat_col: str = "latitude",
         lon_col: str = "longitude",
         env_cols: list[str] | None = None,
-        euclidean_coords: bool = False,
         no_time: bool = False,
     ):
         super().__init__()
         self.num_source_sites = num_source_sites
-        self.num_scale_sites = num_scale_sites if num_scale_sites is not None else num_source_sites
         df = pd.read_csv(csv_path)
 
         if df.isna().any().any():
@@ -214,12 +204,10 @@ class JSDMDataset(Dataset):
 
         species_data = df[species_cols].values.astype(np.float32)
         self._setup_post_load(df, species_data, species_cols, env_cols,
-                              time_col, lat_col, lon_col, has_time,
-                              euclidean_coords)
+                              time_col, lat_col, lon_col, has_time)
 
     def _setup_post_load(self, df, species_data, species_cols, env_cols,
-                         time_col, lat_col, lon_col, has_time,
-                         euclidean_coords):
+                         time_col, lat_col, lon_col, has_time):
         self.species_cols = species_cols
         self.env_cols = env_cols
         self.num_species = len(species_cols)
@@ -241,21 +229,20 @@ class JSDMDataset(Dataset):
             df[env_cols].values.astype(np.float32) if env_cols
             else np.zeros((N, 1), dtype=np.float32)
         )
-        self.euclidean_coords = bool(euclidean_coords)
         self.has_time = bool(has_time)
 
         print(f"Dataset: {N} observations, {self.num_species} species, {self.num_env_vars} env vars")
-        max_sp, max_tp = _bbox_max_distance(self.lats, self.lons, self.times,
-                                            euclidean=self.euclidean_coords)
+        max_sp, max_tp = _bbox_max_distance(self.lats, self.lons, self.times)
         self._max_spatial = max_sp
         self._max_temporal = max_tp if has_time else 0.0
 
-        if self.euclidean_coords:
-            self._knn_index = None
-        else:
-            self._knn_index = _HaversineKNNIndex(self.lats, self.lons)
+        self._knn_index = _HaversineKNNIndex(self.lats, self.lons)
         self._source_pool = None
         self._source_pool_mask = None
+        self._random_exclusion_mask = None
+        self.eval_exclusion_km = 0.0
+        self.eval_exclusion_days = 0.0
+        self.causal_context = False
 
     @property
     def source_pool(self):
@@ -271,10 +258,25 @@ class JSDMDataset(Dataset):
             mask[np.asarray(value)] = True
             self._source_pool_mask = mask
 
+    @property
+    def random_exclusion_rows(self):
+        return self._random_exclusion_mask
+
+    @random_exclusion_rows.setter
+    def random_exclusion_rows(self, value):
+        mask = np.zeros(len(self.lats), dtype=bool)
+        mask[np.asarray(value)] = True
+        self._random_exclusion_mask = mask
+
     def __len__(self):
         return len(self.species_data)
 
-    def _knn_candidates(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
+    def _time_gap(self, idx: int, others: np.ndarray) -> np.ndarray:
+        gap = self.times[idx] - self.times[others]
+        return gap if self.causal_context else np.abs(gap)
+
+    def _knn_candidates(self, idx: int, min_dist: float = 0.0,
+                        min_days: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
         N_total = len(self.lats)
         pool_mask = self._source_pool_mask
         k_query = min(_K_MAX + 1, N_total)
@@ -284,43 +286,39 @@ class JSDMDataset(Dataset):
         while True:
             neigh = self._knn_index.query(self.coords[idx:idx + 1], k_query)[0]
             neigh = neigh[neigh >= 0]
-            keep = neigh != idx
+            sp = haversine_pairs_np(self.lats[idx], self.lons[idx],
+                                    self.lats[neigh], self.lons[neigh])
+            keep = (neigh != idx) & (sp >= min_dist) & (self._time_gap(idx, neigh) >= min_days)
             if pool_mask is not None:
                 keep &= pool_mask[neigh]
-            neigh = neigh[keep]
-            if len(neigh) >= max(self.num_source_sites, self.num_scale_sites) or k_query >= N_total:
+            neigh, sp = neigh[keep], sp[keep]
+            if len(neigh) >= self.num_source_sites or k_query >= N_total:
                 break
             k_query = min(k_query * 2, N_total)
-        sp = haversine_pairs_np(self.lats[idx], self.lons[idx],
-                                self.lats[neigh], self.lons[neigh])
         return neigh, sp
 
-    def _candidates_scalar(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
-        """Neighbour indices + spatial distances for one target (no batching)."""
-        if self._knn_index is None:
-            cand_idx = (self._source_pool if self._source_pool is not None
-                        else np.arange(len(self.lats)))
-            cand_idx = np.asarray(cand_idx)
-            cand_idx = cand_idx[cand_idx != idx]
-            sp = haversine_pairs_np(self.lats[idx], self.lons[idx],
-                                    self.lats[cand_idx], self.lons[cand_idx]) \
-                if not self.euclidean_coords else \
-                np.sqrt((self.lats[cand_idx] - self.lats[idx]) ** 2
-                        + (self.lons[cand_idx] - self.lons[idx]) ** 2).astype(np.float32)
-            return cand_idx, sp
-        return self._knn_candidates(idx)
+    @staticmethod
+    def _random_window(d: np.ndarray) -> float:
+        u = np.random.random()
+        positive = d[d > 0]
+        if u < 0.5 or positive.size == 0:
+            return 0.0
+        lo, hi = np.log(positive.min()), np.log(d.max())
+        return min(float(np.exp(lo + (2.0 * u - 1.0) * (hi - lo))), float(d.max()))
+
+    def _exclusion_window(self, idx: int, d: np.ndarray, eval_value: float) -> float:
+        if self._random_exclusion_mask is None or not self._random_exclusion_mask[idx]:
+            return eval_value
+        return self._random_window(d)
 
     def _candidates_batch(self, indices: list[int]) -> list[tuple[np.ndarray, np.ndarray]]:
         """Neighbour indices + distances for a batch via ONE FAISS query.
 
-        Distribution-identical to calling ``_candidates_scalar`` per index: FAISS
+        Distribution-identical to calling ``_knn_candidates`` per index: FAISS
         ranks (recall ~1.0 in 3D) match the exact nearest, so kept neighbours and
         their order do not depend on batching, and any item too short after the
         shared query falls back to the scalar doubling path.
         """
-        if self._knn_index is None:
-            return [self._candidates_scalar(i) for i in indices]
-
         N_total = len(self.lats)
         pool_mask = self._source_pool_mask
         k_query = min(_K_MAX + 1, N_total)
@@ -330,7 +328,7 @@ class JSDMDataset(Dataset):
         idx_arr = np.asarray(indices)
         neigh = self._knn_index.query(self.coords[idx_arr], k_query)
 
-        need = max(self.num_source_sites, self.num_scale_sites)
+        need = self.num_source_sites
         out: list[tuple[np.ndarray, np.ndarray]] = []
         for b, idx in enumerate(indices):
             nb = neigh[b]
@@ -348,32 +346,20 @@ class JSDMDataset(Dataset):
                 out.append(self._knn_candidates(idx))
         return out
 
-    def _sample_from_candidates(self, idx: int, cand_idx: np.ndarray,
-                                sp: np.ndarray) -> dict[str, Any]:
-        """Weight candidates by distance and draw source sites. Consumes one
-        ``np.random.choice`` — callers must invoke in a fixed index order to keep
-        draws reproducible."""
+    def _select_sources(self, idx: int, cand_idx: np.ndarray,
+                        sp: np.ndarray) -> dict[str, Any]:
         N = self.num_source_sites
-        if self.has_time:
-            tp = np.abs(self.times[cand_idx] - self.times[idx]).astype(np.float32)
+        r = self._exclusion_window(idx, sp, self.eval_exclusion_km)
+        keep = sp >= r
+        cand_idx, sp = cand_idx[keep], sp[keep]
+        tp = self._time_gap(idx, cand_idx)
+        tau = self._exclusion_window(idx, tp, self.eval_exclusion_days)
+        keep = tp >= tau
+        if keep.sum() < N:
+            cand_idx, sp = self._knn_candidates(idx, min_dist=r, min_days=tau)
         else:
-            tp = np.zeros_like(sp)
-
-        n_cand = len(cand_idx)
-        replace = n_cand - 1 < N
-
-        k1 = min(self.num_scale_sites, n_cand)
-        nearest = np.argpartition(sp, k1 - 1)[:k1] if k1 < n_cand else np.arange(n_cand)
-        s_sp = max(float(np.median(sp[nearest])), _positive_floor(sp, self._max_spatial))
-        if self.has_time:
-            s_tp = max(float(np.median(tp[nearest])), _positive_floor(tp, self._max_temporal))
-        else:
-            s_tp = 1.0
-
-        combined = np.sqrt((sp / s_sp) ** 2 + (tp / s_tp) ** 2) if self.has_time else (sp / s_sp)
-        inv_d = 1.0 / (combined + 1e-6)
-        w2 = inv_d / inv_d.sum()
-        source_idx = cand_idx[np.random.choice(n_cand, size=N, replace=replace, p=w2)]
+            cand_idx = cand_idx[keep]
+        source_idx = cand_idx[np.arange(N) % len(cand_idx)]
 
         source_species = np.ascontiguousarray(self.species_data[source_idx].T)
         source_env = self.env_data[source_idx]
@@ -389,15 +375,15 @@ class JSDMDataset(Dataset):
         }
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        cand_idx, sp = self._candidates_scalar(idx)
-        return self._sample_from_candidates(idx, cand_idx, sp)
+        cand_idx, sp = self._knn_candidates(idx)
+        return self._select_sources(idx, cand_idx, sp)
 
     def __getitems__(self, indices: list[int]) -> list[dict[str, Any]]:
         """Batched fetch used by DataLoader: one tree query for the whole batch,
         then per-item sampling in list order — byte-identical to sequential
         ``__getitem__`` for the same RNG state."""
         cands = self._candidates_batch(indices)
-        return [self._sample_from_candidates(i, c, s)
+        return [self._select_sources(i, c, s)
                 for i, (c, s) in zip(indices, cands, strict=True)]
 
 
@@ -407,17 +393,14 @@ class JSDMSparseDataset(JSDMDataset):
         parquet_path: str,
         vocab_path: str,
         num_source_sites: int = 64,
-        num_scale_sites: int | None = None,
         time_col: str = "time",
         lat_col: str = "latitude",
         lon_col: str = "longitude",
         env_cols: list[str] | None = None,
-        euclidean_coords: bool = False,
         no_time: bool = False,
     ):
         Dataset.__init__(self)
         self.num_source_sites = num_source_sites
-        self.num_scale_sites = num_scale_sites if num_scale_sites is not None else num_source_sites
 
         import pyarrow.dataset as pa_ds
 
@@ -462,8 +445,7 @@ class JSDMSparseDataset(JSDMDataset):
         species_data = _SparseSpeciesData(csr)
 
         self._setup_post_load(df, species_data, species_cols, env_cols,
-                              time_col, lat_col, lon_col, has_time,
-                              euclidean_coords)
+                              time_col, lat_col, lon_col, has_time)
 
 
 def csv_to_sparse_parquet(
@@ -512,34 +494,16 @@ class JSDMDataCollator:
                         f"unif range must satisfy 0 <= lo <= hi <= 1; got [{lo}, {hi}]"
                     )
                 return f"unif:{lo},{hi}"
-            if r.startswith("beta:"):
-                try:
-                    a, b = [float(x) for x in r[len("beta:"):].split(",")]
-                except ValueError:
-                    raise ValueError(f"beta params must be 'beta:alpha,beta'; got {r!r}") from None
-                if not (a > 0.0 and b > 0.0):
-                    raise ValueError(f"beta alpha and beta must be > 0; got ({a}, {b})")
-                return f"beta:{a},{b}"
-            raise ValueError(
-                f"mask rate string must be 'unif', 'unif:lo,hi', or 'beta:alpha,beta'; got {r!r}"
-            )
+            raise ValueError(f"mask rate string must be 'unif' or 'unif:lo,hi'; got {r!r}")
         r = float(r)
         if not 0.0 <= r <= 1.0:
-            raise ValueError(f"mask rate must be in [0, 1] or 'unif[:lo,hi]' or 'beta:alpha,beta'; got {r}")
+            raise ValueError(f"mask rate must be in [0, 1] or 'unif[:lo,hi]'; got {r}")
         return r
 
     def _sample_row_rates(self, B, r):
         if isinstance(r, str):
-            if r.startswith("unif:"):
-                lo, hi = [float(x) for x in r[len("unif:"):].split(",")]
-                return torch.rand(B, generator=self.generator) * (hi - lo) + lo
-            if r.startswith("beta:"):
-                a, b = [float(x) for x in r[len("beta:"):].split(",")]
-                if self.generator is not None:
-                    seed = int(torch.randint(0, 2**31 - 1, (1,), generator=self.generator).item())
-                    rng = np.random.default_rng(seed)
-                    return torch.from_numpy(rng.beta(a, b, size=B).astype(np.float32))
-                return torch.from_numpy(np.random.beta(a, b, size=B).astype(np.float32))
+            lo, hi = [float(x) for x in r[len("unif:"):].split(",")]
+            return torch.rand(B, generator=self.generator) * (hi - lo) + lo
         return torch.full((B,), float(r))
 
     @staticmethod
@@ -637,37 +601,9 @@ def compute_dist_info(dataset: "JSDMDataset") -> dict:
         "site_lats":  torch.as_tensor(dataset.lats,  dtype=torch.float32),
         "site_lons":  torch.as_tensor(dataset.lons,  dtype=torch.float32),
         "site_times": torch.as_tensor(dataset.times, dtype=torch.float32),
-        "euclidean":  dataset.euclidean_coords,
         "max_spatial_dist": float(dataset._max_spatial),
         "max_temporal_dist": float(dataset._max_temporal),
     }
-
-
-def grid_block_split(x, y, n_cells=20, train_frac=0.8, test_frac=0.1, seed=42):
-
-    x, y = np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
-    xi = np.floor((x - x.min()) / (np.ptp(x) + 1e-9) * n_cells).clip(0, n_cells - 1).astype(int)
-    yi = np.floor((y - y.min()) / (np.ptp(y) + 1e-9) * n_cells).clip(0, n_cells - 1).astype(int)
-    cell_ids = xi * n_cells + yi
-    unique_cells = np.unique(cell_ids)
-
-    rng = np.random.RandomState(seed)
-    perm = rng.permutation(len(unique_cells))
-    unique_cells = unique_cells[perm]
-
-    n = len(unique_cells)
-    n_test = max(1, round(n * test_frac))
-    n_val  = max(1, round(n * (1 - train_frac - test_frac)))
-    test_cells = set(unique_cells[:n_test])
-    val_cells  = set(unique_cells[n_test : n_test + n_val])
-
-    train_idx = np.where(~np.isin(cell_ids, list(test_cells | val_cells)))[0]
-    val_idx   = np.where( np.isin(cell_ids, list(val_cells)))[0]
-    test_idx  = np.where( np.isin(cell_ids, list(test_cells)))[0]
-
-    n_cells_train = n - n_test - n_val
-    print(f"  Grid {n_cells}×{n_cells} | {n} cells → {n_cells_train} train / {n_val} val / {n_test} test cells")
-    return train_idx, val_idx, test_idx
 
 
 def save_splits(path: str, train_idx, val_idx, test_idx, num_rows: int | None = None,
@@ -739,14 +675,15 @@ def h3_block_split(lats, lons, resolution=2, train_frac=0.8, test_frac=0.1, seed
 
 
 def create_dataloaders(
-    csv_path, batch_size=32, num_source_sites=64, num_scale_sites=None,
+    csv_path, batch_size=32, num_source_sites=64,
     p=0.15,
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None,
-    euclidean_coords=False, no_time=False,
+    no_time=False,
+    train_exclusion=False, eval_exclusion_km=0.0, eval_exclusion_days=0.0,
+    causal_context=False,
     fold_method="random", resolution: int | None = None,
     saved_splits: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
-    restrict_source_pool_with_saved_splits: bool = True,
     vocab_path: str | None = None,
 ):
 
@@ -755,18 +692,14 @@ def create_dataloaders(
             parquet_path=csv_path,
             vocab_path=vocab_path,
             num_source_sites=num_source_sites,
-            num_scale_sites=num_scale_sites,
             env_cols=env_cols,
-            euclidean_coords=euclidean_coords,
             no_time=no_time,
         )
     else:
         dataset = JSDMDataset(
             csv_path=csv_path,
             num_source_sites=num_source_sites,
-            num_scale_sites=num_scale_sites,
             env_cols=env_cols,
-            euclidean_coords=euclidean_coords,
             no_time=no_time,
         )
 
@@ -779,11 +712,8 @@ def create_dataloaders(
         train_indices = np.asarray(train_indices, dtype=np.int64)
         val_indices   = np.asarray(val_indices,   dtype=np.int64)
         test_indices  = np.asarray(test_indices,  dtype=np.int64)
-        source_pool_restricted = restrict_source_pool_with_saved_splits
         split_origin = "saved"
     elif fold_method == "h3":
-        if euclidean_coords:
-            raise ValueError("--fold h3 requires real lat/lon coordinates. Use --fold grid for euclidean datasets.")
         if resolution is None:
             resolution = 2
         if not isinstance(resolution, int) or not (0 <= resolution <= 15):
@@ -793,23 +723,9 @@ def create_dataloaders(
             resolution=resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
         )
         split_origin = "h3"
-        source_pool_restricted = True
-    elif fold_method == "grid":
-        if not euclidean_coords:
-            raise ValueError("--fold grid is for euclidean/simulated datasets. Use --fold h3 for real lat/lon.")
-        if resolution is None:
-            resolution = 20
-        if not isinstance(resolution, int) or resolution < 1:
-            raise ValueError("--resolution for --fold grid must be a positive integer.")
-        train_indices, val_indices, test_indices = grid_block_split(
-            dataset.lats, dataset.lons,
-            n_cells=resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
-        )
-        source_pool_restricted = True
-        split_origin = "grid"
     else:
         if resolution is not None:
-            raise ValueError("--resolution is only valid with --fold {h3,grid}.")
+            raise ValueError("--resolution is only valid with --fold h3.")
         np.random.seed(seed)
         n = len(dataset)
         indices = np.random.permutation(n)
@@ -818,11 +734,14 @@ def create_dataloaders(
         train_indices = indices[:n_train]
         val_indices   = indices[n_train : n - n_test if n_test > 0 else n]
         test_indices  = indices[n - n_test:] if n_test > 0 else np.array([], dtype=int)
-        source_pool_restricted = False
         split_origin = "random"
 
-    if source_pool_restricted:
-        dataset.source_pool = train_indices
+    dataset.source_pool = train_indices
+    if train_exclusion:
+        dataset.random_exclusion_rows = train_indices
+    dataset.eval_exclusion_km = eval_exclusion_km
+    dataset.eval_exclusion_days = eval_exclusion_days
+    dataset.causal_context = causal_context
 
     train_dataset = torch.utils.data.Subset(dataset, train_indices)
     val_dataset   = torch.utils.data.Subset(dataset, val_indices)

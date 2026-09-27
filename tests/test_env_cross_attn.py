@@ -12,7 +12,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from stemlm.model import EnvCrossAttention, JSDMConfig
+from stemlm.model import EnvCrossAttention, EnvSourceModule, JSDMConfig, TargetEnvModule
 
 
 def _reference_forward(mod, hidden_states, env_embeddings):
@@ -30,6 +30,21 @@ def _reference_forward(mod, hidden_states, env_embeddings):
     ctx = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, scale=1.0 / math.sqrt(hd))
     ctx = ctx.transpose(-2, -3).contiguous()
     return ctx.view(*ctx.size()[:-2], mod.all_head_size)
+
+
+def test_env_modules_keep_covariate_levels():
+    torch.manual_seed(1)
+    cfg = JSDMConfig(hidden_size=32, num_attention_heads=4, num_species=4,
+                     num_env_vars=3, num_env_groups=2)
+    target = TargetEnvModule(cfg).eval()
+    source = EnvSourceModule(cfg).eval()
+    scaled = torch.tensor([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]])
+    flat = torch.tensor([[1.0, 1.0, 1.0], [-2.0, -2.0, -2.0]])
+    for rows in (scaled, flat):
+        emb = target(rows).squeeze(1)
+        assert not torch.allclose(emb[0], emb[1], atol=1e-6)
+        pooled = source(rows.unsqueeze(1))
+        assert not torch.allclose(pooled[0], pooled[1], atol=1e-6)
 
 
 def test_env_cross_attn_matches_expand_then_project():

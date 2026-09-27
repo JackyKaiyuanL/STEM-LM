@@ -1,197 +1,93 @@
 # STEM-LM
 
-Joint species distribution model with masked-species pretraining.
+Masked-species Transformer for joint species distribution modelling. Each
+observation is a site–time with a binary vector over species and environmental
+covariates. A random subset of the species is masked and predicted from the
+rest of the vector, from the K nearest other observations in space (their
+species vectors and their environments), and from the target's own environment.
 
-**Input CSV**: `time, latitude, longitude, env_*, species_*` — one row per
-site–time observation. Species are 0/1; env columns must be prefixed `env_*`
-or passed via `--env_cols`. Preparation pipelines for eButterfly, sPlotOpen,
-NEUS, and Monarch live under `data_processing/<dataset>/`, each with its own
-download instructions.
+## Data
 
-## Files
+One CSV per dataset, one row per observation:
 
-| Module | Purpose |
-|---|---|
-| `stemlm/model.py` | Model: species self-attn, ST + env cross-attn, FIRE distance bias. `JSDMConfig.ablation` ∈ `{full, no_st, no_env, no_st_env}`. |
-| `stemlm/data.py` | Dataset, collators (uniform-mask + absence-mask), H3 splits. |
-| `stemlm/train.py` | Training, per-epoch val, end-of-training K-pass-bagged test eval. |
-| `stemlm/metric.py` | AUROC / AUPRC / CBI / Brier / ECE calculations + `bagged_evaluate_at_p`. Library only — no CLI. |
-| `stemlm/cli.py` | `stemlm` command entry point (subcommands). |
-
-## Install
-
-Managed with [uv](https://docs.astral.sh/uv/):
-
-```bash
-uv sync                 # create .venv, install stemlm + deps
-uv run stemlm --help    # or: source .venv/bin/activate && stemlm --help
+```
+time, latitude, longitude, env_*, <species columns>
 ```
 
-## Quickstart
+`time` is an ISO date or a number of days; `latitude`/`longitude` are degrees.
+Environmental columns carry the `env_` prefix or are named with `--env_cols`;
+every other column is a species with 0/1 entries. Preparation scripts for
+eButterfly, NEUS, sPlotOpen and the monarch grid are under
+`data_processing/`.
+
+## Install and run
 
 ```bash
-stemlm train data.csv \
-    --output_dir ./out \
-    --p unif:0.0,1.0 \
-    --temporal_fire_init_periods 365 182
+uv sync
+uv run stemlm train data.csv --output_dir out --splits_path splits.json \
+    --p unif:0.0,1.0 --temporal_fire_init_periods 365 182 122 91 \
+    --train_exclusion --mixed_precision bf16 --temperature_scaling
 ```
 
-Defaults to focal loss (α=0.25, γ=2.0). Saves two checkpoints
-(`best_model.pt` by val-AUROC, `best_model_by_cbi.pt` by val-CBI), evaluates
-both, and reports per-p AUROC / AUPRC / CBI / Brier / ECE on a uniform-mask
-block and a presence-only (absence-mask) block.
+`uv run pytest` runs the test suite.
 
-For BCE, pass `--loss_type bce`.
+## Sources
 
-## Key options
+For every target the K nearest training rows (`--num_source_sites`, default 64)
+are the sources; no held-out row is ever a source. During training,
+`--train_exclusion` drops candidate sources within a radius and, independently,
+within a time window of the target: each is 0 with probability 1/2 and otherwise
+drawn log-uniformly between the target's nearest and farthest candidate. This
+puts the geometry of evaluation and deployment into training without a tuned
+scale. At evaluation `--eval_exclusion_km` and `--eval_exclusion_days` apply a
+fixed radius and window to every validation and test target; sweeping them
+gives performance as a function of distance to the nearest data.
+`--causal_context` restricts sources to earlier dates.
 
-**Loss** (defaults shown)
-- `--loss_type {bce,focal}` `focal`
-- `--focal_alpha 0.25 --focal_gamma 2.0` (RetinaNet defaults)
-- `--class_weighting [β]` opt-in. Pass alone → β=0.999. BCE only.
+## Splits
 
-**Mask rate**
-- `--p` per-row mask rate. Float in `[0,1]`, `unif[:lo,hi]` (Uniform per row),
-  or `beta:α,β` (Beta per row). Default `0.15`. Use `unif:0.0,1.0` for variable-p training.
-- `--val_p_list 0.25 0.5 0.75 1.0` per-epoch fixed-p val rates.
-- `--absence_mask_p_list 0.25 0.5 0.75 1.0` rates for the presence-only test block.
-- `--no_absence_mask_eval` to skip the presence-only block.
-- `--temperature_scaling` adds Guo 2017 post-hoc temperature scaling: fit T\* on val logits at p=1.00, apply at every test p. Saves `temperature.json` (T\* + per-p T-cal ECE) and a `tcal_ece` column in `test_results.csv`. Apply at inference with `sigmoid(logits / T*)`.
+`--fold h3 --resolution R` assigns whole H3 cells to train, validation and test
+(`--train_frac`, `--test_frac`). Resolution 2 (cells of about 160 km edge)
+tests extrapolation to unsampled regions; a fine resolution tests prediction at
+new sites near data. `--splits_path` reuses a saved split; `--fold random` is
+for smoke tests.
 
-**Splits** (block CV by default)
-- `--fold {h3,grid,random}` `h3`
-- `--resolution` block resolution (H3: `0..15`, default `2`; grid: side length, default `20`).
-- `--splits_path` reuse a prior `splits.json` (keeps train/val/test identical across runs).
-- `--train_frac 0.8 --test_frac 0.1` (val = remainder)
-- `--num_source_sites 64`
+## Model and training options
 
-**Model**
-- `--hidden_size 256 --num_attention_heads 4 --num_hidden_layers 3 --intermediate_size 1024`
-- `--num_env_groups 5 --dropout 0.1`
-- `--temporal_fire_init_periods 365 182 ...` periods (days) for sin/cos input added to FIRE temporal bias. Omit to disable.
-- `--per_species_env_rank 8` parallel per-species env head (low-rank A·B + bias on raw target_env).
-- `--no_time` purely spatial.
-- `--euclidean_coords` non-geographic 2D coords.
+| Option | Default | Meaning |
+|---|---|---|
+| `--hidden_size`, `--num_attention_heads`, `--num_hidden_layers`, `--intermediate_size` | 256, 4, 3, 1024 | Transformer size |
+| `--num_env_groups` | 5 | learned queries pooling the sources' environments |
+| `--per_species_env_rank` | 8 | rank of the per-species linear environmental head |
+| `--temporal_fire_init_periods` | none | periods (days) of the periodic terms in the temporal distance bias; omit for a static dataset |
+| `--no_time` | off | ignore the time column |
+| `--ablation` | `full` | `no_st`, `no_env` or `no_st_env` remove cross-attention pathways |
+| `--p` | 0.15 | mask rate per row: a number, `unif:lo,hi` or `beta:a,b` |
+| `--loss_type` | `focal` | `focal` (`--focal_alpha 0.25 --focal_gamma 2.0`) or `bce` |
+| `--batch_size`, `--num_epochs`, `--learning_rate`, `--weight_decay` | 32, 50, 1e-4, 0.01 | AdamW with cosine decay |
+| `--mixed_precision` | `none` | `bf16` or `fp16` |
+| `--grad_accum_steps`, `--gradient_checkpointing`, `--compile` | 1, off, off | memory and speed |
+| `--val_p_list` | 0.25 0.5 0.75 1.0 | mask rates for validation and test |
+| `--absence_mask_p_list`, `--no_absence_mask_eval` | 0.25 0.5 0.75 1.0 | presence-only evaluation block |
+| `--temperature_scaling` | off | fit a temperature on validation logits at p = 1 and report calibrated ECE |
+| `--seed`, `--num_workers`, `--output_dir` | 42, cores, `./STEMLM_output` | |
 
-**Training**
-- `--batch_size 32 --num_epochs 50 --learning_rate 1e-4 --weight_decay 0.01`
-- `--max_grad_norm 1.0 --gradient_checkpointing`
-- `--mixed_precision {none,bf16,fp16}` `none`
-- `--grad_accum_steps 1` effective batch = `batch_size × grad_accum_steps × world_size`.
-- `--test_bag_K 10` K-pass bagging at end of training.
-
-**Ablation**
-- `--ablation {full,no_st,no_env,no_st_env}` `full`.
-
-## Distributed (multi-GPU)
-
-Launch with `torchrun`; `--batch_size` is per-GPU. Auto-detected via
-`LOCAL_RANK` / `WORLD_SIZE`; without `torchrun` it's a single-process no-op.
-Preemption-safe: rank 0 writes `latest_checkpoint.pt` every epoch and resumes
-on resubmission.
-
-```bash
-torchrun --nproc_per_node=4 -m stemlm.cli train data.csv \
-    --output_dir ./out --mixed_precision bf16 --batch_size 32 [args]
-```
-
-## Reproducing paper results
-
-All STEM-LM runs use H3 resolution-2 spatial splits (seed 42); deep-learning runs use three training seeds (41, 42, 43), and the mean across seeds is reported in the paper. Default training hyperparameters: focal loss (γ=2, α=0.25), `--p unif:0.0,1.0`, batch size 128, bf16, AdamW, cosine LR.
-
-**eButterfly — main runs (Tables 3, 5)**
-```bash
-for s in 41 42 43; do
-  stemlm train data/ebutterfly_na_2011_2025.csv \
-      --output_dir ./out/ebutterfly_focal_seed${s} \
-      --splits_path data/ebutterfly_splits.json \
-      --p unif:0.0,1.0 --temporal_fire_init_periods 365 182 122 91 \
-      --num_epochs 100 --batch_size 128 --mixed_precision bf16 \
-      --temperature_scaling --seed ${s}
-done
-
-# BCE variant (Table 3 STEM-LM (B))
-for s in 41 42 43; do
-  stemlm train data/ebutterfly_na_2011_2025.csv \
-      --output_dir ./out/ebutterfly_bce_seed${s} \
-      --splits_path data/ebutterfly_splits.json \
-      --loss_type bce --p unif:0.0,1.0 \
-      --temporal_fire_init_periods 365 182 122 91 \
-      --num_epochs 100 --batch_size 128 --mixed_precision bf16 \
-      --temperature_scaling --seed ${s}
-done
-```
-
-**eButterfly — cross-attention head ablation (Table 1)**
-```bash
-for mode in full no_st no_env no_st_env; do
-  for s in 41 42 43; do
-    stemlm train data/ebutterfly_na_2011_2025.csv \
-        --ablation ${mode} \
-        --output_dir ./out/ablation/${mode}_seed${s} \
-        --splits_path data/ebutterfly_splits.json \
-        --p unif:0.0,1.0 --temporal_fire_init_periods 365 182 122 91 \
-        --num_epochs 100 --batch_size 128 --mixed_precision bf16 \
-        --seed ${s}
-  done
-done
-```
-
-**eButterfly — source-site count ablation (Table 2)**
-```bash
-for N in 32 64 128; do
-  for s in 41 42 43; do
-    stemlm train data/ebutterfly_na_2011_2025.csv \
-        --num_source_sites ${N} \
-        --output_dir ./out/sites${N}_seed${s} \
-        --splits_path data/ebutterfly_splits.json \
-        --p unif:0.0,1.0 --temporal_fire_init_periods 365 182 122 91 \
-        --num_epochs 100 --batch_size 128 --mixed_precision bf16 \
-        --seed ${s}
-  done
-done
-```
-
-**sPlotOpen — main runs (Tables 4, 5)**
-```bash
-for s in 41 42 43; do
-  stemlm train data/splotopen_global.csv \
-      --output_dir ./out/splotopen_focal_seed${s} \
-      --splits_path data/splotopen_global_splits.json \
-      --no_time --p unif:0.0,1.0 \
-      --num_epochs 50 --batch_size 128 --mixed_precision bf16 \
-      --temperature_scaling --seed ${s}
-done
-
-# BCE variant
-for s in 41 42 43; do
-  stemlm train data/splotopen_global.csv \
-      --output_dir ./out/splotopen_bce_seed${s} \
-      --splits_path data/splotopen_global_splits.json \
-      --loss_type bce --no_time --p unif:0.0,1.0 \
-      --num_epochs 50 --batch_size 128 --mixed_precision bf16 \
-      --temperature_scaling --seed ${s}
-done
-```
-
-**Baselines** — see `benchmarks/{statistical_SDM,MaskSDM,CISO}/<dataset>/`. Each subfolder has a self-contained notebook (or script) plus per-baseline README with upstream-repo clone hooks and the exact data-staging requirements.
+Multi-GPU: `torchrun --nproc_per_node=N -m stemlm.cli train ...`; batch size is
+per GPU; `latest_checkpoint.pt` resumes an interrupted run.
 
 ## Outputs
 
-Each `--output_dir` gets:
-- `best_model.pt` (best-by-val-AUROC) and `best_model_by_cbi.pt` (best-by-val-CBI)
-- `latest_checkpoint.pt` (preemption resume) + periodic `checkpoint_epoch{N}.pt`
-- `config.json`, `species_names.json`, `splits.json`
-- `training_log.csv` per-epoch metrics
-- `test_results.csv` flat test metrics by mask scheme × p (includes `tcal_ece` when `--temperature_scaling`)
-- `per_species_auc.csv` per-species AUROC / AUPRC / CBI per p
-- `ablation_summary.json` test metrics for both checkpoints + both mask schemes
-- `cooccurrence_matrix.npy` learned species-species attention
-- `temperature.json` (only with `--temperature_scaling`) — `T_star`, `fitted_at_p`, and per-p T-cal ECE for both mask schemes
+`best_model.pt` (selected by validation AUROC averaged over `--val_p_list`),
+`best_model_by_cbi.pt`, `config.json`, `species_names.json`, `splits.json`,
+`training_log.csv`, `test_results.csv` and `per_species_auc.csv` (per masking
+rate and mask scheme), `ablation_summary.json`, and `temperature.json` with
+`--temperature_scaling`. Evaluation is deterministic: sources are fixed and
+masks are seeded per batch.
 
-## Inference
+## Library use
 
-`stemlm.metric` is a library; import `bagged_evaluate_at_p`,
-`compute_per_species_metrics`, `summarize_per_species_metrics`. Pass
-`--splits_path <run_dir>/splits.json` so source-pool matches training rows;
-species ordering must match the run's `species_names.json`.
+`stemlm.metric.evaluate_at_p` evaluates a model on a set of rows at one mask
+rate; `compute_per_species_metrics` and `summarize_per_species_metrics` give
+per-species and mean AUROC, AUPRC, CBI, Brier and ECE. Load `config.json` into
+`JSDMConfig`, set `dataset.source_pool` to the run's training rows, and keep the
+species order of `species_names.json`.

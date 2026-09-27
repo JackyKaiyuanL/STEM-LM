@@ -5,6 +5,8 @@ __pycache__/
 /data
 /docs/superpowers/
 /.venv
+/benchmarks/*/output/
+/data_processing/*/output/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
