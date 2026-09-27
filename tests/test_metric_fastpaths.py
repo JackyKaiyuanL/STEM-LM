@@ -7,11 +7,21 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from stemlm.metric import (
     auc_roc_and_pr,
     compute_per_species_metrics,
-    safe_auc_pr,
-    safe_auc_roc,
     safe_cbi,
     safe_ece,
 )
+
+
+def safe_auc_roc(labels, preds):
+    if labels.size == 0 or len(set(labels.tolist())) < 2 or np.isnan(preds).any():
+        return float("nan")
+    return float(roc_auc_score(labels, preds))
+
+
+def safe_auc_pr(labels, preds):
+    if labels.size == 0 or labels.sum() in (0, labels.size) or np.isnan(preds).any():
+        return float("nan")
+    return float(average_precision_score(labels, preds))
 
 
 def _ece_maskwise(labels, preds, n_bins=15):

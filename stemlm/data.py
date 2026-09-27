@@ -3,10 +3,11 @@ import math
 import os
 from typing import Any
 
+import h3
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 EARTH_RADIUS_KM = 6371.0
 
@@ -74,7 +75,6 @@ class _HaversineKNNIndex:
 
 def haversine_pairs_np(lat_a: np.ndarray, lon_a: np.ndarray,
                        lat_b: np.ndarray, lon_b: np.ndarray) -> np.ndarray:
-                       
     lat_a = np.radians(np.asarray(lat_a, dtype=np.float64))
     lon_a = np.radians(np.asarray(lon_a, dtype=np.float64))
     lat_b = np.radians(np.asarray(lat_b, dtype=np.float64))
@@ -83,19 +83,6 @@ def haversine_pairs_np(lat_a: np.ndarray, lon_a: np.ndarray,
     dlon = lon_a - lon_b
     a = np.sin(dlat / 2.0) ** 2 + np.cos(lat_a) * np.cos(lat_b) * np.sin(dlon / 2.0) ** 2
     return (EARTH_RADIUS_KM * 2.0 * np.arcsin(np.sqrt(a))).astype(np.float32)
-
-
-def haversine_pairs_torch(lat_a: torch.Tensor, lon_a: torch.Tensor,
-                          lat_b: torch.Tensor, lon_b: torch.Tensor) -> torch.Tensor:
-                          
-    lat_a = torch.deg2rad(lat_a)
-    lon_a = torch.deg2rad(lon_a)
-    lat_b = torch.deg2rad(lat_b)
-    lon_b = torch.deg2rad(lon_b)
-    dlat = lat_a - lat_b
-    dlon = lon_a - lon_b
-    a = torch.sin(dlat / 2.0) ** 2 + torch.cos(lat_a) * torch.cos(lat_b) * torch.sin(dlon / 2.0) ** 2
-    return EARTH_RADIUS_KM * 2.0 * torch.asin(torch.sqrt(a.clamp(min=0.0)))
 
 
 def _bbox_max_distance(lats: np.ndarray, lons: np.ndarray, times: np.ndarray):
@@ -107,8 +94,7 @@ def _bbox_max_distance(lats: np.ndarray, lons: np.ndarray, times: np.ndarray):
     c_lon = np.array([lon_min, lon_max, lon_min, lon_max], dtype=np.float64)
     i, j = np.triu_indices(4, k=1)
     max_sp = float(haversine_pairs_np(c_lat[i], c_lon[i], c_lat[j], c_lon[j]).max())
-    max_tp = float(times.max() - times.min()) if len(times) else 0.0
-    return max_sp, max_tp
+    return max_sp, float(times.max() - times.min())
 
 
 def _normalize_time_col(df: pd.DataFrame, time_col: str, no_time: bool) -> bool:
@@ -137,12 +123,7 @@ def _list_column_to_csr_arrays(column) -> tuple[np.ndarray, np.ndarray]:
     A list array stores one offsets buffer plus one flat values buffer — the same
     layout CSR wants — so this is buffer arithmetic rather than a per-row loop.
     """
-    import pyarrow as pa
-
     arr = column.combine_chunks()
-    if isinstance(arr, pa.ChunkedArray):
-        arr = (arr.chunk(0) if arr.num_chunks == 1
-               else pa.concat_arrays([c for c in arr.iterchunks()]))
     if arr.null_count:
         raise ValueError("species_idx contains nulls; expected a list per row")
 
@@ -150,8 +131,7 @@ def _list_column_to_csr_arrays(column) -> tuple[np.ndarray, np.ndarray]:
     values = arr.values.to_numpy(zero_copy_only=False)
     # A sliced array's offsets do not start at 0; rebase so they index `values`.
     start = int(offsets[0])
-    if start:
-        offsets = offsets - start
+    offsets = offsets - start
     values = values[start:start + int(offsets[-1])]
     return offsets, values.astype(np.int32, copy=False)
 
@@ -227,9 +207,7 @@ class JSDMDataset(Dataset):
         self.has_time = bool(has_time)
 
         print(f"Dataset: {N} observations, {self.num_species} species, {self.num_env_vars} env vars")
-        max_sp, max_tp = _bbox_max_distance(self.lats, self.lons, self.times)
-        self._max_spatial = max_sp
-        self._max_temporal = max_tp if has_time else 0.0
+        self._max_spatial, self._max_temporal = _bbox_max_distance(self.lats, self.lons, self.times)
 
         self._knn_index = _HaversineKNNIndex(self.lats, self.lons)
         self._source_pool = None
@@ -430,8 +408,7 @@ class JSDMSparseDataset(JSDMDataset):
         has_time = _normalize_time_col(df, time_col, no_time)
         coord_cols = ([time_col] if has_time else []) + [lat_col, lon_col]
         if env_cols is None:
-            env_cols = [c for c in df.columns
-                        if c not in coord_cols and c != "species_idx" and c.startswith("env_")]
+            env_cols = [c for c in df.columns if c not in coord_cols and c.startswith("env_")]
         nan_cols = [c for c in coord_cols if df[c].isna().any()]
         if nan_cols:
             raise ValueError("NaNs found in non-covariate columns: " + ", ".join(nan_cols))
@@ -444,31 +421,6 @@ class JSDMSparseDataset(JSDMDataset):
 
         self._setup_post_load(df, species_data, species_cols, env_cols,
                               time_col, lat_col, lon_col, has_time)
-
-
-def csv_to_sparse_parquet(
-    csv_path: str,
-    parquet_out: str,
-    vocab_out: str,
-    time_col: str = "time",
-    lat_col: str = "latitude",
-    lon_col: str = "longitude",
-) -> None:
-    df = pd.read_csv(csv_path)
-    coord_cols = [c for c in (time_col, lat_col, lon_col) if c in df.columns]
-    env_cols = [c for c in df.columns if c not in coord_cols and c.startswith("env_")]
-    species_cols = [c for c in df.columns if c not in coord_cols and c not in env_cols]
-
-    species_arr = df[species_cols].values.astype(bool)
-    species_idx_per_row = [np.where(row)[0].astype(np.int32) for row in species_arr]
-
-    out_df = df[coord_cols + env_cols].copy()
-    out_df["species_idx"] = species_idx_per_row
-    out_df.to_parquet(parquet_out, index=False)
-
-    os.makedirs(os.path.dirname(os.path.abspath(vocab_out)) or ".", exist_ok=True)
-    with open(vocab_out, "w") as f:
-        json.dump(species_cols, f)
 
 
 class JSDMDataCollator:
@@ -579,9 +531,8 @@ class FixedPValCollator(_PerBatchSeededCollator):
         return self._finalize(batch, masked)
 
 
-def build_val_loaders_fixed_p(dataset, val_indices, dist_info, p_values,
+def build_val_loaders_fixed_p(dataset, val_indices, p_values,
                                batch_size, num_workers=0, base_seed=0):
-    from torch.utils.data import DataLoader, Subset
     subset = Subset(dataset, val_indices)
     loaders = []
     for i, p in enumerate(p_values):
@@ -604,11 +555,10 @@ def compute_dist_info(dataset: "JSDMDataset") -> dict:
     }
 
 
-def save_splits(path: str, train_idx, val_idx, test_idx, num_rows: int | None = None,
+def save_splits(path: str, train_idx, val_idx, test_idx, num_rows: int,
                 meta: dict | None = None) -> None:
-
     payload = {
-        "num_rows": int(num_rows) if num_rows is not None else None,
+        "num_rows": int(num_rows),
         "meta":     meta or {},
         "train":    [int(x) for x in np.asarray(train_idx).ravel()],
         "val":      [int(x) for x in np.asarray(val_idx).ravel()],
@@ -619,13 +569,11 @@ def save_splits(path: str, train_idx, val_idx, test_idx, num_rows: int | None = 
         json.dump(payload, f)
 
 
-def load_splits(path: str, expected_num_rows: int | None = None
-                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    
+def load_splits(path: str, expected_num_rows: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     with open(path) as f:
         payload = json.load(f)
     saved_n = payload.get("num_rows")
-    if expected_num_rows is not None and saved_n is not None and saved_n != expected_num_rows:
+    if saved_n is not None and saved_n != expected_num_rows:
         raise ValueError(
             f"Split file at {path} was built for {saved_n} rows but the current "
             f"dataset has {expected_num_rows}. Splits are row-index based; the CSV "
@@ -639,15 +587,8 @@ def load_splits(path: str, expected_num_rows: int | None = None
 
 
 def h3_block_split(lats, lons, resolution=2, train_frac=0.8, test_frac=0.1, seed=42):
-    
-    try:
-        import h3 as h3lib
-    except ImportError:
-        raise ImportError(
-            "h3 package required for --fold h3. Install with: uv add h3"
-        ) from None
-    cells = np.array([h3lib.latlng_to_cell(float(lat), float(lon), resolution)
-                      for lat, lon in zip(lats, lons, strict=False)])
+    cells = np.array([h3.latlng_to_cell(float(lat), float(lon), resolution)
+                      for lat, lon in zip(lats, lons)])
     # Label each row by its cell's rank among the sorted unique cells, then work
     # in those integer codes: membership tests over 71M cell *strings* cost
     # minutes, over int codes they are milliseconds. codes[i] == j exactly when
@@ -681,10 +622,9 @@ def create_dataloaders(
     train_exclusion=False, eval_exclusion_km=0.0, eval_exclusion_days=0.0,
     causal_context=False,
     fold_method="random", resolution: int | None = None,
-    saved_splits: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    splits_path: str | None = None,
     vocab_path: str | None = None,
 ):
-
     if vocab_path is not None:
         dataset = JSDMSparseDataset(
             parquet_path=csv_path,
@@ -701,20 +641,13 @@ def create_dataloaders(
             no_time=no_time,
         )
 
-    print("Computing distance info...")
     dist_info = compute_dist_info(dataset)
 
-    
-    if saved_splits is not None:
-        train_indices, val_indices, test_indices = saved_splits
-        train_indices = np.asarray(train_indices, dtype=np.int64)
-        val_indices   = np.asarray(val_indices,   dtype=np.int64)
-        test_indices  = np.asarray(test_indices,  dtype=np.int64)
+    if splits_path is not None:
+        train_indices, val_indices, test_indices = load_splits(splits_path, expected_num_rows=len(dataset))
         split_origin = "saved"
     elif fold_method == "h3":
-        if resolution is None:
-            resolution = 2
-        if not isinstance(resolution, int) or not (0 <= resolution <= 15):
+        if not 0 <= resolution <= 15:
             raise ValueError("--resolution for --fold h3 must be an integer in [0, 15].")
         train_indices, val_indices, test_indices = h3_block_split(
             dataset.lats, dataset.lons,
@@ -730,8 +663,8 @@ def create_dataloaders(
         n_train = int(n * train_frac)
         n_test  = int(n * test_frac)
         train_indices = indices[:n_train]
-        val_indices   = indices[n_train : n - n_test if n_test > 0 else n]
-        test_indices  = indices[n - n_test:] if n_test > 0 else np.array([], dtype=int)
+        val_indices   = indices[n_train:n - n_test]
+        test_indices  = indices[n - n_test:]
         split_origin = "random"
 
     dataset.source_pool = train_indices
@@ -742,26 +675,14 @@ def create_dataloaders(
     dataset.eval_exclusion_days = eval_exclusion_days
     dataset.causal_context = causal_context
 
-    train_dataset = torch.utils.data.Subset(dataset, train_indices)
-    val_dataset   = torch.utils.data.Subset(dataset, val_indices)
-    test_dataset  = torch.utils.data.Subset(dataset, test_indices) if len(test_indices) > 0 else None
-
-    collator = JSDMDataCollator(p=p, seed=seed)
-
-    train_shuffle_gen = torch.Generator().manual_seed(int(seed))
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                               collate_fn=collator, num_workers=num_workers, pin_memory=True,
-                               worker_init_fn=seed_worker, generator=train_shuffle_gen,
-                               persistent_workers=num_workers > 0)
-    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                               collate_fn=collator, num_workers=num_workers, pin_memory=True,
-                               worker_init_fn=seed_worker)
-    test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
-                               collate_fn=collator, num_workers=num_workers, pin_memory=True,
-                               worker_init_fn=seed_worker) if test_dataset else None
+    train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, shuffle=True,
+                              collate_fn=JSDMDataCollator(p=p, seed=seed), num_workers=num_workers,
+                              pin_memory=True, worker_init_fn=seed_worker,
+                              generator=torch.Generator().manual_seed(int(seed)),
+                              persistent_workers=num_workers > 0)
 
     print(f"Split ({split_origin}): "
           f"{len(train_indices)} train / {len(val_indices)} val / {len(test_indices)} test")
 
     splits = {"train": train_indices, "val": val_indices, "test": test_indices}
-    return train_loader, val_loader, test_loader, dataset, dist_info, splits
+    return train_loader, dataset, dist_info, splits

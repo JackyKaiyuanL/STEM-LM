@@ -14,11 +14,8 @@ def _reference(mod, hidden_states, basis, source_ids, bias):
     emb = basis.reshape(-1, basis.size(-1))[flat].view(*source_ids.shape, -1)
     k = mod.transpose_for_scores(mod.key(emb))
     v = mod.transpose_for_scores(mod.value(emb))
-    scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(mod.attention_head_size)
-    if bias is not None:
-        scores = scores + bias
-    probs = F.softmax(scores, dim=-1)
-    return mod._merge_heads(torch.matmul(probs, v)), probs
+    scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(mod.attention_head_size) + bias
+    return mod._merge_heads(torch.matmul(F.softmax(scores, dim=-1), v))
 
 
 def test_full_model_forward_runs_with_gather():
@@ -40,8 +37,8 @@ def test_full_model_forward_runs_with_gather():
         site_lons=torch.rand(NTOT) * 10 - 100,
         site_times=torch.rand(NTOT) * 100,
     )
-    assert out.last_hidden_state.shape == (B, S, 1, cfg.hidden_size)
-    out.last_hidden_state.sum().backward()
+    assert out.shape == (B, S, 1, cfg.hidden_size)
+    out.sum().backward()
     grad = model.target_input.species_embedding.weight.grad
     assert grad is not None and torch.isfinite(grad).all()
 
@@ -57,12 +54,9 @@ def test_collapsed_matches_explicit_reference():
     source_ids = torch.randint(0, 3, (B, S, N), dtype=torch.uint8)
     bias = torch.randn(B, S, 1, T, N)
 
-    for b in (bias, None):
-        ref_ctx, ref_probs = _reference(mod, hidden_states, basis, source_ids, b)
-        got_ctx, got_probs = mod(hidden_states, (basis, source_ids.long()),
-                                 st_dist_bias=b, output_attentions=True)
-        torch.testing.assert_close(got_ctx, ref_ctx, rtol=1e-4, atol=1e-5)
-        torch.testing.assert_close(got_probs, ref_probs, rtol=1e-4, atol=1e-5)
+    ref = _reference(mod, hidden_states, basis, source_ids, bias)
+    got = mod(hidden_states, (basis, source_ids.long()), bias)
+    torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
 
 
 def test_gate_threshold_scales_the_context():
@@ -78,16 +72,14 @@ def test_gate_threshold_scales_the_context():
 
     with torch.no_grad():
         mod.species_gate_threshold.fill_(-50.0)
-    open_gate = mod(hidden_states, (basis, source_ids), st_dist=st_dist)[0]
+    open_gate = mod(hidden_states, (basis, source_ids), st_dist)
     with torch.no_grad():
         mod.species_gate_threshold.fill_(50.0)
-    closed_gate = mod(hidden_states, (basis, source_ids), st_dist=st_dist)[0]
-    ungated = mod(hidden_states, (basis, source_ids), st_dist=None)[0]
+    closed_gate = mod(hidden_states, (basis, source_ids), st_dist)
 
     torch.testing.assert_close(closed_gate, mod.output(torch.zeros(B, S, 1, mod.output.dense.in_features)),
                                rtol=0, atol=1e-6)
     assert not torch.allclose(open_gate, closed_gate, atol=1e-6)
-    assert not torch.allclose(open_gate, ungated, atol=1e-6)
 
 
 def test_gate_responds_to_a_uniform_bias_shift():
@@ -111,7 +103,7 @@ def test_species_attention_matches_explicit_reference():
     B, T, S, H = 3, 2, 17, 64
     x = torch.randn(B, T, S, H)
 
-    got = mod(x)[0]
+    got = mod(x)
 
     q = mod.transpose_for_scores(mod.query(x))
     k = mod.transpose_for_scores(mod.key(x))
@@ -131,8 +123,8 @@ def test_species_attention_independent_across_leading_dims():
     cfg = JSDMConfig(hidden_size=32, num_attention_heads=4, num_species=9)
     mod = SpeciesSelfAttention(cfg).eval()
     x = torch.randn(4, 3, 9, 32)
-    full = mod(x)[0]
+    full = mod(x)
     for b in range(4):
         for t in range(3):
-            one = mod(x[b:b + 1, t:t + 1])[0]
+            one = mod(x[b:b + 1, t:t + 1])
             torch.testing.assert_close(one[0, 0], full[b, t], rtol=1e-4, atol=1e-5)

@@ -1,4 +1,3 @@
-
 import os
 from concurrent.futures import ThreadPoolExecutor
 
@@ -7,7 +6,6 @@ import torch
 import torch.nn.functional as F
 from scipy.special import expit
 from scipy.stats import spearmanr
-from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
@@ -16,22 +14,6 @@ from stemlm.data import FixedPValCollator, seed_worker
 # Species metrics are independent; cap the pool so a many-species run does
 # not spawn hundreds of threads on a large node.
 _METRIC_MAX_WORKERS = 32
-
-
-def safe_auc_roc(labels: np.ndarray, preds: np.ndarray) -> float:
-    if labels.size == 0 or len(set(labels.tolist())) < 2:
-        return float("nan")
-    if np.isnan(preds).any():
-        return float("nan")
-    return float(roc_auc_score(labels, preds))
-
-
-def safe_auc_pr(labels: np.ndarray, preds: np.ndarray) -> float:
-    if labels.size == 0 or labels.sum() == 0 or labels.sum() == labels.size:
-        return float("nan")
-    if np.isnan(preds).any():
-        return float("nan")
-    return float(average_precision_score(labels, preds))
 
 
 def auc_roc_and_pr(labels: np.ndarray, preds: np.ndarray) -> tuple[float, float]:
@@ -141,8 +123,6 @@ def compute_per_species_metrics(logits: np.ndarray,
                                 labels: np.ndarray,
                                 max_workers: int | None = None,
                                 ) -> dict[str, dict[int, float]]:
-    if logits.shape != labels.shape:
-        raise ValueError(f"logits {logits.shape} != labels {labels.shape}")
     S = logits.shape[1]
     if max_workers is None:
         max_workers = min(_METRIC_MAX_WORKERS, os.cpu_count() or 1, max(S, 1))
@@ -184,8 +164,7 @@ def summarize_per_species_metrics(per_sp: dict[str, dict[int, float]]) -> dict[s
         "n_species":    len(aucs),
     }
 
-def run_forward(model, batch, dist_info, device, output_attentions=False):
-    batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+def run_forward(model, batch, dist_info, **loss_kw):
     return model(
         input_ids=batch["input_ids"],
         source_ids=batch["source_ids"],
@@ -193,15 +172,14 @@ def run_forward(model, batch, dist_info, device, output_attentions=False):
         target_site_idx=batch["target_site_idx"],
         env_data=batch["env_data"],
         target_env=batch["target_env"],
-        labels=batch.get("labels"),
         site_lats=dist_info["site_lats"],
         site_lons=dist_info["site_lons"],
         site_times=dist_info["site_times"],
-        output_attentions=output_attentions,
+        **loss_kw,
     )
 
 
-def _move_dist_info(dist_info, device):
+def move_dist_info_to_device(dist_info, device):
     out = dict(dist_info)
     for k in ("site_lats", "site_lons", "site_times"):
         out[k] = out[k].to(device)
@@ -214,67 +192,11 @@ def evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float,
                   num_workers: int = 0, base_seed: int = 0,
                   amp_dtype=None, distributed_sampler: bool = False,
                   collator_cls=None, temperature: float = 1.0) -> dict:
-    model.eval()
-    use_amp = amp_dtype is not None and device.type == "cuda"
-    dist_info_dev = _move_dist_info(dist_info, device)
-
-    logits_for_idx: dict[int, np.ndarray] = {}
-    label_for_idx: dict[int, np.ndarray] = {}
-
-    is_distributed = bool(distributed_sampler) and torch.distributed.is_initialized()
-
-    mask_seed = base_seed + round(p_value * 1000)
-    cls = collator_cls if collator_cls is not None else FixedPValCollator
-    collator = cls(p=p_value, base_seed=mask_seed)
-    subset = Subset(dataset, eval_indices)
-
-    np.random.seed(mask_seed)
-    torch.manual_seed(mask_seed)
-    if is_distributed:
-        sampler = DistributedSampler(subset, shuffle=False)
-        loader = DataLoader(subset, batch_size=batch_size, sampler=sampler,
-                            collate_fn=collator, num_workers=num_workers, pin_memory=True,
-                            worker_init_fn=seed_worker)
-    else:
-        loader = DataLoader(subset, batch_size=batch_size, shuffle=False,
-                            collate_fn=collator, num_workers=num_workers, pin_memory=True,
-                            worker_init_fn=seed_worker)
-
-    for batch in loader:
-        if use_amp:
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                out = run_forward(model, batch, dist_info_dev, device)
-        else:
-            out = run_forward(model, batch, dist_info_dev, device)
-        z = out.logits.float().squeeze(-1).cpu().numpy()
-        labels = batch["labels"].squeeze(-1).cpu().numpy()
-        target_idx = batch["target_site_idx"].squeeze(-1).cpu().numpy()
-        for b, ti in enumerate(target_idx):
-            logits_for_idx[int(ti)] = z[b].astype(np.float64) / temperature
-            label_for_idx[int(ti)] = labels[b]
-
-    if is_distributed:
-        objs = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(objs, (logits_for_idx, label_for_idx))
-        logits_for_idx, label_for_idx = {}, {}
-        for lg, lb in objs:
-            logits_for_idx.update(lg)
-            label_for_idx.update(lb)
-
-    indices = sorted(logits_for_idx.keys())
-    if not indices:
-        return {"p": float(p_value),
-                "summary": summarize_per_species_metrics({}), "per_species": {}}
-
-    logits_arr = np.stack([logits_for_idx[i] for i in indices], axis=0)
-    labels_arr = np.stack([label_for_idx[i] for i in indices], axis=0)
-    per_sp = compute_per_species_metrics(logits_arr, labels_arr)
-
-    return {
-        "p": float(p_value),
-        "summary": summarize_per_species_metrics(per_sp),
-        "per_species": per_sp,
-    }
+    z, y = gather_logits_at_p(model, dataset, eval_indices, dist_info, p_value, batch_size, device,
+                              num_workers=num_workers, base_seed=base_seed, amp_dtype=amp_dtype,
+                              distributed_sampler=distributed_sampler, collator_cls=collator_cls)
+    per_sp = compute_per_species_metrics(z.astype(np.float64) / temperature, y)
+    return {"p": float(p_value), "summary": summarize_per_species_metrics(per_sp), "per_species": per_sp}
 
 
 @torch.no_grad()
@@ -285,57 +207,41 @@ def gather_logits_at_p(model, dataset, eval_indices, dist_info, p_value: float,
                        collator_cls=None) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
     use_amp = amp_dtype is not None and device.type == "cuda"
-    dist_info_dev = _move_dist_info(dist_info, device)
+    dist_info_dev = move_dist_info_to_device(dist_info, device)
     is_distributed = bool(distributed_sampler) and torch.distributed.is_initialized()
 
     mask_seed = base_seed + round(p_value * 1000)
-    cls = collator_cls if collator_cls is not None else FixedPValCollator
-    collator = cls(p=p_value, base_seed=mask_seed)
+    collator = (collator_cls or FixedPValCollator)(p=p_value, base_seed=mask_seed)
     subset = Subset(dataset, eval_indices)
     np.random.seed(mask_seed)
     torch.manual_seed(mask_seed)
-    if is_distributed:
-        sampler = DistributedSampler(subset, shuffle=False)
-        loader = DataLoader(subset, batch_size=batch_size, sampler=sampler,
-                            collate_fn=collator, num_workers=num_workers, pin_memory=True,
-                            worker_init_fn=seed_worker)
-    else:
-        loader = DataLoader(subset, batch_size=batch_size, shuffle=False,
-                            collate_fn=collator, num_workers=num_workers, pin_memory=True,
-                            worker_init_fn=seed_worker)
+    loader = DataLoader(subset, batch_size=batch_size, shuffle=False,
+                        sampler=DistributedSampler(subset, shuffle=False) if is_distributed else None,
+                        collate_fn=collator, num_workers=num_workers, pin_memory=True,
+                        worker_init_fn=seed_worker)
 
     logits_by_idx: dict[int, np.ndarray] = {}
     labels_by_idx: dict[int, np.ndarray] = {}
     for batch in loader:
-        if use_amp:
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                out = run_forward(model, batch, dist_info_dev, device)
-        else:
-            out = run_forward(model, batch, dist_info_dev, device)
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            out = run_forward(model, batch, dist_info_dev)
         z = out.logits.float().squeeze(-1).cpu().numpy()
         labels = batch["labels"].squeeze(-1).cpu().numpy()
-        target_idx = batch["target_site_idx"].squeeze(-1).cpu().numpy()
-        for b, ti in enumerate(target_idx):
-            ti = int(ti)
-            logits_by_idx[ti] = z[b]
-            labels_by_idx[ti] = labels[b]
+        for b, ti in enumerate(batch["target_site_idx"].squeeze(-1).cpu().numpy()):
+            logits_by_idx[int(ti)] = z[b]
+            labels_by_idx[int(ti)] = labels[b]
 
     if is_distributed:
         objs = [None] * torch.distributed.get_world_size()
         torch.distributed.all_gather_object(objs, (logits_by_idx, labels_by_idx))
-        merged_z, merged_lab = {}, {}
         for zd, ld in objs:
-            merged_z.update(zd)
-            merged_lab.update(ld)
-        logits_by_idx, labels_by_idx = merged_z, merged_lab
+            logits_by_idx.update(zd)
+            labels_by_idx.update(ld)
 
-    indices = sorted(logits_by_idx.keys())
-    if not indices:
-        S = dataset.num_species
-        return np.zeros((0, S), dtype=np.float32), np.zeros((0, S), dtype=np.int64)
-    logits_arr = np.stack([logits_by_idx[i] for i in indices], axis=0).astype(np.float32)
-    labels_arr = np.stack([labels_by_idx[i] for i in indices], axis=0).astype(np.int64)
-    return logits_arr, labels_arr
+    indices = sorted(logits_by_idx)
+    return (np.stack([logits_by_idx[i] for i in indices]).astype(np.float32),
+            np.stack([labels_by_idx[i] for i in indices]).astype(np.int64))
 
 
 def fit_temperature(val_logits: np.ndarray, val_labels: np.ndarray,

@@ -58,7 +58,7 @@ def test_env_cross_attn_matches_expand_then_project():
     env = torch.randn(B, C_env, H)
 
     ref = _reference_forward(mod, hidden_states, env)
-    got = mod(hidden_states, env, output_attentions=False)[0]
+    got = mod(hidden_states, env)
 
     assert got.shape == ref.shape
     torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)

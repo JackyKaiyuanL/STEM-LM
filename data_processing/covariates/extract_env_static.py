@@ -14,17 +14,8 @@ Sources:
              Read via /vsicurl/ — tiles fetched on demand
 
 Usage:
-  python extract_env_static.py --dataset splotopen_europe
-  python extract_env_static.py --dataset splotopen_australia
-  python extract_env_static.py --dataset ebutterfly_na
-  python extract_env_static.py --dataset ebutterfly_us
+  python extract_env_static.py --csv plots.csv --sg_region global
   python extract_env_static.py --csv /path/to/file.csv --no_soilgrids
-
-Datasets and their SoilGrids region key:
-  splotopen_europe    → soilgrids region: europe
-  splotopen_australia → soilgrids region: australia
-  ebutterfly_na       → soilgrids region: na  (covers US + Canada + Mesoamerica)
-  ebutterfly_us       → soilgrids region: na  (US is a spatial subset of NA tiles)
 """
 
 import argparse, math, os, re
@@ -48,26 +39,6 @@ WC_ENV_COLS = [f"env_bio{i:02d}" for i in range(1, 20)]
 SG_ENV_COLS = [f"env_{v}" for v in SOILGRIDS_VARS]
 DEM_ENV_COLS = ["env_dem"]
 CANONICAL_ENV_ORDER = WC_ENV_COLS + SG_ENV_COLS + DEM_ENV_COLS
-
-_LAB = os.path.join(REPO_ROOT, "lab")
-DATASET_CONFIG = {
-    "splotopen_europe": {
-        "csv": os.path.join(_LAB, "sPlotOpen", "splotopen_europe_jsdm.csv"),
-        "sg_region": "europe",
-    },
-    "splotopen_australia": {
-        "csv": os.path.join(_LAB, "sPlotOpen", "splotopen_australia_jsdm.csv"),
-        "sg_region": "australia",
-    },
-    "ebutterfly_na": {
-        "csv": os.path.join(_LAB, "eButterfly", "ebutterfly_na_static_jsdm.csv"),
-        "sg_region": "na",
-    },
-    "ebutterfly_us": {
-        "csv": os.path.join(_LAB, "eButterfly", "ebutterfly_us_static_jsdm.csv"),
-        "sg_region": "na",
-    },
-}
 
 os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"
 os.environ["CPL_VSIL_CURL_ALLOWED_EXTENSIONS"] = ".tif"
@@ -218,23 +189,9 @@ def enrich_csv(
           f"{len([c for c in out.columns if c not in meta_cols+env_cols])} species)")
 
 
-def main(dataset):
-    cfg = DATASET_CONFIG[dataset]
-    enrich_csv(
-        cfg["csv"],
-        out_path=cfg["csv"],
-        sg_region=cfg["sg_region"],
-        include_worldclim=True,
-        include_soilgrids=True,
-        include_dem=True,
-    )
-
-
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--dataset", choices=list(DATASET_CONFIG.keys()))
-    src.add_argument("--csv", type=str, help="Input jSDM CSV path to enrich in-place")
+    p.add_argument("--csv", type=str, required=True, help="Input jSDM CSV path to enrich in-place")
     p.add_argument("--out_csv", type=str, default=None,
                    help="Optional output path (default: overwrite input CSV)")
     p.add_argument("--sg_region", type=str, default=None,
@@ -247,19 +204,11 @@ if __name__ == "__main__":
                    help="Skip DEM env_dem extraction")
     a = p.parse_args()
 
-    if a.dataset:
-        cfg = DATASET_CONFIG[a.dataset]
-        csv_path = cfg["csv"]
-        sg_region = cfg["sg_region"]
-    else:
-        csv_path = a.csv
-        sg_region = a.sg_region
-
     try:
         enrich_csv(
-            csv_path,
-            out_path=a.out_csv or csv_path,
-            sg_region=sg_region,
+            a.csv,
+            out_path=a.out_csv or a.csv,
+            sg_region=a.sg_region,
             include_worldclim=not a.no_worldclim,
             include_soilgrids=not a.no_soilgrids,
             include_dem=not a.no_dem,
