@@ -143,3 +143,36 @@ def test_no_time_drops_time_column_from_species(tmp_path):
     assert ds.species_cols == ["sp_0", "sp_1"]
     assert ds.env_cols == ["env_a"]
     assert not ds.has_time
+
+
+def test_missing_covariates_filled_and_unselected_env_dropped(tmp_path):
+    from stemlm.data import JSDMDataset
+
+    rng = np.random.default_rng(5)
+    n = 40
+    df = pd.DataFrame({
+        "time": np.zeros(n),
+        "latitude": rng.uniform(25, 55, n),
+        "longitude": rng.uniform(-120, -70, n),
+        "env_a": rng.normal(size=n),
+        "env_b": rng.normal(size=n),
+        "sp_0": rng.integers(0, 2, n),
+        "sp_1": rng.integers(0, 2, n),
+    })
+    df.loc[[3, 7], "env_a"] = np.nan
+    df.loc[5, "env_b"] = np.nan
+    df.to_csv(tmp_path / "missing.csv", index=False)
+
+    ds = JSDMDataset(str(tmp_path / "missing.csv"), num_source_sites=4, no_time=True, env_cols=["env_a"])
+    assert ds.species_cols == ["sp_0", "sp_1"]
+    assert ds.env_cols == ["env_a"]
+    rows = np.arange(20)
+    ds.fill_env(rows)
+    expected = pd.read_csv(tmp_path / "missing.csv")["env_a"].to_numpy(dtype=np.float32)
+    expected[[3, 7]] = np.nanmean(expected[rows])
+    np.testing.assert_array_equal(ds.env_data[:, 0], expected)
+
+    df.loc[9, "sp_1"] = np.nan
+    df.to_csv(tmp_path / "bad.csv", index=False)
+    with pytest.raises(ValueError, match="sp_1"):
+        JSDMDataset(str(tmp_path / "bad.csv"), num_source_sites=4, no_time=True)

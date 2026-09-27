@@ -190,11 +190,10 @@ class JSDMDataset(Dataset):
         has_time = _normalize_time_col(df, time_col, no_time)
         coord_cols = ([time_col] if has_time else []) + [lat_col, lon_col]
         if env_cols is None:
-            env_cols     = [c for c in df.columns if c not in coord_cols and c.startswith("env_")]
-            species_cols = [c for c in df.columns if c not in coord_cols and not c.startswith("env_")]
-        else:
-            species_cols = [c for c in df.columns if c not in coord_cols and c not in env_cols]
-        nan_cols = [c for c in df.columns if c not in env_cols and df[c].isna().any()]
+            env_cols = [c for c in df.columns if c not in coord_cols and c.startswith("env_")]
+        species_cols = [c for c in df.columns
+                        if c not in coord_cols and c not in env_cols and not c.startswith("env_")]
+        nan_cols = [c for c in coord_cols + species_cols if df[c].isna().any()]
         if nan_cols:
             raise ValueError("NaNs found in non-covariate columns: " + ", ".join(nan_cols))
 
@@ -433,7 +432,7 @@ class JSDMSparseDataset(JSDMDataset):
         if env_cols is None:
             env_cols = [c for c in df.columns
                         if c not in coord_cols and c != "species_idx" and c.startswith("env_")]
-        nan_cols = [c for c in df.columns if c not in env_cols and df[c].isna().any()]
+        nan_cols = [c for c in coord_cols if df[c].isna().any()]
         if nan_cols:
             raise ValueError("NaNs found in non-covariate columns: " + ", ".join(nan_cols))
 
