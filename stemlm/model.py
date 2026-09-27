@@ -142,14 +142,13 @@ class TargetEnvModule(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
         E = config.num_env_vars
-        self.env_norm = nn.LayerNorm(E)
         self.proj1    = nn.Linear(E, config.hidden_size)
         self.act      = nn.SiLU()
         self.proj2    = nn.Linear(config.hidden_size, config.hidden_size)
         self.out_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, target_env: torch.Tensor) -> torch.Tensor:
-        x = self.proj1(self.env_norm(target_env))
+        x = self.proj1(target_env)
         x = self.proj2(self.act(x))
         return self.out_norm(x).unsqueeze(1)
 
@@ -160,7 +159,6 @@ class EnvSourceModule(nn.Module):
         super().__init__()
         E = config.num_env_vars
         self.num_env_groups = config.num_env_groups
-        self.env_norm = nn.LayerNorm(E)
         self.proj = nn.Linear(E, config.hidden_size)
         self.group_query = nn.Parameter(
             torch.randn(config.num_env_groups, config.hidden_size) * 0.02
@@ -172,7 +170,7 @@ class EnvSourceModule(nn.Module):
 
     def forward(self, env_data: torch.Tensor) -> torch.Tensor:
         B = env_data.size(0)
-        site_emb = self.proj(self.env_norm(env_data))  # (B, N, H)
+        site_emb = self.proj(env_data)  # (B, N, H)
         k = self.key_proj(site_emb)
         v = self.value_proj(site_emb)
         q = self.group_query.unsqueeze(0).expand(B, -1, -1)  # (B, C_env, H)
