@@ -126,6 +126,13 @@ def test_random_exclusion_draws_positive_radii(dataset):
         dataset._random_exclusion_mask = None
 
 
+def test_sources_are_the_nearest_in_pool(dataset):
+    for i in [3, 40, 99, 158]:
+        src = dataset[i]["source_idx"].numpy()
+        expected = _bruteforce_candidates(dataset, i)[:dataset.num_source_sites]
+        np.testing.assert_array_equal(src, expected)
+
+
 def test_eval_exclusion_removes_near_sources(dataset):
     dataset.eval_exclusion_km = 300.0
     try:

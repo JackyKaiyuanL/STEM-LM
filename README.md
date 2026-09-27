@@ -79,7 +79,7 @@ For BCE, pass `--loss_type bce`.
 - `--max_grad_norm 1.0 --gradient_checkpointing`
 - `--mixed_precision {none,bf16,fp16}` `none`
 - `--grad_accum_steps 1` effective batch = `batch_size × grad_accum_steps × world_size`.
-- `--test_bag_K 10` K-pass bagging at end of training.
+- `--test_bag_K 1` evaluation passes averaged per masking rate; sources are deterministic, so 1 is exact.
 
 **Ablation**
 - `--ablation {full,no_st,no_env,no_st_env}` `full`.

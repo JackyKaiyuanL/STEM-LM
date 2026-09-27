@@ -111,11 +111,6 @@ def _bbox_max_distance(lats: np.ndarray, lons: np.ndarray, times: np.ndarray):
     return max_sp, max_tp
 
 
-def _positive_floor(d: np.ndarray, scale: float) -> float:
-    pos = d[d > 0]
-    return float(pos.min()) if pos.size else scale * 1e-6
-
-
 def _normalize_time_col(df: pd.DataFrame, time_col: str, no_time: bool) -> bool:
     has_time = (not no_time) and (time_col in df.columns)
     if not has_time:
@@ -182,7 +177,6 @@ class JSDMDataset(Dataset):
         self,
         csv_path: str,
         num_source_sites: int = 64,
-        num_scale_sites: int | None = None,
         time_col: str = "time",
         lat_col: str = "latitude",
         lon_col: str = "longitude",
@@ -191,7 +185,6 @@ class JSDMDataset(Dataset):
     ):
         super().__init__()
         self.num_source_sites = num_source_sites
-        self.num_scale_sites = num_scale_sites if num_scale_sites is not None else num_source_sites
         df = pd.read_csv(csv_path)
 
         if df.isna().any().any():
@@ -292,7 +285,7 @@ class JSDMDataset(Dataset):
             if pool_mask is not None:
                 keep &= pool_mask[neigh]
             neigh, sp = neigh[keep], sp[keep]
-            if len(neigh) >= max(self.num_source_sites, self.num_scale_sites) or k_query >= N_total:
+            if len(neigh) >= self.num_source_sites or k_query >= N_total:
                 break
             k_query = min(k_query * 2, N_total)
         return neigh, sp
@@ -324,7 +317,7 @@ class JSDMDataset(Dataset):
         idx_arr = np.asarray(indices)
         neigh = self._knn_index.query(self.coords[idx_arr], k_query)
 
-        need = max(self.num_source_sites, self.num_scale_sites)
+        need = self.num_source_sites
         out: list[tuple[np.ndarray, np.ndarray]] = []
         for b, idx in enumerate(indices):
             nb = neigh[b]
@@ -342,39 +335,17 @@ class JSDMDataset(Dataset):
                 out.append(self._knn_candidates(idx))
         return out
 
-    def _sample_from_candidates(self, idx: int, cand_idx: np.ndarray,
-                                sp: np.ndarray) -> dict[str, Any]:
-        """Weight candidates by distance and draw source sites. Consumes one
-        ``np.random.choice`` — callers must invoke in a fixed index order to keep
-        draws reproducible."""
+    def _select_sources(self, idx: int, cand_idx: np.ndarray,
+                        sp: np.ndarray) -> dict[str, Any]:
         N = self.num_source_sites
         r = self._exclusion_radius(idx, sp)
         if r > 0:
             keep = sp >= r
-            if keep.sum() < max(N, self.num_scale_sites):
+            if keep.sum() < N:
                 cand_idx, sp = self._knn_candidates(idx, min_dist=r)
             else:
                 cand_idx, sp = cand_idx[keep], sp[keep]
-        if self.has_time:
-            tp = np.abs(self.times[cand_idx] - self.times[idx]).astype(np.float32)
-        else:
-            tp = np.zeros_like(sp)
-
-        n_cand = len(cand_idx)
-        replace = n_cand - 1 < N
-
-        k1 = min(self.num_scale_sites, n_cand)
-        nearest = np.argpartition(sp, k1 - 1)[:k1] if k1 < n_cand else np.arange(n_cand)
-        s_sp = max(float(np.median(sp[nearest])), _positive_floor(sp, self._max_spatial))
-        if self.has_time:
-            s_tp = max(float(np.median(tp[nearest])), _positive_floor(tp, self._max_temporal))
-        else:
-            s_tp = 1.0
-
-        combined = np.sqrt((sp / s_sp) ** 2 + (tp / s_tp) ** 2) if self.has_time else (sp / s_sp)
-        inv_d = 1.0 / (combined + 1e-6)
-        w2 = inv_d / inv_d.sum()
-        source_idx = cand_idx[np.random.choice(n_cand, size=N, replace=replace, p=w2)]
+        source_idx = cand_idx[np.arange(N) % len(cand_idx)]
 
         source_species = np.ascontiguousarray(self.species_data[source_idx].T)
         source_env = self.env_data[source_idx]
@@ -391,14 +362,14 @@ class JSDMDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         cand_idx, sp = self._knn_candidates(idx)
-        return self._sample_from_candidates(idx, cand_idx, sp)
+        return self._select_sources(idx, cand_idx, sp)
 
     def __getitems__(self, indices: list[int]) -> list[dict[str, Any]]:
         """Batched fetch used by DataLoader: one tree query for the whole batch,
         then per-item sampling in list order — byte-identical to sequential
         ``__getitem__`` for the same RNG state."""
         cands = self._candidates_batch(indices)
-        return [self._sample_from_candidates(i, c, s)
+        return [self._select_sources(i, c, s)
                 for i, (c, s) in zip(indices, cands, strict=True)]
 
 
@@ -408,7 +379,6 @@ class JSDMSparseDataset(JSDMDataset):
         parquet_path: str,
         vocab_path: str,
         num_source_sites: int = 64,
-        num_scale_sites: int | None = None,
         time_col: str = "time",
         lat_col: str = "latitude",
         lon_col: str = "longitude",
@@ -417,7 +387,6 @@ class JSDMSparseDataset(JSDMDataset):
     ):
         Dataset.__init__(self)
         self.num_source_sites = num_source_sites
-        self.num_scale_sites = num_scale_sites if num_scale_sites is not None else num_source_sites
 
         import pyarrow.dataset as pa_ds
 
@@ -710,7 +679,7 @@ def h3_block_split(lats, lons, resolution=2, train_frac=0.8, test_frac=0.1, seed
 
 
 def create_dataloaders(
-    csv_path, batch_size=32, num_source_sites=64, num_scale_sites=None,
+    csv_path, batch_size=32, num_source_sites=64,
     p=0.15,
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None,
@@ -726,7 +695,6 @@ def create_dataloaders(
             parquet_path=csv_path,
             vocab_path=vocab_path,
             num_source_sites=num_source_sites,
-            num_scale_sites=num_scale_sites,
             env_cols=env_cols,
             no_time=no_time,
         )
@@ -734,7 +702,6 @@ def create_dataloaders(
         dataset = JSDMDataset(
             csv_path=csv_path,
             num_source_sites=num_source_sites,
-            num_scale_sites=num_scale_sites,
             env_cols=env_cols,
             no_time=no_time,
         )

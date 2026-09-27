@@ -345,9 +345,6 @@ def add_train_args(parser):
                         help="species_vocab.json; if set, csv_path is read as sparse parquet "
                              "(species_idx) via JSDMSparseDataset.")
     parser.add_argument("--num_source_sites", type=int, default=64)
-    parser.add_argument("--num_scale_sites", type=int, default=None,
-                        help="N1: nearest neighbors used to estimate the per-target "
-                             "spatial/temporal bandwidths; defaults to --num_source_sites.")
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--num_attention_heads", type=int, default=4)
     parser.add_argument("--num_hidden_layers", type=int, default=3)
@@ -491,11 +488,10 @@ def add_train_args(parser):
     parser.add_argument("--absence_mask_p_list", type=float, nargs="+",
                         default=[0.25, 0.5, 0.75, 1.0],
                         help="Presence-mask rates for absence-mask eval.")
-    parser.add_argument("--test_bag_K", type=int, default=10,
-                        help="K-pass test-time eval. Each pass uses the SAME mask pattern (the "
-                             "FixedPValCollator base_seed is held fixed) and re-seeds only "
-                             "source-pool sampling, so bagging averages source-resample variance "
-                             "without inflating numbers via mask-pattern ensembling. K=1 disables.")
+    parser.add_argument("--test_bag_K", type=int, default=1,
+                        help="Evaluation passes averaged per masking rate. Sources are the K "
+                             "nearest training rows and masks are seeded per batch, so passes "
+                             "are identical; 1 is exact.")
     parser.add_argument("--temperature_scaling", action="store_true",
                         help="After test eval, fit Guo et al. 2017 temperature scalar T* on "
                              "validation logits at p=1.00 by L-BFGS on NLL, apply at every "
@@ -547,7 +543,6 @@ def run_train(args):
         csv_path=args.csv_path,
         batch_size=args.batch_size,
         num_source_sites=args.num_source_sites,
-        num_scale_sites=args.num_scale_sites,
         p=args.p,
         train_frac=args.train_frac,
         test_frac=args.test_frac,
