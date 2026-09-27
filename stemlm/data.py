@@ -626,7 +626,7 @@ def create_dataloaders(
     no_time=False,
     train_exclusion=False, eval_exclusion_km=0.0, eval_exclusion_days=0.0,
     causal_context=False,
-    fold_method="random", resolution: int | None = None,
+    resolution: int = 2,
     splits_path: str | None = None,
     vocab_path: str | None = None,
 ):
@@ -651,26 +651,12 @@ def create_dataloaders(
     if splits_path is not None:
         train_indices, val_indices, test_indices = load_splits(splits_path, expected_num_rows=len(dataset))
         split_origin = "saved"
-    elif fold_method == "h3":
-        if not 0 <= resolution <= 15:
-            raise ValueError("--resolution for --fold h3 must be an integer in [0, 15].")
+    else:
         train_indices, val_indices, test_indices = h3_block_split(
             dataset.lats, dataset.lons,
             resolution=resolution, train_frac=train_frac, test_frac=test_frac, seed=seed,
         )
         split_origin = "h3"
-    else:
-        if resolution is not None:
-            raise ValueError("--resolution is only valid with --fold h3.")
-        np.random.seed(seed)
-        n = len(dataset)
-        indices = np.random.permutation(n)
-        n_train = int(n * train_frac)
-        n_test  = int(n * test_frac)
-        train_indices = indices[:n_train]
-        val_indices   = indices[n_train:n - n_test]
-        test_indices  = indices[n - n_test:]
-        split_origin = "random"
 
     dataset.source_pool = train_indices
     dataset.fill_env(train_indices)

@@ -46,11 +46,10 @@ gives performance as a function of distance to the nearest data.
 
 ## Splits
 
-`--fold h3 --resolution R` assigns whole H3 cells to train, validation and test
-(`--train_frac`, `--test_frac`). Resolution 2 (cells of about 160 km edge)
+`--resolution R` assigns whole H3 cells to train, validation and test
+(`--train_frac`, `--test_frac`). Resolution 2 (cells of about 183 km edge)
 tests extrapolation to unsampled regions; a fine resolution tests prediction at
-new sites near data. `--splits_path` reuses a saved split; `--fold random` is
-for smoke tests.
+new sites near data. `--splits_path` reuses a saved split.
 
 ## Model and training options
 

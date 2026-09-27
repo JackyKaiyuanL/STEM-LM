@@ -13,8 +13,6 @@ import pytest
 SPECIES = [f"species_{i}" for i in range(6)]
 ENV_COLS = ["env_temp", "env_precip"]
 
-# Small, fast, CPU-only training config. Enough rows/species for non-empty
-# train/val/test under --fold random; tiny model + 2 epochs to stay quick.
 TRAIN_ARGS = [
     "--num_epochs", "2",
     "--batch_size", "8",
@@ -23,7 +21,6 @@ TRAIN_ARGS = [
     "--num_hidden_layers", "1",
     "--intermediate_size", "32",
     "--num_source_sites", "8",
-    "--fold", "random",
     "--val_p_list", "0.5", "1.0",
     "--absence_mask_p_list", "0.5", "1.0",
     "--seed", "0",

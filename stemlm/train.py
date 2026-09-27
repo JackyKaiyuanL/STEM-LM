@@ -296,17 +296,14 @@ def add_train_args(parser):
                         help="Explicit list of env column names. If not set, columns with 'env_' "
                              "prefix are used. Useful for datasets with non-prefixed env columns "
                              "(e.g. annualtemp, annualprec).")
-    parser.add_argument("--fold", choices=["random", "h3"], default="h3",
-                        help="Train/val/test split strategy. 'h3' (default): spatial blocks via "
-                             "H3 hexagonal grid. 'random': shuffled rows.")
-    parser.add_argument("--resolution", type=int, default=None,
-                        help="H3 resolution in [0, 15] for --fold h3 (default 2 ≈ 183 km edge). "
-                             "Not valid with --fold random.")
+    parser.add_argument("--resolution", type=int, default=2,
+                        help="H3 resolution in [0, 15] of the spatial-block train/val/test split "
+                             "(default 2 ≈ 183 km edge).")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                         help="Gradient clipping max norm (default 1.0).")
     parser.add_argument("--splits_path", type=str, default=None,
                         help="Path to a splits.json (written by a previous training run). "
-                             "When set, overrides --fold / --resolution / "
+                             "When set, overrides --resolution / "
                              "--seed for the split, so train/val/test are exactly reproduced.")
     parser.add_argument("--no_save_splits", action="store_true",
                         help="Skip writing splits.json to output_dir.")
@@ -356,9 +353,6 @@ def add_train_args(parser):
 
 
 def run_train(args):
-    if args.splits_path is None and args.resolution is None:
-        args.resolution = 2 if args.fold == "h3" else None
-
     env = DistEnv()
     env.setup(backend="nccl")
 
@@ -403,7 +397,6 @@ def run_train(args):
         eval_exclusion_km=args.eval_exclusion_km,
         eval_exclusion_days=args.eval_exclusion_days,
         causal_context=args.causal_context,
-        fold_method=args.fold,
         resolution=args.resolution,
         splits_path=args.splits_path,
         vocab_path=args.vocab_path,
@@ -441,7 +434,7 @@ def run_train(args):
             splits_out, splits["train"], splits["val"], splits["test"],
             num_rows=len(dataset),
             meta={
-                "fold":          args.fold,
+                "fold":          "h3",
                 "resolution":    args.resolution,
                 "train_frac":    args.train_frac,
                 "test_frac":     args.test_frac,
