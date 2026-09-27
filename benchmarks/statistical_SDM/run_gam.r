@@ -30,6 +30,7 @@ if ("time" %in% names(dat)) {
 
 splits    <- fromJSON(SPLITS_FILE)
 idx       <- list(train = splits$train + 1L, val = splits$val + 1L, test = splits$test + 1L)
+for (v in env_cols) dat[[v]][is.na(dat[[v]])] <- mean(dat[[v]][idx$train], na.rm = TRUE)
 train_dat <- dat[idx$train, ]
 
 env_terms <- paste(vapply(env_cols, function(v) {

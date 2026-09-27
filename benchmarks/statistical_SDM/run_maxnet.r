@@ -25,6 +25,7 @@ all_sp   <- setdiff(names(dat), c("time", "latitude", "longitude", env_cols))
 
 splits    <- fromJSON(SPLITS_FILE)
 idx       <- list(train = splits$train + 1L, val = splits$val + 1L, test = splits$test + 1L)
+for (v in env_cols) dat[[v]][is.na(dat[[v]])] <- mean(dat[[v]][idx$train], na.rm = TRUE)
 train_dat <- dat[idx$train, ]
 val_dat   <- dat[idx$val, ]
 features  <- env_cols[apply(train_dat[, env_cols, drop = FALSE], 2, var) > 0]

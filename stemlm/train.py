@@ -560,6 +560,9 @@ def run_train(args):
             },
         )
         logger.info(f"Splits saved to {splits_out}")
+    if env.is_main:
+        with open(os.path.join(args.output_dir, "env_stats.json"), "w") as f:
+            json.dump({"env_cols": dataset.env_cols, "mean": dataset.env_mean.tolist()}, f, indent=2)
     env.barrier()
 
     if args.loss_type == "focal":

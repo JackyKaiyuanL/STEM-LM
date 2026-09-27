@@ -187,13 +187,6 @@ class JSDMDataset(Dataset):
         self.num_source_sites = num_source_sites
         df = pd.read_csv(csv_path)
 
-        if df.isna().any().any():
-            nan_cols = df.columns[df.isna().any()].tolist()
-            raise ValueError(
-                "NaNs found in columns: " + ", ".join(nan_cols)
-                + ". Please impute or drop missing values before training."
-            )
-
         has_time = _normalize_time_col(df, time_col, no_time)
         coord_cols = ([time_col] if has_time else []) + [lat_col, lon_col]
         if env_cols is None:
@@ -201,6 +194,9 @@ class JSDMDataset(Dataset):
             species_cols = [c for c in df.columns if c not in coord_cols and not c.startswith("env_")]
         else:
             species_cols = [c for c in df.columns if c not in coord_cols and c not in env_cols]
+        nan_cols = [c for c in df.columns if c not in env_cols and df[c].isna().any()]
+        if nan_cols:
+            raise ValueError("NaNs found in non-covariate columns: " + ", ".join(nan_cols))
 
         species_data = df[species_cols].values.astype(np.float32)
         self._setup_post_load(df, species_data, species_cols, env_cols,
@@ -267,6 +263,11 @@ class JSDMDataset(Dataset):
         mask = np.zeros(len(self.lats), dtype=bool)
         mask[np.asarray(value)] = True
         self._random_exclusion_mask = mask
+
+    def fill_env(self, rows=None, mean=None):
+        self.env_mean = (np.nanmean(self.env_data[np.asarray(rows)], axis=0) if mean is None
+                         else np.asarray(mean)).astype(np.float32)
+        self.env_data = np.where(np.isnan(self.env_data), self.env_mean, self.env_data).astype(np.float32)
 
     def __len__(self):
         return len(self.species_data)
@@ -427,16 +428,14 @@ class JSDMSparseDataset(JSDMDataset):
         df = table.drop(["species_idx"]).to_pandas()
         del table
 
-        non_species = [c for c in df.columns if c != "species_idx"]
-        if df[non_species].isna().any().any():
-            nan_cols = [c for c in non_species if df[c].isna().any()]
-            raise ValueError("NaNs found in columns: " + ", ".join(nan_cols))
-
         has_time = _normalize_time_col(df, time_col, no_time)
         coord_cols = ([time_col] if has_time else []) + [lat_col, lon_col]
         if env_cols is None:
             env_cols = [c for c in df.columns
                         if c not in coord_cols and c != "species_idx" and c.startswith("env_")]
+        nan_cols = [c for c in df.columns if c not in env_cols and df[c].isna().any()]
+        if nan_cols:
+            raise ValueError("NaNs found in non-covariate columns: " + ", ".join(nan_cols))
 
         from scipy.sparse import csr_matrix
         N_rows = len(df)
@@ -737,6 +736,7 @@ def create_dataloaders(
         split_origin = "random"
 
     dataset.source_pool = train_indices
+    dataset.fill_env(train_indices)
     if train_exclusion:
         dataset.random_exclusion_rows = train_indices
     dataset.eval_exclusion_km = eval_exclusion_km
