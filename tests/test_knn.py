@@ -112,18 +112,13 @@ def test_random_exclusion_keeps_batched_equal_to_sequential(dataset):
         dataset._random_exclusion_mask = None
 
 
-def test_random_exclusion_draws_positive_radii(dataset):
-    dataset.random_exclusion_rows = np.arange(160)
-    try:
-        np.random.seed(11)
-        radii = [dataset._exclusion_radius(i, dataset._knn_candidates(i)[1]) for i in range(160)]
-        assert 0 < np.mean(np.array(radii) > 0) < 1
-        for i in range(0, 160, 5):
-            cand, sp = dataset._knn_candidates(i)
-            r = dataset._exclusion_radius(i, sp)
-            assert r <= sp.max()
-    finally:
-        dataset._random_exclusion_mask = None
+def test_random_window_draws_positive_radii(dataset):
+    np.random.seed(11)
+    radii = [dataset._random_window(dataset._knn_candidates(i)[1]) for i in range(160)]
+    assert 0 < np.mean(np.array(radii) > 0) < 1
+    for i in range(0, 160, 5):
+        sp = dataset._knn_candidates(i)[1]
+        assert dataset._random_window(sp) <= sp.max()
 
 
 def test_sources_are_the_nearest_in_pool(dataset):
@@ -131,6 +126,42 @@ def test_sources_are_the_nearest_in_pool(dataset):
         src = dataset[i]["source_idx"].numpy()
         expected = _bruteforce_candidates(dataset, i)[:dataset.num_source_sites]
         np.testing.assert_array_equal(src, expected)
+
+
+def test_eval_exclusion_days_removes_near_in_time(dataset):
+    dataset.eval_exclusion_days = 100.0
+    try:
+        for i in [3, 40, 99]:
+            src = dataset[i]["source_idx"].numpy()
+            assert (np.abs(dataset.times[src] - dataset.times[i]) >= 100.0).all()
+    finally:
+        dataset.eval_exclusion_days = 0.0
+
+
+def test_causal_context_keeps_only_earlier_sources(dataset):
+    dataset.causal_context = True
+    try:
+        for i in [3, 40, 99]:
+            src = dataset[i]["source_idx"].numpy()
+            assert (dataset.times[src] <= dataset.times[i]).all()
+    finally:
+        dataset.causal_context = False
+
+
+def test_random_windows_never_empty_the_sources(dataset):
+    dataset.random_exclusion_rows = np.arange(160)
+    try:
+        for seed in range(3):
+            np.random.seed(seed)
+            for i in range(160):
+                assert dataset[i]["source_idx"].shape == (dataset.num_source_sites,)
+    finally:
+        dataset._random_exclusion_mask = None
+
+
+def test_random_window_is_zero_without_positive_gaps(dataset):
+    np.random.seed(0)
+    assert all(dataset._random_window(np.zeros(10)) == 0.0 for _ in range(20))
 
 
 def test_eval_exclusion_removes_near_sources(dataset):

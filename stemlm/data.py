@@ -241,6 +241,8 @@ class JSDMDataset(Dataset):
         self._source_pool_mask = None
         self._random_exclusion_mask = None
         self.eval_exclusion_km = 0.0
+        self.eval_exclusion_days = 0.0
+        self.causal_context = False
 
     @property
     def source_pool(self):
@@ -269,7 +271,12 @@ class JSDMDataset(Dataset):
     def __len__(self):
         return len(self.species_data)
 
-    def _knn_candidates(self, idx: int, min_dist: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+    def _time_gap(self, idx: int, others: np.ndarray) -> np.ndarray:
+        gap = self.times[idx] - self.times[others]
+        return gap if self.causal_context else np.abs(gap)
+
+    def _knn_candidates(self, idx: int, min_dist: float = 0.0,
+                        min_days: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
         N_total = len(self.lats)
         pool_mask = self._source_pool_mask
         k_query = min(_K_MAX + 1, N_total)
@@ -281,7 +288,7 @@ class JSDMDataset(Dataset):
             neigh = neigh[neigh >= 0]
             sp = haversine_pairs_np(self.lats[idx], self.lons[idx],
                                     self.lats[neigh], self.lons[neigh])
-            keep = (neigh != idx) & (sp >= min_dist)
+            keep = (neigh != idx) & (sp >= min_dist) & (self._time_gap(idx, neigh) >= min_days)
             if pool_mask is not None:
                 keep &= pool_mask[neigh]
             neigh, sp = neigh[keep], sp[keep]
@@ -290,15 +297,19 @@ class JSDMDataset(Dataset):
             k_query = min(k_query * 2, N_total)
         return neigh, sp
 
-    def _exclusion_radius(self, idx: int, sp: np.ndarray) -> float:
-        if self._random_exclusion_mask is None or not self._random_exclusion_mask[idx]:
-            return self.eval_exclusion_km
+    @staticmethod
+    def _random_window(d: np.ndarray) -> float:
         u = np.random.random()
-        positive = sp[sp > 0]
+        positive = d[d > 0]
         if u < 0.5 or positive.size == 0:
             return 0.0
-        lo, hi = np.log(positive.min()), np.log(sp.max())
-        return float(np.exp(lo + (2.0 * u - 1.0) * (hi - lo)))
+        lo, hi = np.log(positive.min()), np.log(d.max())
+        return min(float(np.exp(lo + (2.0 * u - 1.0) * (hi - lo))), float(d.max()))
+
+    def _exclusion_window(self, idx: int, d: np.ndarray, eval_value: float) -> float:
+        if self._random_exclusion_mask is None or not self._random_exclusion_mask[idx]:
+            return eval_value
+        return self._random_window(d)
 
     def _candidates_batch(self, indices: list[int]) -> list[tuple[np.ndarray, np.ndarray]]:
         """Neighbour indices + distances for a batch via ONE FAISS query.
@@ -338,13 +349,16 @@ class JSDMDataset(Dataset):
     def _select_sources(self, idx: int, cand_idx: np.ndarray,
                         sp: np.ndarray) -> dict[str, Any]:
         N = self.num_source_sites
-        r = self._exclusion_radius(idx, sp)
-        if r > 0:
-            keep = sp >= r
-            if keep.sum() < N:
-                cand_idx, sp = self._knn_candidates(idx, min_dist=r)
-            else:
-                cand_idx, sp = cand_idx[keep], sp[keep]
+        r = self._exclusion_window(idx, sp, self.eval_exclusion_km)
+        keep = sp >= r
+        cand_idx, sp = cand_idx[keep], sp[keep]
+        tp = self._time_gap(idx, cand_idx)
+        tau = self._exclusion_window(idx, tp, self.eval_exclusion_days)
+        keep = tp >= tau
+        if keep.sum() < N:
+            cand_idx, sp = self._knn_candidates(idx, min_dist=r, min_days=tau)
+        else:
+            cand_idx = cand_idx[keep]
         source_idx = cand_idx[np.arange(N) % len(cand_idx)]
 
         source_species = np.ascontiguousarray(self.species_data[source_idx].T)
@@ -684,7 +698,8 @@ def create_dataloaders(
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None,
     no_time=False,
-    train_exclusion=False, eval_exclusion_km=0.0,
+    train_exclusion=False, eval_exclusion_km=0.0, eval_exclusion_days=0.0,
+    causal_context=False,
     fold_method="random", resolution: int | None = None,
     saved_splits: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     vocab_path: str | None = None,
@@ -743,6 +758,8 @@ def create_dataloaders(
     if train_exclusion:
         dataset.random_exclusion_rows = train_indices
     dataset.eval_exclusion_km = eval_exclusion_km
+    dataset.eval_exclusion_days = eval_exclusion_days
+    dataset.causal_context = causal_context
 
     train_dataset = torch.utils.data.Subset(dataset, train_indices)
     val_dataset   = torch.utils.data.Subset(dataset, val_indices)

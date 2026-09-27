@@ -64,8 +64,9 @@ For BCE, pass `--loss_type bce`.
 - `--splits_path` reuse a prior `splits.json` (keeps train/val/test identical across runs).
 - `--train_frac 0.8 --test_frac 0.1` (val = remainder)
 - `--num_source_sites 64`
-- `--train_exclusion` per training target, with probability 1/2, drop candidate sources within a radius drawn log-uniformly between its nearest and farthest candidate.
-- `--eval_exclusion_km 0` drop training sources within this radius of every validation and test target.
+- `--train_exclusion` per training target, drop candidate sources within a radius and, independently, within a time window; each is 0 with probability 1/2 and otherwise drawn log-uniformly between its nearest and farthest candidate.
+- `--eval_exclusion_km 0`, `--eval_exclusion_days 0` drop training sources within this radius or this many days of every validation and test target.
+- `--causal_context` sources must precede the target in time.
 
 **Model**
 - `--hidden_size 256 --num_attention_heads 4 --num_hidden_layers 3 --intermediate_size 1024`
