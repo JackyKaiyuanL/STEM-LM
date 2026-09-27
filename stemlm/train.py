@@ -20,7 +20,6 @@ from stemlm.data import (
     seed_worker,
 )
 from stemlm.metric import (
-    compute_per_species_ece_from_logits,
     compute_per_species_metrics,
     evaluate_at_p,
     fit_temperature,
@@ -110,7 +109,7 @@ def log_main(env: "DistEnv", msg: str, level: int = logging.INFO):
 
 
 def _parse_rate(s):
-    if isinstance(s, str) and (s == "unif" or s.startswith(("unif:", "beta:"))):
+    if isinstance(s, str) and (s == "unif" or s.startswith("unif:")):
         return s
     return float(s)
 
@@ -264,7 +263,7 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     num_batches = 0
     S = (model.module if isinstance(model, DDP) else model).config.num_species
-    batch_probs, batch_labels = [], []
+    batch_logits, batch_labels = [], []
     use_amp = amp_dtype is not None and device.type == "cuda"
 
     for batch in loader:
@@ -282,13 +281,12 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
         loss_sum += output.loss.detach().double()
         num_batches += 1
 
-        batch_probs.append(
-            torch.sigmoid(output.logits.float()).squeeze(-1).double().cpu().numpy())
+        batch_logits.append(output.logits.float().squeeze(-1).double().cpu().numpy())
         batch_labels.append(batch["labels"].squeeze(-1).cpu().numpy())
 
     total_loss = loss_sum.item()
-    probs = (np.concatenate(batch_probs, axis=0) if batch_probs
-             else np.zeros((0, S), dtype=np.float64))
+    logits = (np.concatenate(batch_logits, axis=0) if batch_logits
+              else np.zeros((0, S), dtype=np.float64))
     labels = (np.concatenate(batch_labels, axis=0) if batch_labels
               else np.zeros((0, S), dtype=np.int64))
 
@@ -297,7 +295,7 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
         dist.all_reduce(agg, op=dist.ReduceOp.SUM)
         total_loss, num_batches = agg.tolist()
 
-        probs = np.concatenate(env.all_gather_object(probs), axis=0)
+        logits = np.concatenate(env.all_gather_object(logits), axis=0)
         labels = np.concatenate(env.all_gather_object(labels), axis=0)
 
     mask = labels != -100
@@ -308,13 +306,13 @@ def evaluate(model, loader, device, dist_info, amp_dtype=None,
                 summarize_per_species_metrics({}), {})
 
     order = np.argsort(~mask, axis=0, kind="stable")[:max_n]
-    probs_arr = np.take_along_axis(probs, order, axis=0)
+    logits_arr = np.take_along_axis(logits, order, axis=0)
     labels_arr = np.take_along_axis(labels, order, axis=0)
 
-    total_correct = int(((probs > 0.5) == labels)[mask].sum())
+    total_correct = int(((logits > 0) == labels)[mask].sum())
     total_masked = int(counts.sum())
 
-    per_sp = compute_per_species_metrics(probs_arr, labels_arr)
+    per_sp = compute_per_species_metrics(logits_arr, labels_arr)
     summary = summarize_per_species_metrics(per_sp)
     acc = total_correct / max(total_masked, 1)
 
@@ -340,10 +338,8 @@ def add_train_args(parser):
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--p", type=_parse_rate, default=0.15,
-                        help="Per-row mask rate. Float in [0,1], 'unif[:lo,hi]' "
-                             "(Uniform[lo,hi] per row; bare 'unif' = 'unif:0.0,1.0'), or "
-                             "'beta:alpha,beta' (Beta(alpha, beta) per row; e.g. "
-                             "'beta:2,1' biases toward p=1, 'beta:0.5,0.5' is U-shaped).")
+                        help="Per-row mask rate. Float in [0,1], or 'unif[:lo,hi]' "
+                             "(Uniform[lo,hi] per row; bare 'unif' = 'unif:0.0,1.0').")
     parser.add_argument("--train_frac", type=float, default=0.8)
     parser.add_argument("--test_frac", type=float, default=0.1,
                         help="Fraction of data held out as test set for final AUC. "
@@ -457,11 +453,9 @@ def add_train_args(parser):
                         default=[0.25, 0.5, 0.75, 1.0],
                         help="Presence-mask rates for absence-mask eval.")
     parser.add_argument("--temperature_scaling", action="store_true",
-                        help="After test eval, fit Guo et al. 2017 temperature scalar T* on "
-                             "validation logits at p=1.00 by L-BFGS on NLL, apply at every "
-                             "test p (uniform + absence-mask), and save T* + per-p T-cal ECE "
-                             "to temperature.json. Downstream inference should divide logits "
-                             "by T* (sigmoid(logits / T*)) when temperature.json is present.")
+                        help="Fit a temperature T* on validation logits at p=1 for each "
+                             "evaluated checkpoint; every test metric is computed on "
+                             "logits / T*. T* is saved to temperature.json.")
     parser.set_defaults(func=run_train)
 
 
@@ -823,6 +817,21 @@ def run_train(args):
     best_state = torch.load(os.path.join(args.output_dir, "best_model.pt"), map_location=device)
     unwrap(model).load_state_dict(best_state)
 
+    def fit_checkpoint_temperature():
+        if not args.temperature_scaling:
+            return 1.0
+        val_logits, val_labels = gather_logits_at_p(
+            unwrap(model), dataset, np.array(splits["val"]), dist_info,
+            p_value=1.0, batch_size=args.batch_size, device=device,
+            num_workers=args.num_workers, base_seed=args.seed + 30_000,
+            amp_dtype=amp_dtype, distributed_sampler=env.is_distributed,
+        )
+        T = fit_temperature(val_logits, val_labels)
+        log_main(env, f"[temperature_scaling] T* = {T:.4f}; test metrics use logits / T*")
+        return T
+
+    T_star = fit_checkpoint_temperature()
+
     per_p_auc = {}
     per_p_auprc = {}
     per_p_cbi = {}
@@ -841,6 +850,7 @@ def run_train(args):
             base_seed=args.seed + 10_000,
             amp_dtype=amp_dtype,
             distributed_sampler=env.is_distributed,
+            temperature=T_star,
         )
         s = result["summary"]
         per_p_auc[p]    = s["mean_auc_roc"]
@@ -880,6 +890,7 @@ def run_train(args):
     if os.path.exists(cbi_ckpt_path):
         log_main(env, f"Evaluating CBI-selected model on {eval_split}...")
         unwrap(model).load_state_dict(torch.load(cbi_ckpt_path, map_location=device))
+        T_cbi = fit_checkpoint_temperature()
         for p in args.val_p_list:
             result = evaluate_at_p(
                 unwrap(model), dataset, eval_indices, dist_info,
@@ -889,6 +900,7 @@ def run_train(args):
                 base_seed=args.seed + 10_000,
                 amp_dtype=amp_dtype,
                 distributed_sampler=env.is_distributed,
+                temperature=T_cbi,
             )
             s = result["summary"]
             cbi_sel_per_p_auc[p]   = s["mean_auc_roc"]
@@ -948,6 +960,7 @@ def run_train(args):
                 amp_dtype=amp_dtype,
                 distributed_sampler=env.is_distributed,
                 collator_cls=AbsenceMaskCollator,
+                temperature=T_star,
             )
             s = result["summary"]
             absmask_per_p_auc[p]   = s["mean_auc_roc"]
@@ -977,52 +990,10 @@ def run_train(args):
                 f"CBI={absmask_mean_cbi:.3f}"
             )
 
-    T_star = None
-    tcal_per_p_ece: dict = {}
-    absmask_tcal_per_p_ece: dict = {}
     if args.temperature_scaling and env.is_main:
-        log_main(env, "[temperature_scaling] gathering val logits at p=1.00...")
-        val_logits, val_labels = gather_logits_at_p(
-            unwrap(model), dataset, np.array(splits["val"]), dist_info,
-            p_value=1.0, batch_size=args.batch_size, device=device,
-            num_workers=args.num_workers, base_seed=args.seed + 30_000,
-            amp_dtype=amp_dtype, distributed_sampler=False,
-        )
-        T_star = fit_temperature(val_logits, val_labels)
-        log_main(env, f"[temperature_scaling] T* = {T_star:.4f}")
-        for p in args.val_p_list:
-            tl, ty = gather_logits_at_p(
-                unwrap(model), dataset, eval_indices, dist_info,
-                p_value=p, batch_size=args.batch_size, device=device,
-                num_workers=args.num_workers, base_seed=args.seed + 40_000,
-                amp_dtype=amp_dtype, distributed_sampler=False,
-            )
-            tcal_per_p_ece[p] = compute_per_species_ece_from_logits(tl, ty, T=T_star)
-            log_main(env, f"  uniform p={p:.2f}: T-cal ECE = {tcal_per_p_ece[p]:.4f}")
-        if not args.no_absence_mask_eval:
-            from stemlm.data import AbsenceMaskCollator
-            for p in args.absence_mask_p_list:
-                if p == 1.0 and 1.0 in tcal_per_p_ece:
-                    absmask_tcal_per_p_ece[p] = tcal_per_p_ece[1.0]
-                    continue
-                tl, ty = gather_logits_at_p(
-                    unwrap(model), dataset, eval_indices, dist_info,
-                    p_value=p, batch_size=args.batch_size, device=device,
-                    num_workers=args.num_workers, base_seed=args.seed + 50_000,
-                    amp_dtype=amp_dtype, distributed_sampler=False,
-                    collator_cls=AbsenceMaskCollator,
-                )
-                absmask_tcal_per_p_ece[p] = compute_per_species_ece_from_logits(tl, ty, T=T_star)
-                log_main(env, f"  absmask p={p:.2f}: T-cal ECE = {absmask_tcal_per_p_ece[p]:.4f}")
         with open(os.path.join(args.output_dir, "temperature.json"), "w") as f:
-            json.dump({
-                "T_star": float(T_star),
-                "fitted_at_p": 1.0,
-                "fitted_on_split": "val",
-                "n_bins": 15,
-                "uniform_tcal_ece_by_p": {f"{p:.2f}": v for p, v in tcal_per_p_ece.items()},
-                "absmask_tcal_ece_by_p": {f"{p:.2f}": v for p, v in absmask_tcal_per_p_ece.items()},
-            }, f, indent=2)
+            json.dump({"T_star": float(T_star), "fitted_at_p": 1.0, "fitted_on_split": "val"},
+                      f, indent=2)
         log_main(env, f"[temperature_scaling] saved -> {args.output_dir}/temperature.json")
 
     if env.is_main:
@@ -1057,7 +1028,6 @@ def run_train(args):
                 "cbi": per_p_cbi.get(p, float("nan")),
                 "brier": per_p_brier.get(p, float("nan")),
                 "ece": per_p_ece.get(p, float("nan")),
-                "tcal_ece": tcal_per_p_ece.get(p, float("nan")),
             })
         if not args.no_absence_mask_eval:
             for p in args.absence_mask_p_list:
@@ -1071,7 +1041,6 @@ def run_train(args):
                     "cbi": absmask_per_p_cbi.get(p, float("nan")),
                     "brier": absmask_per_p_brier.get(p, float("nan")),
                     "ece": absmask_per_p_ece.get(p, float("nan")),
-                    "tcal_ece": absmask_tcal_per_p_ece.get(p, float("nan")),
                 })
         pd.DataFrame(test_rows).to_csv(
             os.path.join(args.output_dir, "test_results.csv"), index=False)
@@ -1094,6 +1063,7 @@ def run_train(args):
             "test_auc_q50_by_p":  {f"{p:.2f}": per_p_q50[p]   for p in per_p_q50},
             "test_auc_q75_by_p":  {f"{p:.2f}": per_p_q75[p]   for p in per_p_q75},
             "eval_split":         eval_split,
+            "temperature":        T_star,
             "num_species":        config.num_species,
             "num_epochs":         args.num_epochs,
             "seed":               args.seed,

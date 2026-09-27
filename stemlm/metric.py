@@ -105,7 +105,7 @@ def safe_cbi(labels: np.ndarray, logits: np.ndarray,
     lo, hi = float(logits.min()), float(logits.max())
     if hi <= lo:
         return float("nan")
-    u = (logits - lo) / (hi - lo)
+    u = (logits - lo) / (hi - lo) # The extreme scores sit exactly on outer window edges; only this form keeps their membership fixed under z / T.
     half_w = 0.5 * bin_width_frac
     centers = np.linspace(0.0, 1.0, n_windows)
     pres_sorted = np.sort(u[labels == 1])

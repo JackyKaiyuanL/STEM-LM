@@ -494,34 +494,16 @@ class JSDMDataCollator:
                         f"unif range must satisfy 0 <= lo <= hi <= 1; got [{lo}, {hi}]"
                     )
                 return f"unif:{lo},{hi}"
-            if r.startswith("beta:"):
-                try:
-                    a, b = [float(x) for x in r[len("beta:"):].split(",")]
-                except ValueError:
-                    raise ValueError(f"beta params must be 'beta:alpha,beta'; got {r!r}") from None
-                if not (a > 0.0 and b > 0.0):
-                    raise ValueError(f"beta alpha and beta must be > 0; got ({a}, {b})")
-                return f"beta:{a},{b}"
-            raise ValueError(
-                f"mask rate string must be 'unif', 'unif:lo,hi', or 'beta:alpha,beta'; got {r!r}"
-            )
+            raise ValueError(f"mask rate string must be 'unif' or 'unif:lo,hi'; got {r!r}")
         r = float(r)
         if not 0.0 <= r <= 1.0:
-            raise ValueError(f"mask rate must be in [0, 1] or 'unif[:lo,hi]' or 'beta:alpha,beta'; got {r}")
+            raise ValueError(f"mask rate must be in [0, 1] or 'unif[:lo,hi]'; got {r}")
         return r
 
     def _sample_row_rates(self, B, r):
         if isinstance(r, str):
-            if r.startswith("unif:"):
-                lo, hi = [float(x) for x in r[len("unif:"):].split(",")]
-                return torch.rand(B, generator=self.generator) * (hi - lo) + lo
-            if r.startswith("beta:"):
-                a, b = [float(x) for x in r[len("beta:"):].split(",")]
-                if self.generator is not None:
-                    seed = int(torch.randint(0, 2**31 - 1, (1,), generator=self.generator).item())
-                    rng = np.random.default_rng(seed)
-                    return torch.from_numpy(rng.beta(a, b, size=B).astype(np.float32))
-                return torch.from_numpy(np.random.beta(a, b, size=B).astype(np.float32))
+            lo, hi = [float(x) for x in r[len("unif:"):].split(",")]
+            return torch.rand(B, generator=self.generator) * (hi - lo) + lo
         return torch.full((B,), float(r))
 
     @staticmethod

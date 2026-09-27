@@ -1,13 +1,6 @@
-"""The fast metric paths must agree with the implementations they replaced.
-
-compute_per_species_metrics is the per-epoch validation cost (7 min per pass at
-71M-scale val), so AUROC/AP now share one sort instead of calling sklearn twice,
-ECE bins with bincount instead of one mask per bin, CBI counts windows with
-searchsorted instead of rescanning, and species run on a thread pool. Each is
-checked here against a direct implementation of the original.
-"""
 import numpy as np
 import pytest
+from scipy.special import expit
 from scipy.stats import spearmanr
 from sklearn.metrics import average_precision_score, roc_auc_score
 
@@ -35,15 +28,14 @@ def _ece_maskwise(labels, preds, n_bins=15):
 
 
 def _cbi_looped(labels, preds, n_windows=101, bin_width_frac=0.1):
-    """The previous CBI: rescan both arrays for every window."""
-    pres = preds[labels == 1]
-    lo, hi = float(preds.min()), float(preds.max())
-    half_w = 0.5 * bin_width_frac * (hi - lo)
-    centers = np.linspace(lo, hi, n_windows)
+    u = (preds - preds.min()) / (preds.max() - preds.min())
+    pres = u[labels == 1]
+    half_w = 0.5 * bin_width_frac
+    centers = np.linspace(0.0, 1.0, n_windows)
     pe = np.full(n_windows, np.nan)
     for i, ctr in enumerate(centers):
         a, b = ctr - half_w, ctr + half_w
-        e = ((preds >= a) & (preds <= b)).sum() / preds.size
+        e = ((u >= a) & (u <= b)).sum() / u.size
         if e == 0:
             continue
         pe[i] = (((pres >= a) & (pres <= b)).sum() / pres.size) / e
@@ -121,35 +113,38 @@ def test_cbi_matches_looped(seed):
     assert safe_cbi(y, p) == pytest.approx(_cbi_looped(y, p), rel=1e-12, abs=1e-15)
 
 
-def _per_species_serial_sklearn(probs, labels):
-    """The previous per-species loop, sklearn metrics, single threaded."""
+def _per_species_serial_sklearn(logits, labels):
     from stemlm.metric import safe_brier
-    S = probs.shape[1]
+    S = logits.shape[1]
     out = {k: {} for k in ("auc_roc", "auc_pr", "cbi", "brier", "ece")}
     for s in range(S):
         mask = labels[:, s] != -100
         y = labels[mask, s].astype(np.int64)
-        p = probs[mask, s].astype(np.float64)
+        z = logits[mask, s].astype(np.float64)
         if y.size == 0 or y.sum() == 0 or y.sum() == y.size:
             continue
+        p = expit(z)
         out["auc_roc"][s] = safe_auc_roc(y, p)
         out["auc_pr"][s] = safe_auc_pr(y, p)
-        out["cbi"][s] = safe_cbi(y, p)
+        out["cbi"][s] = safe_cbi(y, z)
         out["brier"][s] = safe_brier(y, p)
         out["ece"][s] = safe_ece(y, p)
     return out
 
 
+def _random_logits(rng, n, S, prevalence):
+    labels = (rng.random((n, S)) < prevalence).astype(np.int64)
+    return 2.0 * labels - 3.0 + rng.normal(0, 1.0, (n, S)), labels
+
+
 def test_per_species_metrics_match_serial_sklearn():
     rng = np.random.default_rng(11)
-    n, S = 3000, 12
-    labels = (rng.random((n, S)) < 0.08).astype(np.int64)
-    probs = np.clip(0.4 * labels + rng.normal(0, 0.25, (n, S)), 0, 1)
-    # a couple of species get partially masked, and one is degenerate
+    n = 3000
+    logits, labels = _random_logits(rng, n, 12, 0.08)
     labels[: n // 3, 2] = -100
     labels[:, 5] = 0
-    got = compute_per_species_metrics(probs, labels)
-    ref = _per_species_serial_sklearn(probs, labels)
+    got = compute_per_species_metrics(logits, labels)
+    ref = _per_species_serial_sklearn(logits, labels)
     assert got.keys() == ref.keys()
     for name in ref:
         assert got[name].keys() == ref[name].keys(), name
@@ -159,10 +154,20 @@ def test_per_species_metrics_match_serial_sklearn():
 
 def test_per_species_metrics_thread_count_does_not_change_results():
     rng = np.random.default_rng(12)
-    n, S = 1500, 9
-    labels = (rng.random((n, S)) < 0.1).astype(np.int64)
-    probs = np.clip(0.4 * labels + rng.normal(0, 0.3, (n, S)), 0, 1)
-    serial = compute_per_species_metrics(probs, labels, max_workers=1)
-    parallel = compute_per_species_metrics(probs, labels, max_workers=8)
+    logits, labels = _random_logits(rng, 1500, 9, 0.1)
+    serial = compute_per_species_metrics(logits, labels, max_workers=1)
+    parallel = compute_per_species_metrics(logits, labels, max_workers=8)
     for name in serial:
         assert serial[name] == parallel[name], name
+
+
+@pytest.mark.parametrize("T", [0.5, 2.0, 3.7])
+def test_ranking_and_cbi_invariant_to_temperature(T):
+    rng = np.random.default_rng(13)
+    logits, labels = _random_logits(rng, 4000, 10, 0.06)
+    base = compute_per_species_metrics(logits, labels)
+    scaled = compute_per_species_metrics(logits / T, labels)
+    for name in ("auc_roc", "auc_pr", "cbi"):
+        for s, v in base[name].items():
+            assert scaled[name][s] == pytest.approx(v, rel=1e-12, abs=1e-12), (name, s)
+    assert any(scaled["brier"][s] != v for s, v in base["brier"].items())
