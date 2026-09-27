@@ -1,0 +1,42 @@
+ARCO-ERA5 — Date-Matched Daily Weather
+======================================
+Product:   ERA5 hourly reanalysis, Analysis-Ready Cloud-Optimized mirror (ARCO-ERA5)
+Store:     gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3
+Access:    Public Google Cloud bucket, read anonymously with xarray + zarr + gcsfs; no account
+License:   Copernicus License (free for all uses)
+Citation:  Hersbach, H. et al. (2020). The ERA5 global reanalysis. Q. J. R. Meteorol. Soc. 146:1999–2049.
+           ARCO mirror: Carver, R. W. and Merose, A. (2023), https://github.com/google-research/arco-era5
+
+Spatial resolution: 0.25° × 0.25°
+Temporal resolution: hourly, 1940 to present
+Bounding box read:  7–72 °N, 170–50 °W (NA + Mesoamerica)
+
+
+VARIABLES AND DAILY AGGREGATION  (extract_era5_at_points.py)
+------------------------------------------------------------
+For every (latitude, longitude, date) row the extractor loads the month that
+contains the date, aggregates hourly values to UTC calendar days, and samples
+the nearest grid cell and day:
+
+  env_t2m_min   daily minimum of 2m_temperature        (K)
+  env_t2m_max   daily maximum of 2m_temperature        (K)
+  env_t2m_mean  daily mean of 2m_temperature           (K)
+  env_tp_sum    daily sum of total_precipitation       (m)
+
+Temperatures are lapse-rate corrected to the site elevation:
+  t_site = t_era5 + (z_era5 − z_dem) × 0.0065 K/m
+where z_dem is sampled from the Copernicus GLO-30 DEM
+(../copernicus_dem/COP30_hh_vsicurl.vrt) and z_era5 is the ERA5 invariant
+surface geopotential divided by g = 9.80665 m/s². The geopotential is
+downloaded once from the Copernicus CDS (reanalysis-era5-single-levels,
+variable geopotential, 2020-01-01 00:00; requires ~/.cdsapirc) and cached at
+~/.cache/era5_orog_na.nc, because the in-store surface geopotential is NaN
+over land.
+
+
+USED BY
+-------
+  ../../eButterfly/enrich_ebutterfly_na.py   observation rows
+  ../../Monarch/enrich_grid_daily.py         grid cells on the map dates
+Both call extract_era5_at_points.py with the same arguments, so observation
+and grid covariates are computed identically.

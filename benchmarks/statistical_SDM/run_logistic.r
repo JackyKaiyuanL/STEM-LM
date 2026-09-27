@@ -1,6 +1,5 @@
 suppressPackageStartupMessages({
   library(jsonlite)
-  library(mgcv)
   library(parallel)
 })
 
@@ -13,6 +12,7 @@ DATA_FILE   <- need("DATA_FILE")
 SPLITS_FILE <- need("SPLITS_FILE")
 results_dir <- need("RESULTS_DIR")
 N_CORES     <- as.integer(Sys.getenv("N_CORES", unset = "8"))
+DOY_PERIODS <- as.numeric(strsplit(Sys.getenv("DOY_PERIODS", unset = "365,182,122,91"), ",")[[1]])
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
 COV_SETS <- c("env", "spatiotemporal", "full")
@@ -22,22 +22,26 @@ dat      <- read.csv(DATA_FILE, check.names = FALSE)
 env_cols <- grep("^env_", names(dat), value = TRUE)
 all_sp   <- setdiff(names(dat), c("time", "latitude", "longitude", env_cols))
 
-doy_term <- character(0)
+doy_cols <- character(0)
 if ("time" %in% names(dat)) {
-  dat$doy <- as.POSIXlt(as.Date(dat$time))$yday + 1L
-  if (length(unique(dat$doy)) > 1) doy_term <- "s(doy, bs = 'cc', k = 12)"
+  doy <- as.POSIXlt(as.Date(dat$time))$yday + 1L
+  if (length(unique(doy)) > 1) {
+    for (P in DOY_PERIODS) {
+      sn <- sprintf("doy_sin_%d", P); cn <- sprintf("doy_cos_%d", P)
+      dat[[sn]] <- sin(2 * pi * doy / P)
+      dat[[cn]] <- cos(2 * pi * doy / P)
+      doy_cols <- c(doy_cols, sn, cn)
+    }
+  }
 }
 
 splits    <- fromJSON(SPLITS_FILE)
 idx       <- list(train = splits$train + 1L, val = splits$val + 1L, test = splits$test + 1L)
 train_dat <- dat[idx$train, ]
 
-env_terms <- paste(vapply(env_cols, function(v) {
-  k <- min(10L, length(unique(train_dat[[v]])) - 1L)
-  if (k >= 3L) sprintf("s(%s, k = %d)", v, k) else v
-}, character(1)), collapse = " + ")
-st_terms <- paste(c("s(latitude, longitude, k = 50)", doy_term), collapse = " + ")
-formulas <- list(
+env_terms <- paste(env_cols, collapse = " + ")
+st_terms  <- paste(c("latitude * longitude", doy_cols), collapse = " + ")
+formulas  <- list(
   env            = paste("y ~", env_terms),
   spatiotemporal = paste("y ~", st_terms),
   full           = paste("y ~", env_terms, "+", st_terms)
@@ -47,14 +51,14 @@ cat(sprintf("Data: %d rows | %d species | %d env | train %d val %d test %d\n",
             nrow(dat), length(all_sp), length(env_cols),
             length(idx$train), length(idx$val), length(idx$test)))
 writeLines(c(paste0("data_file=", DATA_FILE), paste0("splits_file=", SPLITS_FILE),
-             paste0("model_", names(formulas), "=bam(", unlist(formulas), ", binomial, discrete)")),
+             paste0("model_", names(formulas), "=glm(", unlist(formulas), ", binomial)")),
            file.path(results_dir, "run_params.txt"))
 
 fit_predict_species <- function(sp, cs, out_dir) {
   y_tr <- train_dat[[sp]]
   if (sum(y_tr) == 0 || sum(y_tr) == length(y_tr)) return(NULL)
-  m <- tryCatch(bam(as.formula(formulas[[cs]]), data = cbind(train_dat, y = y_tr),
-                    family = binomial(link = "logit"), discrete = TRUE, nthreads = 1),
+  m <- tryCatch(glm(as.formula(formulas[[cs]]), data = cbind(train_dat, y = y_tr),
+                    family = binomial(link = "logit"), control = glm.control(maxit = 200)),
                 error = function(e) { warning(conditionMessage(e)); NULL })
   if (is.null(m)) return(data.frame(species = sp, cov_set = cs, converged = FALSE))
   sp_safe <- gsub("[^A-Za-z0-9]", "_", sp)

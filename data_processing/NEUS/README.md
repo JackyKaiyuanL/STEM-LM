@@ -13,8 +13,9 @@ Only NEUS is used. The four other NW Atlantic surveys in FISHGLOB (SCS, GSL-N, G
 1. **`prepare_neus.py`** — extracts hauls and occurrences from the RData compilation via Rscript, filters years, drops hauls with incomplete date or covariates, zero-fills to presence/absence over taxa with ≥100 hauls, and attaches the three in-survey covariates.
    - Output: `neus_nefsc.csv` (the file STEM-LM consumes).
 
-2. **`regen_splits.py`** — H3 spatial-block split, seed 42, 80/10/10.
-   - Output: `neus_nefsc_splits.json`.
+2. **`../regen_splits.py`** — H3 spatial-block split (resolution 4, 80/10/10), one file per split seed (41, 42, 43).
+   - `python ../regen_splits.py neus_nefsc.csv --splits_path neus_nefsc_splits_seed42.json --resolution 4 --seed 42`
+   - Output: `neus_nefsc_splits_seed{41,42,43}.json`.
    - Use `--resolution 4`, not 2. The domain is 18.1° × 16.0°, about a tenth of the continental datasets: at resolution 2 the data falls in 15 cells with one cell holding 34.7% of hauls and a 10% test split drawn from 2 cells. Resolution 4 gives 77 cells, largest 3.9%, test drawn from 8.
 
 ## Environmental covariates

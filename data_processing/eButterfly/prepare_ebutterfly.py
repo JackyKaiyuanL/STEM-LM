@@ -6,8 +6,8 @@ Source: eButterfly DwC-A from GBIF (cf3bdc30-370c-48d3-8fff-b587a39d72d6)
 
 Outputs (two files per run):
   ebutterfly[_us]_2011_2025_jsdm.csv — 2011–2025, time = ISO date (YYYY-MM-DD)
-                                       For temporal modeling with ERA5-Land + MODIS dynamic
-  ebutterfly[_us]_static_jsdm.csv    — all years, time = 0 (compressed, like SatButterfly)
+                                       For temporal modeling with ARCO-ERA5 + MODIS dynamic
+  ebutterfly[_us]_static_jsdm.csv    — all years, time = 0
                                        For static modeling with WorldClim + DEM + MODIS climatology
 
   Columns: time, latitude, longitude, <species...>

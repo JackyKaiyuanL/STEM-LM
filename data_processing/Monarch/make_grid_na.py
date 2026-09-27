@@ -24,9 +24,9 @@ REPO_ROOT = os.environ.get(
     "REPO_ROOT",
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
 )
-ENV_DIR = os.path.join(REPO_ROOT, "Examples", "env_vars")
+ENV_DIR = os.environ.get("ENV_DIR", os.path.join(REPO_ROOT, "Examples", "env_vars"))
 SG_DIR  = os.path.join(ENV_DIR, "soilgrids", "raw")
-DEM_VRT = os.path.join(ENV_DIR, "copernicus_dem", "COP30_hh_vsicurl.vrt")
+DEM_VRT = os.path.join(REPO_ROOT, "data_processing", "covariates", "copernicus_dem", "COP30_hh_vsicurl.vrt")
 
 LON_MIN, LON_MAX = -170.0, -50.0
 LAT_MIN, LAT_MAX =    7.0,  72.0
@@ -115,14 +115,6 @@ def main(resolution, output):
     print("Extracting DEM ...")
     dem = sample_dem(lons, lats)
 
-    env = np.concatenate([dem.reshape(-1, 1), sg], axis=1)
-    sg_zero = (sg == 0)
-    sg = np.where(sg_zero, np.nan, sg)
-    for j in range(sg.shape[1]):
-        col = sg[:, j]
-        col_mean = np.nanmean(col)
-        col[np.isnan(col)] = col_mean
-        sg[:, j] = col
     env = np.concatenate([dem.reshape(-1, 1), sg], axis=1)
     keep = np.isfinite(env).all(axis=1)
     print(f"\nFinal land mask: {keep.sum():,} / {len(lats):,} kept "
