@@ -37,22 +37,21 @@ safe_ece <- function(labels, preds, n_bins = 15) {
   err
 }
 
-# CBI: bg-only "expected" denominator, min_per_window floor
-safe_cbi <- function(labels, preds, n_windows = 101, width = 0.1, min_per_window = 10) {
+safe_cbi <- function(labels, preds, n_windows = 101, width = 0.1) {
   if (sum(labels) == 0 || sum(labels) == length(labels)) return(NA_real_)
   if (any(is.na(preds))) return(NA_real_)
-  pres_preds <- preds[labels == 1]
-  bg_preds   <- preds[labels == 0]
-  if (length(bg_preds) == 0 || length(pres_preds) == 0) return(NA_real_)
+  z  <- log(preds) - log1p(-preds)
+  lo <- min(z)
+  hi <- max(z)
+  if (hi <= lo) return(NA_real_)
+  u       <- (z - lo) / (hi - lo)
+  pres    <- u[labels == 1]
   centers <- seq(0, 1, length.out = n_windows)
   half_w  <- width / 2
   pe <- vapply(centers, function(ctr) {
-    n_bg <- sum(bg_preds >= (ctr - half_w) & bg_preds <= (ctr + half_w))
-    if (n_bg < min_per_window) return(NA_real_)
-    e_frac <- n_bg / length(bg_preds)
+    e_frac <- sum(u >= ctr - half_w & u <= ctr + half_w) / length(u)
     if (e_frac == 0) return(NA_real_)
-    p_frac <- sum(pres_preds >= (ctr - half_w) & pres_preds <= (ctr + half_w)) / length(pres_preds)
-    p_frac / e_frac
+    (sum(pres >= ctr - half_w & pres <= ctr + half_w) / length(pres)) / e_frac
   }, numeric(1))
   ok <- is.finite(pe)
   if (sum(ok) < 3 || length(unique(pe[ok])) < 2) return(NA_real_)
