@@ -5,6 +5,7 @@
     <MDI key="AREA_OR_POINT">Point</MDI>
   </Metadata>
   <VRTRasterBand dataType="Float32" band="1">
+    <NoDataValue>-32767</NoDataValue>
     <ColorInterp>Gray</ColorInterp>
     <SimpleSource>
       <SourceFilename relativeToVRT="0">/vsicurl/https://opentopography.s3.sdsc.edu/raster/COP30/COP30_hh/Copernicus_DSM_10_N73_00_W030_00_DEM.tif</SourceFilename>

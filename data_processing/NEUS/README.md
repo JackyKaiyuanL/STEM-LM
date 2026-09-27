@@ -10,7 +10,7 @@ Only NEUS is used. The four other NW Atlantic surveys in FISHGLOB (SCS, GSL-N, G
 
 ## Pipeline (run in order)
 
-1. **`prepare_neus.py`** — extracts hauls and occurrences from the RData compilation via Rscript, filters years, drops hauls with incomplete date or covariates, zero-fills to presence/absence over taxa with ≥100 hauls, and attaches the three in-survey covariates.
+1. **`prepare_neus.py`** — extracts hauls and occurrences from the RData compilation via Rscript, filters years, drops hauls with incomplete date or coordinates, leaves missing covariates as NaN, zero-fills to presence/absence over taxa with ≥100 hauls, and attaches the three in-survey covariates.
    - Output: `neus_nefsc.csv` (the file STEM-LM consumes).
 
 2. **`../regen_splits.py`** — H3 spatial-block split (resolution 4, 80/10/10), one file per split seed (41, 42, 43).
@@ -28,7 +28,7 @@ All three are measured at the haul by the survey itself, so `env_sbt` and `env_s
 | `env_sbt` | Bottom temperature | °C | 87.3% |
 | `env_sst` | Surface temperature | °C | 89.1% |
 
-FISHGLOB passes NOAA's `BOTTEMP` and `SURFTEMP` through unchanged (`cleaning_codes/get_neus.R:211-212`); there is no documented fill convention. 104 hauls carry `sst` exactly 0.00 and 2 carry `sbt` exactly 0.00, against 113 hauls below 1 °C in total. These are left as-is rather than recoded.
+FISHGLOB passes NOAA's `BOTTEMP` and `SURFTEMP` through unchanged (`cleaning_codes/get_neus.R:211-212`); there is no documented fill convention. 104 hauls carry `sst` exactly 0.00 and 2 carry `sbt` exactly 0.00, against 113 hauls below 1 °C in total. `--zero_temp_is_missing` recodes them as missing; `neus_nefsc.csv` is built with it (`--year_min 1970 --year_max 2019 --zero_temp_is_missing`).
 
 Salinity is the covariate most obviously missing and is not obtainable in situ here; GLORYS12V1 would supply it from 1993 onward.
 

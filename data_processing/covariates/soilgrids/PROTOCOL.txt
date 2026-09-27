@@ -63,8 +63,8 @@ PROCESSING NOTES
 - Native projection is Interrupted Goode's Homolosine — must reproject
   to WGS84 before merging with WorldClim.
 - Use bilinear resampling when upscaling from 250 m to 1 km.
-- NoData over ocean/water is expected — these cells will be masked anyway
-  by the land mask during inference grid generation.
+- The WCS GeoTIFFs carry no nodata tag and store nodata as 0. Extraction
+  (covariates/extract_env_static.py: sample_soilgrids) writes it as NaN.
 - Scale factors: SoilGrids values are stored as integers with a scale factor
   (e.g., bdod ÷ 100 = g/cm³). Apply scale before saving or at extraction time.
   Confirm scale factors from SoilGrids documentation for each variable.

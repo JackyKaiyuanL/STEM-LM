@@ -27,7 +27,7 @@ Datasets and their SoilGrids region key:
   ebutterfly_us       → soilgrids region: na  (US is a spatial subset of NA tiles)
 """
 
-import argparse, math, os
+import argparse, math, os, re
 import numpy as np
 import pandas as pd
 import rasterio
@@ -39,6 +39,7 @@ ENV_DIR    = os.environ.get("ENV_DIR", os.path.join(REPO_ROOT, "Examples", "env_
 WC_ZIP     = f"{ENV_DIR}/worldclim/raw/wc2.1_30s_bio.zip"
 SG_DIR     = f"{ENV_DIR}/soilgrids/raw"
 COP_BASE   = "https://opentopography.s3.sdsc.edu/raster/COP30/COP30_hh"
+DEM_VRT    = os.path.join(REPO_ROOT, "data_processing", "covariates", "copernicus_dem", "COP30_hh_vsicurl.vrt")
 
 WORLDCLIM_VARS = [f"bio{i:02d}" for i in range(1, 20)]   # bio01..bio19
 SOILGRIDS_VARS = ["bdod", "cec", "cfvo", "clay", "nitrogen", "phh2o", "sand", "silt"]
@@ -75,10 +76,10 @@ os.environ["GDAL_HTTP_MULTIPLEX"] = "YES"
 
 
 def sample_raster(path, coords_xy):
-    """Sample a raster at list of (lon, lat) tuples. Returns np.array."""
+    """Sample band 1 at (lon, lat) tuples; nodata becomes NaN."""
     with rasterio.open(path) as src:
-        vals = np.array(list(src.sample(coords_xy, masked=True)), dtype=np.float32)
-    return vals[:, 0]  # single band
+        vals = np.ma.stack(list(src.sample(coords_xy, masked=True)))[:, 0]
+    return vals.astype(np.float32).filled(np.nan)
 
 
 def sample_worldclim(lons, lats):
@@ -102,20 +103,18 @@ def sample_soilgrids(lons, lats, region):
         tif_path = os.path.join(SG_DIR, f"{var}_0-5cm_{region}.tif")
         vrt_path = os.path.join(SG_DIR, f"{var}_0-5cm_{region}.vrt")
         path = tif_path if os.path.exists(tif_path) else vrt_path
-        if not os.path.exists(path):
-            print(f"  MISSING: {tif_path} (or {vrt_path}) — skipping")
-            continue
         print(f"  SoilGrids {var} ...", flush=True)
         vals = sample_raster(path, coords)
+        vals[vals == 0] = np.nan
         out[:, i] = vals
     return out
 
 
 def sample_dem(lons, lats):
-    """Sample Copernicus DEM via vsicurl, grouping by tile for efficiency."""
+    """Sample Copernicus DEM via vsicurl, grouping by tile; points outside every tile are NaN."""
     out = np.full(len(lons), np.nan, dtype=np.float32)
+    listed = set(re.findall(r"Copernicus_DSM_10_\w+_DEM\.tif", open(DEM_VRT).read()))
 
-    # Group point indices by their 1°x1° tile
     tile_groups = defaultdict(list)
     for idx, (lon, lat) in enumerate(zip(lons, lats)):
         tlat = math.floor(lat)
@@ -128,23 +127,12 @@ def sample_dem(lons, lats):
     n_tiles = len(tile_groups)
     print(f"  DEM: {n_tiles} unique tiles for {len(lons)} points ...", flush=True)
     for t, (tile_name, idxs) in enumerate(tile_groups.items()):
-        url = f"/vsicurl/{COP_BASE}/{tile_name}"
-        coords = [(lons[i], lats[i]) for i in idxs]
-        try:
-            with rasterio.open(url) as src:
-                vals = np.array(list(src.sample(coords, masked=True)),
-                                dtype=np.float32)[:, 0]
-            for i, idx in enumerate(idxs):
-                out[idx] = vals[i]
-        except Exception as e:
-            print(f"    WARN tile {tile_name}: {e}")
+        if tile_name in listed:
+            out[idxs] = sample_raster(f"/vsicurl/{COP_BASE}/{tile_name}", [(lons[i], lats[i]) for i in idxs])
         if (t + 1) % 50 == 0:
             print(f"    {t+1}/{n_tiles} tiles done", flush=True)
 
-    n_nan = np.isnan(out).sum()
-    if n_nan:
-        print(f"  DEM: {n_nan} NaN values (ocean/water tiles → set to 0)")
-        out = np.nan_to_num(out, nan=0.0)
+    print(f"  DEM: {np.isnan(out).sum()} points outside every Copernicus tile → NaN")
     return out
 
 
@@ -156,7 +144,6 @@ def enrich_csv(
     include_worldclim: bool = True,
     include_soilgrids: bool = True,
     include_dem: bool = True,
-    min_presences: int = 100,
 ):
     if not (include_worldclim or include_soilgrids or include_dem):
         raise ValueError("Nothing to do: all extraction steps disabled.")
@@ -173,9 +160,8 @@ def enrich_csv(
     print(f"Loading {csv_path} ...")
     df = pd.read_csv(csv_path)
 
-    # Skip if requested env cols already present and complete
-    if all(c in df.columns for c in env_cols) and not df[env_cols].isna().any().any():
-        print("Requested env columns already present and complete — nothing to do.")
+    if all(c in df.columns for c in env_cols):
+        print("Requested env columns already present — nothing to do.")
         if out_path != csv_path:
             df.to_csv(out_path, index=False)
             print(f"Saved copy → {out_path}")
@@ -222,26 +208,9 @@ def enrich_csv(
 
     out = pd.concat([df[meta_cols], merged_env, df[species_cols]], axis=1)
 
-    # Drop rows with any NaN in env columns present — incomplete coverage is unacceptable
-    final_env_cols = [c for c in out.columns if c.startswith("env_")]
-    before = len(out)
-    out = out.dropna(subset=final_env_cols).reset_index(drop=True)
-    dropped = before - len(out)
-    if dropped:
-        print(f"\nDropped {dropped} rows with NaN env values "
-              f"({dropped/before:.1%} of plots)")
-        # Re-apply min_presences filter on remaining rows
-        sp_remaining = [c for c in out.columns if c not in meta_cols + env_cols]
-        keep2 = [c for c in sp_remaining if out[c].sum() >= min_presences]
-        dropped_sp = len(sp_remaining) - len(keep2)
-        if dropped_sp:
-            print(f"  Re-filtered species: {len(keep2)} kept, {dropped_sp} dropped "
-                  f"(fell below {min_presences} presences after row drop)")
-        out = out[meta_cols + env_cols + keep2]
-    else:
-        print(f"\nNo NaN values — all {len(out)} rows complete.")
-
-    assert not out[env_cols].isna().any().any(), "NaN still present after drop!"
+    n_missing = out[[c for c in out.columns if c.startswith("env_")]].isna().sum()
+    print("\nMissing env values: "
+          + (", ".join(f"{c} {n}" for c, n in n_missing[n_missing > 0].items()) or "none"))
 
     out.to_csv(out_path, index=False)
     print(f"Saved → {out_path}")
@@ -249,7 +218,7 @@ def enrich_csv(
           f"{len([c for c in out.columns if c not in meta_cols+env_cols])} species)")
 
 
-def main(dataset, min_presences=100):
+def main(dataset):
     cfg = DATASET_CONFIG[dataset]
     enrich_csv(
         cfg["csv"],
@@ -258,7 +227,6 @@ def main(dataset, min_presences=100):
         include_worldclim=True,
         include_soilgrids=True,
         include_dem=True,
-        min_presences=min_presences,
     )
 
 
@@ -277,7 +245,6 @@ if __name__ == "__main__":
                    help="Skip SoilGrids env_{bdod..silt} extraction")
     p.add_argument("--no_dem", action="store_true",
                    help="Skip DEM env_dem extraction")
-    p.add_argument("--min_presences", type=int, default=100)
     a = p.parse_args()
 
     if a.dataset:
@@ -296,7 +263,6 @@ if __name__ == "__main__":
             include_worldclim=not a.no_worldclim,
             include_soilgrids=not a.no_soilgrids,
             include_dem=not a.no_dem,
-            min_presences=a.min_presences,
         )
     except ValueError as e:
         raise SystemExit(str(e))

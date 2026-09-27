@@ -4,7 +4,7 @@ Builds the 0.5° North America grid used to render the monarch butterfly (*Danau
 
 ## Pipeline (run in order)
 
-1. **`make_grid_na.py`** — builds the land-only static grid over North America with SoilGrids (8 properties, 0–5 cm) and Copernicus GLO-30 DEM elevation. Mexico → southern Canada; Hawaii excluded. Soil values are kept exactly as sampled, as in the observation datasets.
+1. **`make_grid_na.py`** — builds the land-only static grid over North America with SoilGrids (8 properties, 0–5 cm) and Copernicus GLO-30 DEM elevation. Mexico → southern Canada; Hawaii excluded. SoilGrids nodata is written as NaN, as in the observation datasets; cells outside every DEM tile are dropped.
    - Output: `static_grid_na.csv`.
 
 2. **`enrich_grid_daily.py`** — for each requested date, runs the grid cells through the same covariate code as the eButterfly observations: `covariates/era5/extract_era5_at_points.py` for ARCO-ERA5 daily 2 m temperature (min/max/mean) and total precipitation (lapse-rate corrected to the DEM), and `covariates/modis_phenology/mod13q1.py` for NDVI/EVI from the 16-day composite nearest the date.

@@ -8,7 +8,7 @@ Output columns: latitude, longitude, env_dem,
 
 Land mask:
   1. Natural Earth admin_0 country polygons (US/Canada/Mexico/Mesoamerica).
-  2. Raster nodata (cells where any soil var or DEM is nodata are dropped).
+  2. Cells outside every Copernicus DEM tile are dropped; SoilGrids nodata stays NaN.
 
 Usage:
   python make_grid_na.py --resolution 0.5 --output static_grid_na.csv
@@ -16,17 +16,17 @@ Usage:
 
 import argparse
 import os
+import sys
 import numpy as np
 import pandas as pd
-import rasterio
 
 REPO_ROOT = os.environ.get(
     "REPO_ROOT",
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
 )
-ENV_DIR = os.environ.get("ENV_DIR", os.path.join(REPO_ROOT, "Examples", "env_vars"))
-SG_DIR  = os.path.join(ENV_DIR, "soilgrids", "raw")
 DEM_VRT = os.path.join(REPO_ROOT, "data_processing", "covariates", "copernicus_dem", "COP30_hh_vsicurl.vrt")
+sys.path.insert(0, os.path.join(REPO_ROOT, "data_processing", "covariates"))
+from extract_env_static import sample_raster, sample_soilgrids  # noqa: E402
 
 LON_MIN, LON_MAX = -170.0, -50.0
 LAT_MIN, LAT_MAX =    7.0,  72.0
@@ -63,31 +63,6 @@ def make_grid(resolution):
     return lat_g.ravel(), lon_g.ravel()
 
 
-def sample_raster(path, coords):
-    with rasterio.open(path) as src:
-        vals = np.array(list(src.sample(coords, masked=True)), dtype=np.float32)
-    v = vals[:, 0] if vals.ndim == 2 else vals
-    if hasattr(v, "filled"):
-        v = v.filled(np.nan)
-    return v
-
-
-def sample_soil(lons, lats):
-    coords = list(zip(lons.tolist(), lats.tolist()))
-    out = np.full((len(lons), len(SOIL_VARS)), np.nan, dtype=np.float32)
-    for i, var in enumerate(SOIL_VARS):
-        path = os.path.join(SG_DIR, f"{var}_0-5cm_na.tif")
-        if not os.path.exists(path):
-            print(f"  MISSING: {path}")
-            continue
-        print(f"  SoilGrids {var} ...", end="\r", flush=True)
-        vals = sample_raster(path, coords)
-        vals[vals > 1e6] = np.nan
-        out[:, i] = vals
-    print()
-    return out
-
-
 def sample_dem(lons, lats):
     coords = list(zip(lons.tolist(), lats.tolist()))
     print("  DEM via VRT ...", flush=True)
@@ -111,12 +86,12 @@ def main(resolution, output):
     print(f"After country mask: {len(lats):,} points")
 
     print("\nExtracting SoilGrids ...")
-    sg = sample_soil(lons, lats)
+    sg = sample_soilgrids(lons, lats, "na")
     print("Extracting DEM ...")
     dem = sample_dem(lons, lats)
 
     env = np.concatenate([dem.reshape(-1, 1), sg], axis=1)
-    keep = np.isfinite(env).all(axis=1)
+    keep = np.isfinite(dem)
     print(f"\nFinal land mask: {keep.sum():,} / {len(lats):,} kept "
           f"({keep.mean()*100:.1f}%)")
 

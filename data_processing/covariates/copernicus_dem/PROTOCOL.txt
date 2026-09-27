@@ -9,7 +9,7 @@ Citation: European Space Agency / Airbus (2021).
 
 Variable (1 total → env_dem):
   env_dem  Ellipsoidal height above WGS84 ellipsoid (metres)
-           Ocean / missing tiles filled with 0
+           Points outside every tile are NaN (the VRT declares NoDataValue -32767)
 
 Spatial resolution: 30 m (native); point extraction at native resolution
 Projection:         WGS84 geographic (EPSG:4326)
@@ -45,8 +45,8 @@ to read any region via VSICURL by updating tile paths to absolute URLs.
 PROCESSING NOTES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - Use bilinear resampling when downscaling 30 m → 1 km.
-- Ocean/water pixels may have NoData or value 0 — these will be masked
-  by the land mask during inference grid generation.
+- Tiles carry no nodata tag. Some coastal pixels inside a tile hold 0; that is
+  the tile's own value and is kept.
 - Tiles over high latitudes (>60°N) may have gaps filled from SRTM or
   TanDEM-X; this is fine for SDM applications.
 - For sPlotOpen Europe: download tiles covering lat 35–72°N, lon -12–40°E

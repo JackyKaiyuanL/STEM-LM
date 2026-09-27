@@ -86,9 +86,9 @@ def main(a):
             h.loc[h[v] == 0, v] = np.nan
             print(f"{v}: {n_zero} hauls at exactly 0.00 set to missing")
 
-    h = h.dropna(subset=["latitude", "longitude", "year", "month", "day"] + ENV)
-    print(f"hauls {n0} -> {len(h)} after dropping incomplete env/date "
-          f"({100 * (n0 - len(h)) / n0:.1f}% dropped)")
+    h = h.dropna(subset=["latitude", "longitude", "year", "month", "day"])
+    print(f"hauls {n0} -> {len(h)} after dropping incomplete coordinates/date | missing "
+          + ", ".join(f"{v} {int(h[v].isna().sum())}" for v in ENV))
 
     t = pd.to_datetime(dict(year=h.year.astype(int), month=h.month.astype(int),
                             day=h.day.astype(int)), errors="coerce")
@@ -111,7 +111,6 @@ def main(a):
         axis=1,
     ).reset_index(drop=True)
 
-    assert not df.isna().any().any(), "NaNs in output"
     print(f"shape {df.shape} | species {len(keep)} | "
           f"prevalence {df[keep].mean().min():.4f}-{df[keep].mean().max():.4f} | "
           f"richness/haul mean {df[keep].to_numpy().sum(1).mean():.2f}")

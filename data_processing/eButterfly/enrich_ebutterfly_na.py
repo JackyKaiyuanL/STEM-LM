@@ -33,6 +33,8 @@ REPO_ROOT = os.environ.get("REPO_ROOT",
 COVARIATES = os.path.join(REPO_ROOT, "data_processing", "covariates")
 sys.path.insert(0, os.path.join(COVARIATES, "modis_phenology"))
 from mod13q1 import extract_modis as sample_modis  # noqa: E402
+sys.path.insert(0, COVARIATES)
+from extract_env_static import SOILGRIDS_VARS, sample_raster, sample_soilgrids  # noqa: E402
 
 ENV_DIR   = os.environ.get("ENV_DIR",   os.path.join(REPO_ROOT, "Examples", "env_vars"))
 OBS_CSV   = os.environ.get("OBS_CSV",   os.path.join(REPO_ROOT, "lab", "ebutterfly_na_2011_2025_jsdm.csv"))
@@ -43,9 +45,6 @@ ERA5_CORR = os.environ.get("ERA5_CORR", os.path.join(REPO_ROOT, "lab", "_ebutter
 ERA5_EXTRACT = os.path.join(COVARIATES, "era5", "extract_era5_at_points.py")
 DEM_VRT      = os.path.join(COVARIATES, "copernicus_dem", "COP30_hh_vsicurl.vrt")
 MODIS_DIR    = os.path.join(ENV_DIR, "modis_phenology", "raw")
-SOIL_DIR     = os.path.join(ENV_DIR, "soilgrids", "raw")
-
-SOIL_VARS = ["bdod", "cec", "cfvo", "clay", "nitrogen", "phh2o", "sand", "silt"]
 
 LAPSE_K_PER_M = 0.0065
 
@@ -110,29 +109,18 @@ def extract_modis(obs):
 
 def extract_soil_dem(obs):
     sep("SoilGrids (0–5 cm, NA) + Copernicus DEM — static extract")
-    import rasterio
     lats = obs["latitude"].to_numpy()
     lons = obs["longitude"].to_numpy()
-    coords = list(zip(lons, lats))
 
+    soil = sample_soilgrids(lons, lats, "na")
     out = {}
-    for var in SOIL_VARS:
-        path = f"{SOIL_DIR}/{var}_0-5cm_na.tif"
-        if not os.path.exists(path):
-            log(f"SKIP env_soil_{var}: {path} missing")
-            continue
-        with rasterio.open(path) as src:
-            vals = np.fromiter((s[0] for s in src.sample(coords)),
-                               dtype=np.float32, count=len(lats))
-        # SoilGrids nodata varies; treat highly-negative as NaN
-        vals = np.where(vals < -32000, np.nan, vals)
+    for i, var in enumerate(SOILGRIDS_VARS):
+        vals = soil[:, i]
         out[f"env_soil_{var}"] = vals
         log(f"env_soil_{var:9s}: {np.isfinite(vals).sum()}/{len(lats)} valid   "
             f"mean={np.nanmean(vals):.2f}   range [{np.nanmin(vals):.1f}, {np.nanmax(vals):.1f}]")
 
-    with rasterio.open(DEM_VRT) as src:
-        dem_vals = np.fromiter((s[0] for s in src.sample(coords)),
-                               dtype=np.float32, count=len(lats))
+    dem_vals = sample_raster(DEM_VRT, list(zip(lons, lats)))
     out["env_dem"] = dem_vals
     log(f"env_dem    : {np.isfinite(dem_vals).sum()}/{len(lats)} valid   "
         f"mean={np.nanmean(dem_vals):.1f} m   range [{np.nanmin(dem_vals):.1f}, {np.nanmax(dem_vals):.1f}] m")
