@@ -20,7 +20,7 @@ KNOWN_RATIOS = (0.0, 0.25, 0.5, 0.75)
 def prepare_data(df, env_cols, species_cols, splits, data_dir):
     data_dir.mkdir(parents=True, exist_ok=True)
     ids = pd.DataFrame({"PlotObservationID": np.arange(len(df))})
-    env = (df[env_cols] - df[env_cols].iloc[splits["train"]].mean()).fillna(0.0)
+    env = df[env_cols].fillna(df[env_cols].iloc[splits["train"]].mean())
     pd.concat([ids, env], axis=1).to_csv(data_dir / "worldclim_data.csv", index=False)
     ids.to_csv(data_dir / "soilgrid_data.csv", index=False)
     pd.DataFrame({"species": species_cols}).to_csv(data_dir / "species_list.csv", index=False)
