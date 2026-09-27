@@ -14,6 +14,7 @@ from stemlm.data import FixedPValCollator, seed_worker
 # Species metrics are independent; cap the pool so a many-species run does
 # not spawn hundreds of threads on a large node.
 _METRIC_MAX_WORKERS = 32
+_METRIC_THREAD_MIN_ROWS = 25_000
 
 
 def auc_roc_and_pr(labels: np.ndarray, preds: np.ndarray) -> tuple[float, float]:
@@ -125,7 +126,8 @@ def compute_per_species_metrics(logits: np.ndarray,
                                 ) -> dict[str, dict[int, float]]:
     S = logits.shape[1]
     if max_workers is None:
-        max_workers = min(_METRIC_MAX_WORKERS, os.cpu_count() or 1, max(S, 1))
+        max_workers = (1 if logits.shape[0] < _METRIC_THREAD_MIN_ROWS
+                       else min(_METRIC_MAX_WORKERS, os.cpu_count() or 1, S))
 
     if max_workers <= 1:
         results = [_species_metrics(logits, labels, s) for s in range(S)]

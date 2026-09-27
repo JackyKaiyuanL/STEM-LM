@@ -17,7 +17,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from stemlm.data import (
     AbsenceMaskCollator,
-    build_val_loaders_fixed_p,
+    build_val_loader_fixed_p,
     create_dataloaders,
     save_splits,
     seed_worker,
@@ -181,36 +181,38 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch, e
 @torch.no_grad()
 def evaluate(model, loader, device, dist_info, env, amp_dtype=None, **loss_kw):
     model.eval()
-    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    K = len(loader.collate_fn.collators)
+    loss_sums = [torch.zeros((), device=device, dtype=torch.float64) for _ in range(K)]
+    batch_logits, batch_labels = [[] for _ in range(K)], [[] for _ in range(K)]
     num_batches = 0
-    batch_logits, batch_labels = [], []
     use_amp = amp_dtype is not None and device.type == "cuda"
 
-    for batch in loader:
-        batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            output = run_forward(model, batch, dist_info, labels=batch["labels"], **loss_kw)
-        loss_sum += output.loss.detach().double()
+    for batches in loader:
+        for k, batch in enumerate(batches):
+            batch = {key: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                     for key, v in batch.items()}
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                output = run_forward(model, batch, dist_info, labels=batch["labels"], **loss_kw)
+            loss_sums[k] += output.loss.detach().double()
+            batch_logits[k].append(output.logits.float().squeeze(-1).double().cpu().numpy())
+            batch_labels[k].append(batch["labels"].squeeze(-1).cpu().numpy())
         num_batches += 1
-        batch_logits.append(output.logits.float().squeeze(-1).double().cpu().numpy())
-        batch_labels.append(batch["labels"].squeeze(-1).cpu().numpy())
 
-    total_loss = loss_sum.item()
-    logits = np.concatenate(batch_logits, axis=0)
-    labels = np.concatenate(batch_labels, axis=0)
-
-    if env.is_distributed:
-        agg = torch.tensor([total_loss, num_batches], dtype=torch.float64, device=device)
-        dist.all_reduce(agg, op=dist.ReduceOp.SUM)
-        total_loss, num_batches = agg.tolist()
-
-        logits = np.concatenate(env.all_gather_object(logits), axis=0)
-        labels = np.concatenate(env.all_gather_object(labels), axis=0)
-
-    mask = labels != -100
-    acc = float(((logits > 0) == labels)[mask].mean())
-    per_sp = compute_per_species_metrics(logits, labels)
-    return total_loss / num_batches, acc, summarize_per_species_metrics(per_sp), per_sp
+    results = []
+    for loss_sum, z_parts, y_parts in zip(loss_sums, batch_logits, batch_labels, strict=True):
+        total_loss, n = loss_sum.item(), num_batches
+        logits, labels = np.concatenate(z_parts, axis=0), np.concatenate(y_parts, axis=0)
+        if env.is_distributed:
+            agg = torch.tensor([total_loss, n], dtype=torch.float64, device=device)
+            dist.all_reduce(agg, op=dist.ReduceOp.SUM)
+            total_loss, n = agg.tolist()
+            logits = np.concatenate(env.all_gather_object(logits), axis=0)
+            labels = np.concatenate(env.all_gather_object(labels), axis=0)
+        mask = labels != -100
+        per_sp = compute_per_species_metrics(logits, labels)
+        results.append((total_loss / n, float(((logits > 0) == labels)[mask].mean()),
+                        summarize_per_species_metrics(per_sp), per_sp))
+    return results
 
 
 def add_train_args(parser):
@@ -553,14 +555,14 @@ def run_train(args):
 
     dist_info = move_dist_info_to_device(dist_info, device)
 
-    fixed_val_loaders = build_val_loaders_fixed_p(
+    val_loader = build_val_loader_fixed_p(
         dataset, splits["val"], args.val_p_list,
         batch_size=args.batch_size, num_workers=args.num_workers, base_seed=args.seed,
     )
 
     log_csv = os.path.join(args.output_dir, "training_log.csv")
     per_p_header = []
-    for p, _ in fixed_val_loaders:
+    for p in args.val_p_list:
         per_p_header += [f"val_loss_p{p:.2f}", f"val_acc_p{p:.2f}",
                          f"val_auc_p{p:.2f}", f"val_auprc_p{p:.2f}",
                          f"val_cbi_p{p:.2f}"]
@@ -607,12 +609,11 @@ def run_train(args):
             focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
         )
         per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_cbi, per_p_nauc = [], [], [], [], [], []
-        for _p, loader in fixed_val_loaders:
-            loss_v, acc_v, summary, _per_sp = evaluate(
-                model, loader, device, dist_info, amp_dtype=amp_dtype, env=env,
-                loss_type=args.loss_type,
-                focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
-            )
+        for loss_v, acc_v, summary, _per_sp in evaluate(
+            model, val_loader, device, dist_info, amp_dtype=amp_dtype, env=env,
+            loss_type=args.loss_type,
+            focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
+        ):
             per_p_loss.append(loss_v)
             per_p_acc.append(acc_v)
             per_p_auc.append(summary["mean_auc_roc"])
@@ -630,9 +631,9 @@ def run_train(args):
         if env.is_main:
             per_p_str = " ".join(
                 f"p{p:.2f}(loss={lo:.3f},acc={a:.3f},auc={u:.3f},auprc={ap:.3f},cbi={c:.3f},n={n})"
-                for (p, _), lo, a, u, ap, c, n in zip(
-                    fixed_val_loaders, per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_cbi, per_p_nauc,
-                    strict=False,
+                for p, lo, a, u, ap, c, n in zip(
+                    args.val_p_list, per_p_loss, per_p_acc, per_p_auc, per_p_auprc, per_p_cbi, per_p_nauc,
+                    strict=True,
                 )
             )
             logger.info(

@@ -502,12 +502,14 @@ class _PerBatchSeededCollator(JSDMDataCollator):
         return torch.Generator().manual_seed(
             self.base_seed + int(batch["target_idx"][0].item()))
 
+    def __call__(self, examples):
+        return self.mask(self._stack(examples))
+
 
 class AbsenceMaskCollator(_PerBatchSeededCollator):
     """Mask all absences + p fraction of presences."""
 
-    def __call__(self, examples):
-        batch = self._stack(examples)
+    def mask(self, batch):
         target_species = batch["target_species"]
         B, S = target_species.shape
         g = self._generator(batch)
@@ -521,8 +523,7 @@ class AbsenceMaskCollator(_PerBatchSeededCollator):
 
 
 class FixedPValCollator(_PerBatchSeededCollator):
-    def __call__(self, examples):
-        batch = self._stack(examples)
+    def mask(self, batch):
         B, S = batch["target_species"].shape
         g = self._generator(batch)
 
@@ -531,18 +532,22 @@ class FixedPValCollator(_PerBatchSeededCollator):
         return self._finalize(batch, masked)
 
 
-def build_val_loaders_fixed_p(dataset, val_indices, p_values,
-                               batch_size, num_workers=0, base_seed=0):
-    subset = Subset(dataset, val_indices)
-    loaders = []
-    for i, p in enumerate(p_values):
-        col = FixedPValCollator(p=p, base_seed=base_seed + 1000 * i)
-        loaders.append((float(p), DataLoader(
-            subset, batch_size=batch_size, shuffle=False,
-            collate_fn=col, num_workers=num_workers, pin_memory=True,
-            worker_init_fn=seed_worker,
-        )))
-    return loaders
+class MultiMaskCollator:
+    def __init__(self, collators):
+        self.collators = collators
+
+    def __call__(self, examples):
+        batch = JSDMDataCollator._stack(examples)
+        return [c.mask(dict(batch)) for c in self.collators]
+
+
+def build_val_loader_fixed_p(dataset, val_indices, p_values,
+                             batch_size, num_workers=0, base_seed=0):
+    collator = MultiMaskCollator([FixedPValCollator(p=p, base_seed=base_seed + 1000 * i)
+                                  for i, p in enumerate(p_values)])
+    return DataLoader(Subset(dataset, val_indices), batch_size=batch_size, shuffle=False,
+                      collate_fn=collator, num_workers=num_workers, pin_memory=True,
+                      worker_init_fn=seed_worker, persistent_workers=num_workers > 0)
 
 
 def compute_dist_info(dataset: "JSDMDataset") -> dict:
