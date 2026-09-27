@@ -55,7 +55,34 @@ def test_collapsed_matches_explicit_reference():
     bias = torch.randn(B, S, 1, T, N)
 
     ref = _reference(mod, hidden_states, basis, source_ids, bias)
+    got = mod(hidden_states, (basis, source_ids.long()), bias[:, :, 0])
+    torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+
+
+def test_collapsed_dropout_matches_explicit_reference():
+    torch.manual_seed(4)
+    cfg = JSDMConfig(hidden_size=64, num_attention_heads=8, num_species=10,
+                     num_source_sites=7, attention_probs_dropout_prob=0.3)
+    mod = STCrossAttention(cfg).train()
+    B, S, N, T, H = 3, 10, 7, 2, 64
+    h, p = mod.num_attention_heads, cfg.attention_probs_dropout_prob
+    hidden_states = torch.randn(B, S, T, H)
+    basis = torch.randn(3, S, H)
+    source_ids = torch.randint(0, 3, (B, S, N), dtype=torch.uint8)
+    bias = torch.randn(B, S, T, N)
+
+    torch.manual_seed(9)
     got = mod(hidden_states, (basis, source_ids.long()), bias)
+    torch.manual_seed(9)
+    keep = torch.empty(B, S, T, h, N).bernoulli_(1 - p).transpose(2, 3)
+
+    q = mod.transpose_for_scores(mod.query(hidden_states))
+    flat = (source_ids.long() * S + torch.arange(S)[None, :, None]).reshape(-1)
+    emb = basis.reshape(-1, H)[flat].view(B, S, N, H)
+    k = mod.transpose_for_scores(mod.key(emb))
+    v = mod.transpose_for_scores(mod.value(emb))
+    scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(mod.attention_head_size) + bias[:, :, None]
+    ref = mod._merge_heads(torch.matmul(F.softmax(scores, dim=-1) * keep / (1 - p), v))
     torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
 
 

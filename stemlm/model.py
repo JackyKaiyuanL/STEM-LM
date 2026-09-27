@@ -260,22 +260,18 @@ class STCrossAttention(Attention):
         qk = torch.einsum("bshtd,ishd->bshti", query_layer, k_tab)
         qk = qk / math.sqrt(hd)
 
-        # Expand each source site to its bin's score. gather() reads the expanded
-        # index as a view, so no (B, S, h, T, N) index tensor is materialised.
-        B, _, _, T, _ = qk.shape
-        N = source_ids.size(-1)
-        idx = source_ids[:, :, None, None, :].expand(B, S, h, T, N)
-        attn_scores = torch.gather(qk, -1, idx) + st_dist_bias.to(query_layer.dtype)
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        weights = F.dropout(attn_probs, p=self.attention_probs_dropout_prob,
-                            training=self.training)
-
-        bins = torch.stack(
-            [(weights * (source_ids == i)[:, :, None, None, :]).sum(-1)
-             for i in range(n_bins)],
-            dim=-1,
-        )                                                   # (B, S, h, T, n_bins)
-        context = torch.einsum("bshti,ishd->bshtd", bins, v_tab)
+        p = self.attention_probs_dropout_prob
+        with torch.autocast(device_type=st_dist_bias.device.type, enabled=False):
+            in_bin = F.one_hot(source_ids.long(), n_bins).bool()[:, :, None]
+            masked = st_dist_bias.float()[..., None].masked_fill(~in_bin, torch.finfo(torch.float32).min) # float32 minimum, since -inf gives NaN in exp(masked - log_mass) for a state with no source sites.
+            log_mass = torch.logsumexp(masked, dim=-2)
+            bins = F.softmax(qk.float() + log_mass[:, :, None], dim=-1)
+            if self.training and p > 0:
+                B, _, T, N = st_dist_bias.shape
+                keep = torch.empty(B, S, T, h, N, device=masked.device).bernoulli_(1 - p)
+                kept = torch.matmul(keep, torch.exp(masked - log_mass[..., None, :])).transpose(2, 3)
+                bins = bins * kept / (1 - p)
+        context = torch.einsum("bshti,ishd->bshtd", bins.to(v_tab.dtype), v_tab)
         return self._merge_heads(context)
 
 
@@ -312,27 +308,24 @@ class STColAttention(nn.Module):
 
         gate = torch.sigmoid(self.species_gate_threshold[None, :, None]
                              - torch.logsumexp(st_dist_bias.float(), dim=-1))
-        context = self.cross_attn(hidden_states, source_embeddings, st_dist_bias[:, :, None, :, :])
+        context = self.cross_attn(hidden_states, source_embeddings, st_dist_bias)
         return self.output(context * (1.0 - gate).unsqueeze(-1).to(context.dtype))
 
 
 class EnvCrossAttention(Attention):
 
     def forward(self, hidden_states, env_embeddings):
-        query_layer = self.transpose_for_scores(self.query(hidden_states))
-        # Env keys/values are identical across the species axis S (env_embeddings
-        # does not depend on the species row). Project once on (B, C_env, H) and
-        # add a singleton S axis for SDPA/matmul to broadcast, instead of
-        # expanding to (B, S, C_env, H) and projecting S times.
-        key_layer = self.transpose_for_scores(self.key(env_embeddings)).unsqueeze(1)
-        value_layer = self.transpose_for_scores(self.value(env_embeddings)).unsqueeze(1)
-
+        B, S, T, _ = hidden_states.shape
+        h, hd = self.num_attention_heads, self.attention_head_size
+        q = self.query(hidden_states).view(B, S * T, h, hd).transpose(1, 2)
+        k = self.key(env_embeddings).view(B, -1, h, hd).transpose(1, 2)
+        v = self.value(env_embeddings).view(B, -1, h, hd).transpose(1, 2)
         context = F.scaled_dot_product_attention(
-            query_layer, key_layer, value_layer,
+            q, k, v,
             dropout_p=self.attention_probs_dropout_prob if self.training else 0.0,
-            scale=1.0 / math.sqrt(self.attention_head_size),
+            scale=1.0 / math.sqrt(hd),
         )
-        return self._merge_heads(context)
+        return context.transpose(1, 2).reshape(B, S, T, self.all_head_size)
 
 
 class EnvColAttention(nn.Module):

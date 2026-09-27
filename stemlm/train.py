@@ -516,7 +516,8 @@ def run_train(args):
         log_main(env, "Model wrapped with DistributedDataParallel")
 
     def unwrap(m):
-        return m.module if isinstance(m, DDP) else m
+        m = m.module if isinstance(m, DDP) else m
+        return getattr(m, "_orig_mod", m)
 
     amp_dtype = None
     grad_scaler = None
