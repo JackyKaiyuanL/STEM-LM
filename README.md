@@ -73,6 +73,7 @@ which species are kept.
 | `--mixed_precision` | `none` | `bf16` or `fp16` |
 | `--grad_accum_steps`, `--gradient_checkpointing`, `--compile` | 1, off, off | memory and speed |
 | `--val_p_list` | 0.25 0.5 0.75 1.0 | mask rates for validation and test |
+| `--val_sources`, `--source_cell_resolution` | `train`, 7 | `heldout` lets validation and test targets also use the other rows of their own split as sources, outside the target's H3 cell at this resolution; the uniform scheme is scored in both modes |
 | `--absence_mask_p_list`, `--no_absence_mask_eval` | 0.25 0.5 0.75 1.0 | presence-only evaluation block |
 | `--temperature_scaling` | off | fit a temperature on validation logits at p = 1 and report calibrated ECE |
 | `--seed`, `--num_workers`, `--output_dir` | 42, cores, `./STEMLM_output` | |

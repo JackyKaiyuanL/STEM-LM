@@ -11,7 +11,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import add_species_arg, load_dataset, resolve_output_dir, timed_phase, write_metrics  # noqa: E402
-from stemlm.data import JSDMDataset  # noqa: E402
+from stemlm.data import create_dataloaders  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 METHODS = {
@@ -22,10 +22,11 @@ METHODS = {
 }
 
 
-def write_autocovariate(csv_path, train_indices, min_train_presences, out_path):
-    dataset = JSDMDataset(str(csv_path))
-    dataset.restrict_species(train_indices, min_train_presences)
-    dataset.source_pool = np.asarray(train_indices)
+def write_autocovariate(csv_path, splits_path, args, out_path):
+    _, dataset, _, _ = create_dataloaders(str(csv_path), splits_path=str(splits_path),
+                                          min_train_presences=args.min_train_presences,
+                                          heldout_sources=args.val_sources == "heldout",
+                                          source_cell_resolution=args.source_cell_resolution)
     share = np.empty((len(dataset), dataset.num_species), dtype=np.float32)
     for start in range(0, len(dataset), 2048):
         items = dataset.__getitems__(list(range(start, min(start + 2048, len(dataset)))))
@@ -42,6 +43,9 @@ def main():
     parser.add_argument("--output_dir", type=Path)
     parser.add_argument("--rscript", default="Rscript")
     parser.add_argument("--n_cores", type=int, default=8)
+    parser.add_argument("--val_sources", choices=["train", "heldout"], default="train",
+                        help="Sources of the autologistic autocovariate at held-out rows, as in stemlm train.")
+    parser.add_argument("--source_cell_resolution", type=int, default=7)
     add_species_arg(parser)
     args = parser.parse_args()
 
@@ -59,8 +63,7 @@ def main():
                    "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
     if args.method == "autologistic":
         environment["AUTOCOV_FILE"] = str(output_dir / "autocovariate.csv")
-        write_autocovariate(args.csv_path.resolve(), splits["train"], args.min_train_presences,
-                            environment["AUTOCOV_FILE"])
+        write_autocovariate(args.csv_path.resolve(), args.splits_path.resolve(), args, environment["AUTOCOV_FILE"])
     with timed_phase(output_dir, "training"):
         subprocess.run([args.rscript, str(SCRIPT_DIR / script)], check=True, env=environment)
 
@@ -74,7 +77,7 @@ def main():
         fitted = ~np.isnan(z).all(axis=0)
         if not np.isfinite(z[:, fitted]).all():
             raise ValueError(f"{cov_set}: non-finite logits in {output_dir / cov_set}")
-        results.append(({"cov_set": cov_set, "masking_p": 1.0},
+        results.append(({"cov_set": cov_set, "masking_p": 1.0, "sources": args.val_sources},
                         np.where(fitted, z, 0.0),
                         np.where(fitted, labels_all, -100)))
     write_metrics(output_dir, args.method, results, species_cols,
