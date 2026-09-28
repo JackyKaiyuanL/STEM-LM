@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common import load_dataset, resolve_output_dir, timed_phase, write_metrics  # noqa: E402
+from common import add_species_arg, load_dataset, resolve_output_dir, timed_phase, write_metrics  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 METHODS = {
@@ -27,14 +27,19 @@ def main():
     parser.add_argument("--output_dir", type=Path)
     parser.add_argument("--rscript", default="Rscript")
     parser.add_argument("--n_cores", type=int, default=8)
+    add_species_arg(parser)
     args = parser.parse_args()
 
     output_dir = resolve_output_dir(args, __file__, prefix=args.method)
     output_dir.mkdir(parents=True, exist_ok=True)
-    df, _, species_cols, splits = load_dataset(args.csv_path.resolve(), args.splits_path.resolve())
+    df, _, species_cols, splits = load_dataset(args.csv_path.resolve(), args.splits_path.resolve(),
+                                               args.min_train_presences)
+    species_file = output_dir / "species.txt"
+    species_file.write_text("\n".join(species_cols) + "\n")
     script, cov_sets = METHODS[args.method]
     environment = {**os.environ, "DATA_FILE": str(args.csv_path.resolve()),
                    "SPLITS_FILE": str(args.splits_path.resolve()),
+                   "SPECIES_FILE": str(species_file),
                    "RESULTS_DIR": str(output_dir), "N_CORES": str(args.n_cores),
                    "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
     with timed_phase(output_dir, "training"):

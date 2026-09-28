@@ -39,10 +39,11 @@ are the sources; no held-out row is ever a source. During training,
 within a time window of the target: each is 0 with probability 1/2 and otherwise
 drawn log-uniformly between the target's nearest and farthest candidate. This
 puts the geometry of evaluation and deployment into training without a tuned
-scale. At evaluation `--eval_exclusion_km` and `--eval_exclusion_days` apply a
-fixed radius and window to every validation and test target; sweeping them
-gives performance as a function of distance to the nearest data.
-`--causal_context` restricts sources to earlier dates.
+scale. Validation, checkpoint selection and `test_results.csv` use no exclusion.
+`--eval_exclusion_km` and `--eval_exclusion_days` take lists: the selected
+checkpoint is also scored on the test set at every radius and window pair, written
+to `test_sweep.csv`, giving performance as a function of distance to the nearest
+source. `--causal_context` restricts sources to earlier dates.
 
 ## Splits
 
@@ -50,6 +51,11 @@ gives performance as a function of distance to the nearest data.
 (`--train_frac`, `--test_frac`). Resolution 2 (cells of about 183 km edge)
 tests extrapolation to unsampled regions; a fine resolution tests prediction at
 new sites near data. `--splits_path` reuses a saved split.
+
+`--min_train_presences M` (default 100) keeps the species with at least M
+presences in the training rows; the baseline runners take the same option. Build
+tables with a `--min_presences` at or below M, so that test rows do not decide
+which species are kept.
 
 ## Model and training options
 

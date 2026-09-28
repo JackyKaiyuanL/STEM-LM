@@ -21,6 +21,7 @@ GBIF DwC-A `cf3bdc30-370c-48d3-8fff-b587a39d72d6` (eButterfly), accessed 2026-04
 3. **`../regen_splits.py`** — H3 spatial-block split (resolution 2, 80/10/10), one file per split seed (41, 42, 43).
    - `python ../regen_splits.py ebutterfly_na_2011_2025.csv --splits_path ebutterfly_splits_seed41.json --resolution 2 --seed 41`
    - Output: `ebutterfly_splits_seed{41,42,43}.json`.
+   - Fine split at resolution 7 (1.41 km edge): `--resolution 7`, output `ebutterfly_splits_res7_seed{41,42,43}.json`.
 
 ## Survey protocols kept
 

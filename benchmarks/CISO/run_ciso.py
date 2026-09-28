@@ -12,7 +12,7 @@ import torch
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common import load_dataset, resolve_output_dir, timed_phase, write_metrics  # noqa: E402
+from common import add_species_arg, load_dataset, resolve_output_dir, timed_phase, write_metrics  # noqa: E402
 
 KNOWN_RATIOS = (0.0, 0.25, 0.5, 0.75)
 
@@ -62,12 +62,14 @@ def main():
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--ciso_repo", required=True, type=Path)
     parser.add_argument("--num_epochs", type=int, default=100)
+    add_species_arg(parser)
     args = parser.parse_args()
 
     output_dir = resolve_output_dir(args, __file__)
     data_dir, config_dir = output_dir / "data", output_dir / "configs"
     config_dir.mkdir(parents=True, exist_ok=True)
-    df, env_cols, species_cols, splits = load_dataset(args.csv_path.resolve(), args.splits_path.resolve())
+    df, env_cols, species_cols, splits = load_dataset(args.csv_path.resolve(), args.splits_path.resolve(),
+                                                      args.min_train_presences)
     prepare_data(df, env_cols, species_cols, splits, data_dir)
 
     repo = args.ciso_repo.resolve()

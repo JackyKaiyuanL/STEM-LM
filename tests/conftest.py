@@ -21,6 +21,7 @@ TRAIN_ARGS = [
     "--num_hidden_layers", "1",
     "--intermediate_size", "32",
     "--num_source_sites", "8",
+    "--min_train_presences", "1",
     "--val_p_list", "0.5", "1.0",
     "--absence_mask_p_list", "0.5", "1.0",
     "--seed", "0",
@@ -79,7 +80,8 @@ def tiny_csv(tmp_path_factory):
 def trained_run(tmp_path_factory, tiny_csv):
     """Run `stemlm train` once; return the output directory Path."""
     out_dir = tmp_path_factory.mktemp("run") / "out"
-    result = _run_cli("train", str(tiny_csv), "--output_dir", str(out_dir), *TRAIN_ARGS)
+    result = _run_cli("train", str(tiny_csv), "--output_dir", str(out_dir), *TRAIN_ARGS,
+                      "--eval_exclusion_km", "0", "500", "--eval_exclusion_days", "0", "30")
     assert result.returncode == 0, (
         f"stemlm train exited {result.returncode}\n"
         f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"

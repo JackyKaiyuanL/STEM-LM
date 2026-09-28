@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from stemlm.data import load_splits  # noqa: E402
+from stemlm.data import MIN_TRAIN_PRESENCES, load_splits, species_with_presences  # noqa: E402
 from stemlm.metric import compute_per_species_metrics, summarize_per_species_metrics  # noqa: E402
 
 META_COLS = ("time", "latitude", "longitude")
@@ -28,12 +28,18 @@ def resolve_output_dir(args, script_file, prefix=None):
     return Path(script_file).resolve().parent / "output" / "__".join(p for p in parts if p)
 
 
-def load_dataset(csv_path, split_path):
+def add_species_arg(parser):
+    parser.add_argument("--min_train_presences", type=int, default=MIN_TRAIN_PRESENCES,
+                        help="Keep the species with at least this many presences in the training rows.")
+
+
+def load_dataset(csv_path, split_path, min_train_presences):
     df = pd.read_csv(csv_path)
     env_cols = [c for c in df.columns if c.startswith("env_")]
     species_cols = [c for c in df.columns if c not in META_COLS and not c.startswith("env_")]
     train, val, test = load_splits(str(split_path), expected_num_rows=len(df))
-    return df, env_cols, species_cols, {"train": train, "val": val, "test": test}
+    keep = species_with_presences(df[species_cols].to_numpy(dtype=np.float32), train, min_train_presences)
+    return df, env_cols, [species_cols[i] for i in keep], {"train": train, "val": val, "test": test}
 
 
 @contextmanager

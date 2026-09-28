@@ -20,7 +20,7 @@ SPLITS   <- c("train", "val", "test")
 
 dat      <- read.csv(DATA_FILE, check.names = FALSE)
 env_cols <- grep("^env_", names(dat), value = TRUE)
-all_sp   <- setdiff(names(dat), c("time", "latitude", "longitude", env_cols))
+all_sp   <- readLines(need("SPECIES_FILE"))
 
 doy_term <- character(0)
 if ("time" %in% names(dat)) {

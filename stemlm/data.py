@@ -136,6 +136,15 @@ def _list_column_to_csr_arrays(column) -> tuple[np.ndarray, np.ndarray]:
     return offsets, values.astype(np.int32, copy=False)
 
 
+MIN_TRAIN_PRESENCES = 100
+
+
+def species_with_presences(species_matrix, rows, min_presences):
+    in_rows = np.zeros(species_matrix.shape[0], dtype=np.float64)
+    in_rows[np.asarray(rows)] = 1.0
+    return np.flatnonzero(np.asarray(species_matrix.T @ in_rows).ravel() >= min_presences)
+
+
 class _SparseSpeciesData:
     def __init__(self, csr):
         self._csr = csr
@@ -216,6 +225,15 @@ class JSDMDataset(Dataset):
         self.eval_exclusion_km = 0.0
         self.eval_exclusion_days = 0.0
         self.causal_context = False
+
+    def restrict_species(self, rows, min_presences):
+        sparse = isinstance(self.species_data, _SparseSpeciesData)
+        matrix = self.species_data._csr if sparse else self.species_data
+        keep = species_with_presences(matrix, rows, min_presences)
+        self.species_data = _SparseSpeciesData(matrix[:, keep]) if sparse else matrix[:, keep]
+        self.species_cols = [self.species_cols[i] for i in keep]
+        self.num_species = len(keep)
+        print(f"Species: {self.num_species} with >= {min_presences} presences in the training rows")
 
     @property
     def source_pool(self):
@@ -624,11 +642,12 @@ def create_dataloaders(
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None,
     no_time=False,
-    train_exclusion=False, eval_exclusion_km=0.0, eval_exclusion_days=0.0,
+    train_exclusion=False,
     causal_context=False,
     resolution: int = 2,
     splits_path: str | None = None,
     vocab_path: str | None = None,
+    min_train_presences: int = MIN_TRAIN_PRESENCES,
 ):
     if vocab_path is not None:
         dataset = JSDMSparseDataset(
@@ -658,12 +677,11 @@ def create_dataloaders(
         )
         split_origin = "h3"
 
+    dataset.restrict_species(train_indices, min_train_presences)
     dataset.source_pool = train_indices
     dataset.fill_env(train_indices)
     if train_exclusion:
         dataset.random_exclusion_rows = train_indices
-    dataset.eval_exclusion_km = eval_exclusion_km
-    dataset.eval_exclusion_days = eval_exclusion_days
     dataset.causal_context = causal_context
 
     train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, shuffle=True,

@@ -1,4 +1,5 @@
 import csv
+import itertools
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from stemlm.data import (
+    MIN_TRAIN_PRESENCES,
     AbsenceMaskCollator,
     build_val_loader_fixed_p,
     create_dataloaders,
@@ -283,12 +285,17 @@ def add_train_args(parser):
                              "independently, within a time window; each is 0 with probability 1/2 "
                              "and otherwise drawn log-uniformly between the nearest candidate and "
                              "the candidate pool's extent.")
-    parser.add_argument("--eval_exclusion_km", type=float, default=0.0,
-                        help="Remove training sources within this radius of every validation "
-                             "and test target.")
-    parser.add_argument("--eval_exclusion_days", type=float, default=0.0,
-                        help="Remove training sources within this many days of every validation "
-                             "and test target.")
+    parser.add_argument("--eval_exclusion_km", type=float, nargs="+", default=None,
+                        help="Also score the selected checkpoint on the test set with the training "
+                             "sources within each of these radii (km) of the target removed, crossed "
+                             "with every --eval_exclusion_days value; writes test_sweep.csv. "
+                             "Validation, checkpoint selection and test_results.csv use no exclusion.")
+    parser.add_argument("--eval_exclusion_days", type=float, nargs="+", default=None,
+                        help="Time windows (days) crossed with --eval_exclusion_km for the test sweep.")
+    parser.add_argument("--min_train_presences", type=int, default=MIN_TRAIN_PRESENCES,
+                        help="Keep the species with at least this many presences in the training "
+                             "rows of the split. Set it at or above the --min_presences the table "
+                             "was built with, so that test rows do not decide which species are kept.")
     parser.add_argument("--causal_context", action="store_true",
                         help="Sources must precede the target in time; time windows then count "
                              "days before the target only.")
@@ -394,12 +401,11 @@ def run_train(args):
         env_cols=args.env_cols,
         no_time=args.no_time,
         train_exclusion=args.train_exclusion,
-        eval_exclusion_km=args.eval_exclusion_km,
-        eval_exclusion_days=args.eval_exclusion_days,
         causal_context=args.causal_context,
         resolution=args.resolution,
         splits_path=args.splits_path,
         vocab_path=args.vocab_path,
+        min_train_presences=args.min_train_presences,
     )
 
     if env.is_distributed:
@@ -872,6 +878,30 @@ def run_train(args):
             f"CBI={absmask_mean_cbi:.3f}"
         )
 
+    sweep_rows = []
+    if args.eval_exclusion_km or args.eval_exclusion_days:
+        for r, tau in itertools.product(args.eval_exclusion_km or [0.0], args.eval_exclusion_days or [0.0]):
+            dataset.eval_exclusion_km, dataset.eval_exclusion_days = r, tau
+            for p in args.val_p_list:
+                s = evaluate_at_p(
+                    unwrap(model), dataset, eval_indices, dist_info,
+                    p_value=p,
+                    batch_size=args.batch_size, device=device,
+                    num_workers=args.num_workers,
+                    base_seed=args.seed + 10_000,
+                    amp_dtype=amp_dtype,
+                    distributed_sampler=env.is_distributed,
+                    temperature=T_star,
+                )["summary"]
+                log_main(env, f"sweep r={r:g} km tau={tau:g} d p={p:.2f}  AUC={s['mean_auc_roc']:.4f}  "
+                              f"AUPRC={s['mean_auc_pr']:.4f}  CBI={s['mean_cbi']:.3f}  (n={s['n_species']})")
+                sweep_rows.append({
+                    "eval_exclusion_km": r, "eval_exclusion_days": tau, "p": p,
+                    "auc": s["mean_auc_roc"], "auc_q25": s["auc_roc_q25"], "auc_q50": s["auc_roc_q50"],
+                    "auc_q75": s["auc_roc_q75"], "auprc": s["mean_auc_pr"], "cbi": s["mean_cbi"],
+                    "brier": s["mean_brier"], "ece": s["mean_ece"], "n_species": s["n_species"],
+                })
+
     if args.temperature_scaling and env.is_main:
         with open(os.path.join(args.output_dir, "temperature.json"), "w") as f:
             json.dump({"T_star": float(T_star), "fitted_at_p": 1.0, "fitted_on_split": "val"},
@@ -926,6 +956,9 @@ def run_train(args):
         pd.DataFrame(test_rows).to_csv(
             os.path.join(args.output_dir, "test_results.csv"), index=False)
         logger.info(f"Test results saved to {args.output_dir}/test_results.csv")
+        if sweep_rows:
+            pd.DataFrame(sweep_rows).to_csv(os.path.join(args.output_dir, "test_sweep.csv"), index=False)
+            logger.info(f"Exclusion sweep saved to {args.output_dir}/test_sweep.csv")
 
         summary = {
             "ablation":           config.ablation,

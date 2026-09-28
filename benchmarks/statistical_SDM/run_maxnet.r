@@ -21,7 +21,7 @@ REG_MULT_VALUES <- c(1, 2, 4, 6, 8, 10, 12, 16, 20, 24, 32)
 
 dat      <- read.csv(DATA_FILE, check.names = FALSE)
 env_cols <- grep("^env_", names(dat), value = TRUE)
-all_sp   <- setdiff(names(dat), c("time", "latitude", "longitude", env_cols))
+all_sp   <- readLines(need("SPECIES_FILE"))
 
 splits    <- fromJSON(SPLITS_FILE)
 idx       <- list(train = splits$train + 1L, val = splits$val + 1L, test = splits$test + 1L)

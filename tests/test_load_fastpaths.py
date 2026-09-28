@@ -176,3 +176,20 @@ def test_missing_covariates_filled_and_unselected_env_dropped(tmp_path):
     df.to_csv(tmp_path / "bad.csv", index=False)
     with pytest.raises(ValueError, match="sp_1"):
         JSDMDataset(str(tmp_path / "bad.csv"), num_source_sites=4, no_time=True)
+
+
+def test_species_kept_by_training_presences_only():
+    from scipy.sparse import csr_matrix
+
+    from stemlm.data import species_with_presences
+
+    y = np.zeros((10, 4), dtype=np.float32)
+    train, test = np.arange(6), np.arange(6, 10)
+    y[train[:3], 0] = 1
+    y[train[:2], 1] = 1
+    y[test, 1] = 1
+    y[test, 2] = 1
+    y[train[:3], 3] = 1
+    y[test, 3] = 1
+    for matrix in (y, csr_matrix(y)):
+        assert species_with_presences(matrix, train, 3).tolist() == [0, 3]

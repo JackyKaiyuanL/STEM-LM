@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common import load_dataset, resolve_output_dir, timed_phase, write_metrics  # noqa: E402
+from common import add_species_arg, load_dataset, resolve_output_dir, timed_phase, write_metrics  # noqa: E402
 
 
 class Tee:
@@ -37,12 +37,14 @@ def main():
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--masksdm_repo", required=True, type=Path)
     parser.add_argument("--num_epochs", type=int, default=1000)
+    add_species_arg(parser)
     args = parser.parse_args()
 
     output_dir = resolve_output_dir(args, __file__)
     checkpoint_dir = output_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    df, env_cols, species_cols, splits = load_dataset(args.csv_path.resolve(), args.splits_path.resolve())
+    df, env_cols, species_cols, splits = load_dataset(args.csv_path.resolve(), args.splits_path.resolve(),
+                                                      args.min_train_presences)
 
     repo = args.masksdm_repo.resolve()
     sys.path.insert(0, str(repo))

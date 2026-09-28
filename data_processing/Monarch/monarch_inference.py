@@ -116,6 +116,8 @@ def main():
     model, config, T = load_model(args.run_dir, device)
     env_mean = json.loads((args.run_dir / "env_stats.json").read_text())["mean"]
     obs = pd.read_csv(args.csv_path)
+    species = json.loads((args.run_dir / "species_names.json").read_text())
+    obs = obs[[c for c in obs.columns if c in META_COLS or c.startswith("env_")] + species]
     predictions = {}
     for date in args.dates:
         cells, z = predict_grid(model, config, env_mean, obs, args.grid_dir / f"monarch_grid_{date}.csv", args.species,
