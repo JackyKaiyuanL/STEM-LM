@@ -21,6 +21,7 @@ from stemlm.data import (
     AbsenceMaskCollator,
     build_val_loader_fixed_p,
     create_dataloaders,
+    heldout_split_ids,
     save_splits,
     seed_worker,
 )
@@ -299,6 +300,14 @@ def add_train_args(parser):
     parser.add_argument("--causal_context", action="store_true",
                         help="Sources must precede the target in time; time windows then count "
                              "days before the target only.")
+    parser.add_argument("--val_sources", choices=["train", "heldout"], default="train",
+                        help="Sources of validation and test targets: training rows only, or also "
+                             "the other rows of the target's own split outside the target's H3 cell "
+                             "at --source_cell_resolution. Checkpoint selection and the primary test "
+                             "metrics use this mode; the uniform scheme is also scored in the other one.")
+    parser.add_argument("--source_cell_resolution", type=int, default=7,
+                        help="H3 resolution of the cell around a held-out target whose rows are never "
+                             "its sources under --val_sources heldout (default 7, about 1.4 km edge).")
     parser.add_argument("--env_cols", nargs="+", default=None,
                         help="Explicit list of env column names. If not set, columns with 'env_' "
                              "prefix are used. Useful for datasets with non-prefixed env columns "
@@ -406,6 +415,8 @@ def run_train(args):
         splits_path=args.splits_path,
         vocab_path=args.vocab_path,
         min_train_presences=args.min_train_presences,
+        heldout_sources=args.val_sources == "heldout",
+        source_cell_resolution=args.source_cell_resolution,
     )
 
     if env.is_distributed:
@@ -769,6 +780,27 @@ def run_train(args):
         f"AUC={best_mean_auc:.4f}  AUPRC={best_mean_auprc:.4f}  CBI={best_mean_cbi:.3f}"
     )
 
+    other_sources = "train" if args.val_sources == "heldout" else "heldout"
+    dataset.heldout_split = (None if other_sources == "train"
+                             else heldout_split_ids(len(dataset), splits["val"], splits["test"]))
+    other_per_p = {}
+    for p in args.val_p_list:
+        s = evaluate_at_p(
+            unwrap(model), dataset, eval_indices, dist_info,
+            p_value=p,
+            batch_size=args.batch_size, device=device,
+            num_workers=args.num_workers,
+            base_seed=args.seed + 10_000,
+            amp_dtype=amp_dtype,
+            distributed_sampler=env.is_distributed,
+            temperature=T_star,
+        )["summary"]
+        other_per_p[p] = s
+        log_main(env, f"{eval_split} sources={other_sources} p={p:.2f}  AUC={s['mean_auc_roc']:.4f}  "
+                      f"AUPRC={s['mean_auc_pr']:.4f}  CBI={s['mean_cbi']:.3f}  (n={s['n_species']})")
+    dataset.heldout_split = (None if args.val_sources == "train"
+                             else heldout_split_ids(len(dataset), splits["val"], splits["test"]))
+
     cbi_sel_per_p_auc = {}
     cbi_sel_per_p_auprc = {}
     cbi_sel_per_p_cbi = {}
@@ -928,9 +960,16 @@ def run_train(args):
         logger.info(f"Per-species metrics saved to {args.output_dir}/per_species_auc.csv")
 
         test_rows = []
+        for p, s in other_per_p.items():
+            test_rows.append({
+                "mask_scheme": "uniform", "sources": other_sources, "p": p,
+                "auc": s["mean_auc_roc"], "auc_q25": s["auc_roc_q25"], "auc_q50": s["auc_roc_q50"],
+                "auc_q75": s["auc_roc_q75"], "auprc": s["mean_auc_pr"], "cbi": s["mean_cbi"],
+                "brier": s["mean_brier"], "ece": s["mean_ece"],
+            })
         for p in args.val_p_list:
             test_rows.append({
-                "mask_scheme": "uniform", "p": p,
+                "mask_scheme": "uniform", "sources": args.val_sources, "p": p,
                 "auc": per_p_auc.get(p, float("nan")),
                 "auc_q25": per_p_q25.get(p, float("nan")),
                 "auc_q50": per_p_q50.get(p, float("nan")),
@@ -943,7 +982,7 @@ def run_train(args):
         if not args.no_absence_mask_eval:
             for p in args.absence_mask_p_list:
                 test_rows.append({
-                    "mask_scheme": "absence_mask", "p": p,
+                    "mask_scheme": "absence_mask", "sources": args.val_sources, "p": p,
                     "auc": absmask_per_p_auc.get(p, float("nan")),
                     "auc_q25": absmask_per_p_q25.get(p, float("nan")),
                     "auc_q50": absmask_per_p_q50.get(p, float("nan")),

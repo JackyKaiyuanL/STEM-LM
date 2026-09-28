@@ -225,6 +225,8 @@ class JSDMDataset(Dataset):
         self.eval_exclusion_km = 0.0
         self.eval_exclusion_days = 0.0
         self.causal_context = False
+        self.heldout_split = None
+        self.cell = None
 
     def restrict_species(self, rows, min_presences):
         sparse = isinstance(self.species_data, _SparseSpeciesData)
@@ -271,6 +273,12 @@ class JSDMDataset(Dataset):
         gap = self.times[idx] - self.times[others]
         return gap if self.causal_context else np.abs(gap)
 
+    def _source_ok(self, idx: int, neigh: np.ndarray) -> np.ndarray:
+        ok = self._source_pool_mask[neigh]
+        if self.heldout_split is not None and self.heldout_split[idx] >= 0:
+            ok = (ok | (self.heldout_split[neigh] == self.heldout_split[idx])) & (self.cell[neigh] != self.cell[idx])
+        return ok
+
     def _knn_candidates(self, idx: int, min_dist: float = 0.0,
                         min_days: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
         N_total = len(self.lats)
@@ -286,7 +294,7 @@ class JSDMDataset(Dataset):
                                     self.lats[neigh], self.lons[neigh])
             keep = (neigh != idx) & (sp >= min_dist) & (self._time_gap(idx, neigh) >= min_days)
             if pool_mask is not None:
-                keep &= pool_mask[neigh]
+                keep &= self._source_ok(idx, neigh)
             neigh, sp = neigh[keep], sp[keep]
             if len(neigh) >= self.num_source_sites or k_query >= N_total:
                 break
@@ -331,7 +339,7 @@ class JSDMDataset(Dataset):
             nb = nb[nb >= 0]
             keep = nb != idx
             if pool_mask is not None:
-                keep &= pool_mask[nb]
+                keep &= self._source_ok(idx, nb)
             nb = nb[keep]
             if len(nb) >= need or k_query >= N_total:
                 sp = haversine_pairs_np(self.lats[idx], self.lons[idx],
@@ -655,6 +663,8 @@ def create_dataloaders(
     splits_path: str | None = None,
     vocab_path: str | None = None,
     min_train_presences: int = MIN_TRAIN_PRESENCES,
+    heldout_sources: bool = False,
+    source_cell_resolution: int = 7,
 ):
     if vocab_path is not None:
         dataset = JSDMSparseDataset(
@@ -686,6 +696,11 @@ def create_dataloaders(
 
     dataset.restrict_species(train_indices, min_train_presences)
     dataset.source_pool = train_indices
+    cells = [h3.latlng_to_cell(float(la), float(lo), source_cell_resolution)
+             for la, lo in zip(dataset.lats, dataset.lons)]
+    dataset.cell = np.unique(cells, return_inverse=True)[1].ravel()
+    if heldout_sources:
+        dataset.heldout_split = heldout_split_ids(len(dataset), val_indices, test_indices)
     dataset.fill_env(train_indices)
     if train_exclusion:
         dataset.random_exclusion_rows = train_indices

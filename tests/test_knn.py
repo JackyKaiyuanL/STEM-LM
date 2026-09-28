@@ -186,3 +186,23 @@ def test_batched_matches_sequential_full_pool(tmp_path_factory):
     got = _batched_source_idx(ds, indices, seed=99)
     for r, g in zip(ref, got, strict=True):
         np.testing.assert_array_equal(r, g)
+
+
+def test_heldout_rows_are_sources_only_within_their_split_and_outside_their_cell(dataset):
+    from stemlm.data import heldout_split_ids
+
+    pool, val, test = set(range(0, 160, 2)), set(range(1, 160, 4)), set(range(3, 160, 4))
+    dataset.heldout_split = heldout_split_ids(160, sorted(val), sorted(test))
+    dataset.cell = np.arange(160) // 2
+    try:
+        for i in [1, 5, 41]:
+            src = set(dataset[i]["source_idx"].numpy())
+            assert src <= (pool | val) and not (src & test) and (i - 1) not in src
+        for i in [3, 7, 43]:
+            src = set(dataset[i]["source_idx"].numpy())
+            assert src <= (pool | test) and not (src & val) and (i - 1) not in src
+        for i in [0, 4, 40]:
+            assert set(dataset[i]["source_idx"].numpy()) <= pool
+    finally:
+        dataset.heldout_split = None
+        dataset.cell = None
