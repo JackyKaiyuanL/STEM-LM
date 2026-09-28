@@ -224,18 +224,18 @@ def add_train_args(parser):
     parser.add_argument("--vocab_path", type=str, default=None,
                         help="species_vocab.json; if set, csv_path is read as sparse parquet "
                              "(species_idx) via JSDMSparseDataset.")
-    parser.add_argument("--num_source_sites", type=int, default=64)
+    parser.add_argument("--num_source_sites", type=int, default=128)
     parser.add_argument("--hidden_size", type=int, default=256)
-    parser.add_argument("--num_attention_heads", type=int, default=4)
-    parser.add_argument("--num_hidden_layers", type=int, default=3)
-    parser.add_argument("--intermediate_size", type=int, default=1024)
+    parser.add_argument("--num_attention_heads", type=int, default=8)
+    parser.add_argument("--num_hidden_layers", type=int, default=4)
+    parser.add_argument("--intermediate_size", type=int, default=512)
     parser.add_argument("--num_env_groups", type=int, default=5)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--p", type=_parse_rate, default=0.15,
+    parser.add_argument("--p", type=_parse_rate, default="unif:0.0,1.0",
                         help="Per-row mask rate. Float in [0,1], or 'unif[:lo,hi]' "
                              "(Uniform[lo,hi] per row; bare 'unif' = 'unif:0.0,1.0').")
     parser.add_argument("--train_frac", type=float, default=0.8)

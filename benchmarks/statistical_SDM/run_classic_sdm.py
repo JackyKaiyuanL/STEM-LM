@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -10,13 +11,27 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import add_species_arg, load_dataset, resolve_output_dir, timed_phase, write_metrics  # noqa: E402
+from stemlm.data import JSDMDataset  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 METHODS = {
     "logistic": ("run_logistic.r", ("env", "spatiotemporal", "full")),
+    "autologistic": ("run_autologistic.r", ("env", "full")),
     "gam": ("run_gam.r", ("env", "spatiotemporal", "full")),
     "maxnet": ("run_maxnet.r", ("env",)),
 }
+
+
+def write_autocovariate(csv_path, train_indices, min_train_presences, out_path):
+    dataset = JSDMDataset(str(csv_path))
+    dataset.restrict_species(train_indices, min_train_presences)
+    dataset.source_pool = np.asarray(train_indices)
+    share = np.empty((len(dataset), dataset.num_species), dtype=np.float32)
+    for start in range(0, len(dataset), 2048):
+        items = dataset.__getitems__(list(range(start, min(start + 2048, len(dataset)))))
+        share[start:start + len(items)] = np.stack([it["source_species"].numpy().mean(1) for it in items])
+    columns = ["auto_" + re.sub(r"[^A-Za-z0-9]", "_", s) for s in dataset.species_cols]
+    pd.DataFrame(share, columns=columns).to_csv(out_path, index=False)
 
 
 def main():
@@ -42,6 +57,10 @@ def main():
                    "SPECIES_FILE": str(species_file),
                    "RESULTS_DIR": str(output_dir), "N_CORES": str(args.n_cores),
                    "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
+    if args.method == "autologistic":
+        environment["AUTOCOV_FILE"] = str(output_dir / "autocovariate.csv")
+        write_autocovariate(args.csv_path.resolve(), splits["train"], args.min_train_presences,
+                            environment["AUTOCOV_FILE"])
     with timed_phase(output_dir, "training"):
         subprocess.run([args.rscript, str(SCRIPT_DIR / script)], check=True, env=environment)
 

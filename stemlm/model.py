@@ -23,7 +23,7 @@ class JSDMConfig:
 
     num_species: int = 100
 
-    num_source_sites: int = 64
+    num_source_sites: int = 128
 
     max_spatial_dist: float = 180.0
     max_temporal_dist: float = 365.0
@@ -48,7 +48,7 @@ class JSDMConfig:
 
     per_species_env_rank: int = 8
 
-    p: "float | str" = 0.15
+    p: "float | str" = "unif:0.0,1.0"
 
     def __post_init__(self):
         if self.num_attention_heads < 2 or self.num_attention_heads % 2 != 0:

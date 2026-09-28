@@ -165,7 +165,7 @@ class JSDMDataset(Dataset):
     def __init__(
         self,
         csv_path: str,
-        num_source_sites: int = 64,
+        num_source_sites: int = 128,
         time_col: str = "time",
         lat_col: str = "latitude",
         lon_col: str = "longitude",
@@ -388,7 +388,7 @@ class JSDMSparseDataset(JSDMDataset):
         self,
         parquet_path: str,
         vocab_path: str,
-        num_source_sites: int = 64,
+        num_source_sites: int = 128,
         time_col: str = "time",
         lat_col: str = "latitude",
         lon_col: str = "longitude",
@@ -636,9 +636,16 @@ def h3_block_split(lats, lons, resolution=2, train_frac=0.8, test_frac=0.1, seed
     return train_idx, val_idx, test_idx
 
 
+def heldout_split_ids(num_rows, val_indices, test_indices):
+    ids = np.full(num_rows, -1, dtype=np.int8)
+    ids[np.asarray(val_indices, dtype=np.int64)] = 1
+    ids[np.asarray(test_indices, dtype=np.int64)] = 2
+    return ids
+
+
 def create_dataloaders(
-    csv_path, batch_size=32, num_source_sites=64,
-    p=0.15,
+    csv_path, batch_size=32, num_source_sites=128,
+    p="unif:0.0,1.0",
     train_frac=0.8, test_frac=0.1, num_workers=0,
     seed=42, env_cols=None,
     no_time=False,

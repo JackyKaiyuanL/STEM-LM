@@ -33,7 +33,7 @@ uv run stemlm train data.csv --output_dir out --splits_path splits.json \
 
 ## Sources
 
-For every target the K nearest training rows (`--num_source_sites`, default 64)
+For every target the K nearest training rows (`--num_source_sites`, default 128)
 are the sources; no held-out row is ever a source. During training,
 `--train_exclusion` drops candidate sources within a radius and, independently,
 within a time window of the target: each is 0 with probability 1/2 and otherwise
@@ -61,13 +61,13 @@ which species are kept.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--hidden_size`, `--num_attention_heads`, `--num_hidden_layers`, `--intermediate_size` | 256, 4, 3, 1024 | Transformer size |
+| `--hidden_size`, `--num_attention_heads`, `--num_hidden_layers`, `--intermediate_size` | 256, 8, 4, 512 | Transformer size |
 | `--num_env_groups` | 5 | learned queries pooling the sources' environments |
 | `--per_species_env_rank` | 8 | rank of the per-species linear environmental head |
 | `--temporal_fire_init_periods` | none | periods (days) of the periodic terms in the temporal distance bias; omit for a static dataset |
 | `--no_time` | off | ignore the time column |
 | `--ablation` | `full` | `no_st`, `no_env` or `no_st_env` remove cross-attention pathways |
-| `--p` | 0.15 | mask rate per row: a number, `unif:lo,hi` or `beta:a,b` |
+| `--p` | `unif:0.0,1.0` | mask rate per row: a number or `unif:lo,hi` |
 | `--loss_type` | `focal` | `focal` (`--focal_alpha 0.25 --focal_gamma 2.0`) or `bce` |
 | `--batch_size`, `--num_epochs`, `--learning_rate`, `--weight_decay` | 32, 50, 1e-4, 0.01 | AdamW with cosine decay |
 | `--mixed_precision` | `none` | `bf16` or `fp16` |
