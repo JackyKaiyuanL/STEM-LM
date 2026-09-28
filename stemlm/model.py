@@ -120,8 +120,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
-        return (x / rms) * self.weight
+        return F.rms_norm(x, (x.size(-1),), self.weight, self.eps)
 
 
 class TargetInput(nn.Module):
