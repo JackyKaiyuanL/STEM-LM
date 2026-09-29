@@ -323,7 +323,8 @@ def add_train_args(parser):
                              "Validation, checkpoint selection and test_results.csv use no exclusion.")
     parser.add_argument("--eval_exclusion_days", type=float, nargs="+", default=[0.0, 1.0],
                         help="Time windows (days) crossed with --eval_exclusion_km for the test sweep "
-                             "(default 0 1, so same-day sources are removed in one sweep row).")
+                             "(default 0 1, so same-day sources are removed in one sweep row). "
+                             "Dropped automatically when every time value is equal.")
     parser.add_argument("--min_train_presences", type=int, default=MIN_TRAIN_PRESENCES,
                         help="Keep the species with at least this many presences in the training "
                              "rows of the split. Set it at or above the --min_presences the table "
@@ -507,7 +508,7 @@ def run_train(args):
 
     use_temporal = dist_info["max_temporal_dist"] > 0
     if not use_temporal:
-        log_main(env, "Temporal FIRE bias disabled (no temporal variation in data)")
+        log_main(env, "Temporal FIRE bias and test-sweep time windows disabled (no temporal variation in data)")
 
     config = JSDMConfig(
         num_species=dataset.num_species,
@@ -931,8 +932,9 @@ def run_train(args):
         )
 
     sweep_rows = []
-    if args.eval_exclusion_km or args.eval_exclusion_days:
-        for r, tau in itertools.product(args.eval_exclusion_km or [0.0], args.eval_exclusion_days or [0.0]):
+    eval_exclusion_days = args.eval_exclusion_days if use_temporal else None
+    if args.eval_exclusion_km or eval_exclusion_days:
+        for r, tau in itertools.product(args.eval_exclusion_km or [0.0], eval_exclusion_days or [0.0]):
             dataset.eval_exclusion_km, dataset.eval_exclusion_days = r, tau
             for p in args.val_p_list:
                 s = evaluate_at_p(

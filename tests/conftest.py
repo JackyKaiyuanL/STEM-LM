@@ -87,3 +87,11 @@ def trained_run(tmp_path_factory, tiny_csv):
         f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
     )
     return out_dir
+
+
+@pytest.fixture(scope="session")
+def no_time_run(tmp_path_factory, tiny_csv):
+    out_dir = tmp_path_factory.mktemp("run_no_time") / "out"
+    result = _run_cli("train", str(tiny_csv), "--output_dir", str(out_dir), *TRAIN_ARGS, "--no_time")
+    assert result.returncode == 0, f"stemlm train --no_time exited {result.returncode}\n{result.stderr}"
+    return out_dir

@@ -57,6 +57,11 @@ def test_exclusion_sweep_covers_the_grid_and_matches_the_fixed_pair(trained_run)
     np.testing.assert_allclose(none["auc"], fixed.loc[none.index, "auc"], rtol=0, atol=1e-12)
 
 
+def test_no_time_run_finishes_without_time_windows(no_time_run):
+    assert (no_time_run / "test_results.csv").exists()
+    assert not (no_time_run / "test_sweep.csv").exists()
+
+
 def test_test_results_has_finite_metrics(trained_run):
     df = pd.read_csv(trained_run / "test_results.csv")
     assert len(df) > 0

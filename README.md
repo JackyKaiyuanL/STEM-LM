@@ -47,7 +47,8 @@ and `train` for training rows as the only sources).
 checkpoint is also scored on the test set at every radius and window pair, written
 to `test_sweep.csv`, giving performance as a function of distance to the nearest
 source; by default the sweep holds the windows 0 and 1 day with no radius, so
-same-day sources are removed in one row. `--causal_context` restricts sources to
+same-day sources are removed in one row. The windows are dropped when every time
+value is equal. `--causal_context` restricts sources to
 earlier dates.
 
 ## Splits
