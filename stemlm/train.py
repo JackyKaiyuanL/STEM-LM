@@ -727,16 +727,6 @@ def run_train(args):
                 "val_cbi_mean": val_cbi_mean,
             }, resume_path)
 
-            if epoch % 10 == 0:
-                torch.save({
-                    "epoch": epoch,
-                    "model_state_dict": unwrap(model).state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss_mean": val_loss_mean,
-                    "val_auc_mean": val_auc_mean,
-                    "val_auprc_mean": val_auprc_mean,
-                }, os.path.join(args.output_dir, f"checkpoint_epoch{epoch}.pt"))
-
         if env.is_distributed:
             best_state = torch.tensor([best_val_auc_mean, best_val_auprc_mean],
                                       dtype=torch.float64, device=device)
