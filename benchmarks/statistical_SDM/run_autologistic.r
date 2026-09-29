@@ -16,7 +16,7 @@ DOY_PERIODS <- as.numeric(strsplit(Sys.getenv("DOY_PERIODS", unset = "365,182,12
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
 COV_SETS <- c("env", "full")
-SPLITS   <- c("train", "val", "test")
+SPLITS   <- c("test")
 
 dat      <- read.csv(DATA_FILE, check.names = FALSE)
 env_cols <- grep("^env_", names(dat), value = TRUE)

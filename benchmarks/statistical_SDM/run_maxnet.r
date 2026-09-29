@@ -16,7 +16,7 @@ results_dir <- need("RESULTS_DIR")
 N_CORES     <- as.integer(Sys.getenv("N_CORES", unset = "8"))
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
-SPLITS          <- c("train", "val", "test")
+SPLITS          <- c("test")
 REG_MULT_VALUES <- c(1, 2, 4, 6, 8, 10, 12, 16, 20, 24, 32)
 
 dat      <- read.csv(DATA_FILE, check.names = FALSE)

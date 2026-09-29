@@ -16,7 +16,7 @@ N_CORES     <- as.integer(Sys.getenv("N_CORES", unset = "8"))
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
 COV_SETS <- c("env", "spatiotemporal", "full")
-SPLITS   <- c("train", "val", "test")
+SPLITS   <- c("test")
 
 dat      <- read.csv(DATA_FILE, check.names = FALSE)
 env_cols <- grep("^env_", names(dat), value = TRUE)
