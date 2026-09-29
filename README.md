@@ -91,7 +91,8 @@ per GPU; `latest_checkpoint.pt` resumes an interrupted run.
 `best_model.pt` (selected by validation AUROC averaged over `--val_p_list`),
 `best_model_by_cbi.pt`, `config.json`, `species_names.json`, `splits.json`,
 `training_log.csv`, `test_results.csv` and `per_species_auc.csv` (per masking
-rate and mask scheme), `ablation_summary.json`, and `temperature.json`.
+rate and mask scheme), `ablation_summary.json`, `temperature.json`, and
+`run_info.json` (host, GPU, seed, versions, command, arguments, and the run's wall time).
 Evaluation is deterministic: sources are fixed and
 masks are seeded per batch.
 

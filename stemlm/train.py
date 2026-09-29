@@ -4,8 +4,13 @@ import itertools
 import json
 import logging
 import os
+import platform
+import shlex
+import socket
+import sys
 import time
 from contextlib import nullcontext
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -94,6 +99,24 @@ class DistEnv:
 def log_main(env: "DistEnv", msg: str, level: int = logging.INFO):
     if env.is_main:
         logger.log(level, msg)
+
+
+def run_info(args, env, device):
+    cuda = device.type == "cuda"
+    return {
+        "started_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "num_gpus": env.world_size if cuda else 0,
+        "gpu": torch.cuda.get_device_name(device) if cuda else None,
+        "gpu_memory_gib": round(torch.cuda.get_device_properties(device).total_memory / 2**30, 1) if cuda else None,
+        "seed": args.seed,
+        "command": shlex.join(sys.argv),
+        "args": {k: v for k, v in vars(args).items() if k != "func"},
+    }
 
 
 def _parse_rate(s):
@@ -367,6 +390,7 @@ def add_train_args(parser):
 
 
 def run_train(args):
+    started = time.monotonic()
     env = DistEnv()
     env.setup(backend="nccl")
 
@@ -388,13 +412,13 @@ def run_train(args):
             log_main(env, f"  {p}")
         return
 
-    if env.is_distributed:
-        log_main(env,
-            f"Distributed training: world_size={env.world_size}, "
-            f"backend=nccl, device={device}"
-        )
-    else:
-        log_main(env, f"Single-process training, device={device}")
+    info = run_info(args, env, device)
+    log_main(env, f"Run: {info['num_gpus']}x {info['gpu']} ({info['gpu_memory_gib']} GiB) on {info['hostname']}, "
+                  f"seed {args.seed}, torch {info['torch']}, CUDA {info['cuda']}, {info['platform']}")
+    log_main(env, f"Command: {info['command']}")
+    if env.is_main:
+        with open(os.path.join(args.output_dir, "run_info.json"), "w") as f:
+            json.dump(info, f, indent=2)
 
     train_loader, dataset, dist_info, splits = create_dataloaders(
         csv_path=args.csv_path,
@@ -1054,7 +1078,14 @@ def run_train(args):
             json.dump(summary, f, indent=2)
         with open(os.path.join(args.output_dir, "species_names.json"), "w") as f:
             json.dump(dataset.species_cols, f)
-        logger.info(f"Done. Output: {args.output_dir}")
+        wall = time.monotonic() - started
+        info.update(ended_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    wall_seconds=round(wall, 1),
+                    wall_hm=f"{int(wall // 3600)}:{int(wall % 3600 // 60):02d}")
+        with open(os.path.join(args.output_dir, "run_info.json"), "w") as f:
+            json.dump(info, f, indent=2)
+        logger.info(f"Done. Wall time {info['wall_hm']} (h:mm) on {info['num_gpus']}x {info['gpu']}. "
+                    f"Output: {args.output_dir}")
 
     env.barrier()
     env.cleanup()

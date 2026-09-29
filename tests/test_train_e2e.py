@@ -17,12 +17,18 @@ EXPECTED_ARTIFACTS = [
     "test_results.csv",
     "per_species_auc.csv",
     "ablation_summary.json",
+    "run_info.json",
 ]
 
 
 def test_all_artifacts_written(trained_run):
     missing = [f for f in EXPECTED_ARTIFACTS if not (trained_run / f).exists()]
     assert not missing, f"missing artifacts: {missing}"
+
+
+def test_run_info_records_seed_and_wall_time(trained_run):
+    info = json.loads((trained_run / "run_info.json").read_text())
+    assert info["seed"] == 0 and info["wall_seconds"] > 0
 
 
 def test_config_matches_dataset(trained_run):
