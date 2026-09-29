@@ -124,6 +124,9 @@ def main():
                         row_indices=splits["test"], species=np.asarray(species_cols))
     write_metrics(output_dir, "MaskSDM", [({"cov_set": "env", "masking_p": 1.0}, logits, labels)],
                   species_cols, data["y_train"].sum(0))
+    for f in checkpoint_dir.glob("epoch_*.pt"):
+        if f.name != f"epoch_{best_epoch}.pt":
+            f.unlink()
 
 
 if __name__ == "__main__":
