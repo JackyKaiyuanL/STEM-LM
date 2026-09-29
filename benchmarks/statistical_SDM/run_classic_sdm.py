@@ -22,11 +22,7 @@ METHODS = {
 }
 
 
-def write_autocovariate(csv_path, splits_path, args, out_path):
-    _, dataset, _, _ = create_dataloaders(str(csv_path), splits_path=str(splits_path),
-                                          min_train_presences=args.min_train_presences,
-                                          heldout_sources=args.val_sources == "heldout",
-                                          source_cell_resolution=args.source_cell_resolution)
+def write_autocovariate(dataset, out_path):
     share = np.empty((len(dataset), dataset.num_species), dtype=np.float32)
     for start in range(0, len(dataset), 2048):
         items = dataset.__getitems__(list(range(start, min(start + 2048, len(dataset)))))
@@ -43,9 +39,9 @@ def main():
     parser.add_argument("--output_dir", type=Path)
     parser.add_argument("--rscript", default="Rscript")
     parser.add_argument("--n_cores", type=int, default=8)
-    parser.add_argument("--val_sources", choices=["train", "heldout"], default="train",
-                        help="Sources of the autologistic autocovariate at held-out rows, as in stemlm train.")
-    parser.add_argument("--source_cell_resolution", type=int, default=7)
+    parser.add_argument("--source_cell_resolution", type=int, default=7,
+                        help="As in stemlm train: held-out rows outside the target's H3 cell at this "
+                             "resolution join the training rows as autologistic neighbours.")
     add_species_arg(parser)
     args = parser.parse_args()
 
@@ -62,24 +58,33 @@ def main():
                    "RESULTS_DIR": str(output_dir), "N_CORES": str(args.n_cores),
                    "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
     if args.method == "autologistic":
+        _, dataset, _, _ = create_dataloaders(str(args.csv_path.resolve()), splits_path=str(args.splits_path.resolve()),
+                                              min_train_presences=args.min_train_presences,
+                                              source_cell_resolution=args.source_cell_resolution)
         environment["AUTOCOV_FILE"] = str(output_dir / "autocovariate.csv")
-        write_autocovariate(args.csv_path.resolve(), args.splits_path.resolve(), args, environment["AUTOCOV_FILE"])
+        write_autocovariate(dataset, environment["AUTOCOV_FILE"])
+        dataset.heldout_split = None
+        environment["AUTOCOV_TRAIN_FILE"] = str(output_dir / "autocovariate_train_sources.csv")
+        write_autocovariate(dataset, environment["AUTOCOV_TRAIN_FILE"])
     with timed_phase(output_dir, "training"):
         subprocess.run([args.rscript, str(SCRIPT_DIR / script)], check=True, env=environment)
 
     test_idx = np.sort(splits["test"])
     labels_all = df[species_cols].to_numpy(dtype=np.int64)[test_idx]
     results = []
+    sources = ("heldout", "train") if args.method == "autologistic" else ("none",)
     for cov_set in cov_sets:
-        pred = pd.read_csv(output_dir / cov_set / "predictions_test_all.csv")
-        z = (pred.pivot(index="row_index", columns="species", values="logit")
-             .reindex(index=test_idx, columns=species_cols).to_numpy(dtype=np.float64))
-        fitted = ~np.isnan(z).all(axis=0)
-        if not np.isfinite(z[:, fitted]).all():
-            raise ValueError(f"{cov_set}: non-finite logits in {output_dir / cov_set}")
-        results.append(({"cov_set": cov_set, "masking_p": 1.0, "sources": args.val_sources},
-                        np.where(fitted, z, 0.0),
-                        np.where(fitted, labels_all, -100)))
+        for src in sources:
+            name = "predictions_test_all.csv" if src == "none" else f"predictions_test_{src}_all.csv"
+            pred = pd.read_csv(output_dir / cov_set / name)
+            z = (pred.pivot(index="row_index", columns="species", values="logit")
+                 .reindex(index=test_idx, columns=species_cols).to_numpy(dtype=np.float64))
+            fitted = ~np.isnan(z).all(axis=0)
+            if not np.isfinite(z[:, fitted]).all():
+                raise ValueError(f"{cov_set}: non-finite logits in {output_dir / cov_set / name}")
+            results.append(({"cov_set": cov_set, "masking_p": 1.0, "sources": src},
+                            np.where(fitted, z, 0.0),
+                            np.where(fitted, labels_all, -100)))
     write_metrics(output_dir, args.method, results, species_cols,
                   df[species_cols].to_numpy()[splits["train"]].sum(0))
 

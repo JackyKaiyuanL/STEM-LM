@@ -25,25 +25,30 @@ eButterfly, NEUS, sPlotOpen and the monarch grid are under
 ```bash
 uv sync
 uv run stemlm train data.csv --output_dir out --splits_path splits.json \
-    --p unif:0.0,1.0 --temporal_fire_init_periods 365 182 122 91 \
-    --train_exclusion --mixed_precision bf16 --temperature_scaling
+    --temporal_fire_init_periods 365 182 122 91 --mixed_precision bf16
 ```
 
 `uv run pytest` runs the test suite.
 
 ## Sources
 
-For every target the K nearest training rows (`--num_source_sites`, default 128)
-are the sources; no held-out row is ever a source. During training,
-`--train_exclusion` drops candidate sources within a radius and, independently,
+For every target the K nearest candidate rows (`--num_source_sites`, default 128)
+are the sources. Training targets take candidates from the training rows only;
+validation and test targets also take the other rows of their own split outside
+their H3 cell at `--source_cell_resolution` (see the options table). During training,
+`--train_exclusion` (default on) drops candidate sources within a radius and, independently,
 within a time window of the target: each is 0 with probability 1/2 and otherwise
 drawn log-uniformly between the target's nearest and farthest candidate. This
 puts the geometry of evaluation and deployment into training without a tuned
-scale. Validation, checkpoint selection and `test_results.csv` use no exclusion.
+scale. Validation, checkpoint selection and `test_results.csv` use no exclusion
+(`test_results.csv` carries a `sources` column, `heldout` for the primary regime
+and `train` for training rows as the only sources).
 `--eval_exclusion_km` and `--eval_exclusion_days` take lists: the selected
 checkpoint is also scored on the test set at every radius and window pair, written
 to `test_sweep.csv`, giving performance as a function of distance to the nearest
-source. `--causal_context` restricts sources to earlier dates.
+source; by default the sweep holds the windows 0 and 1 day with no radius, so
+same-day sources are removed in one row. `--causal_context` restricts sources to
+earlier dates.
 
 ## Splits
 
@@ -73,9 +78,9 @@ which species are kept.
 | `--mixed_precision` | `none` | `bf16` or `fp16` |
 | `--grad_accum_steps`, `--gradient_checkpointing`, `--compile` | 1, off, off | memory and speed |
 | `--val_p_list` | 0.25 0.5 0.75 1.0 | mask rates for validation and test |
-| `--val_sources`, `--source_cell_resolution` | `train`, 7 | `heldout` lets validation and test targets also use the other rows of their own split as sources, outside the target's H3 cell at this resolution; the uniform scheme is scored in both modes |
+| `--source_cell_resolution` | 7 | validation and test targets use the training rows and the other rows of their own split as sources, outside the target's H3 cell at this resolution; the uniform test scheme is also scored with training rows as the only sources |
 | `--absence_mask_p_list`, `--no_absence_mask_eval` | 0.25 0.5 0.75 1.0 | presence-only evaluation block |
-| `--temperature_scaling` | off | fit a temperature on validation logits at p = 1 and report calibrated ECE |
+| `--temperature_scaling` | on | fit a temperature on validation logits at p = 1; every test metric uses the scaled logits |
 | `--seed`, `--num_workers`, `--output_dir` | 42, cores, `./STEMLM_output` | |
 
 Multi-GPU: `torchrun --nproc_per_node=N -m stemlm.cli train ...`; batch size is
@@ -86,8 +91,8 @@ per GPU; `latest_checkpoint.pt` resumes an interrupted run.
 `best_model.pt` (selected by validation AUROC averaged over `--val_p_list`),
 `best_model_by_cbi.pt`, `config.json`, `species_names.json`, `splits.json`,
 `training_log.csv`, `test_results.csv` and `per_species_auc.csv` (per masking
-rate and mask scheme), `ablation_summary.json`, and `temperature.json` with
-`--temperature_scaling`. Evaluation is deterministic: sources are fixed and
+rate and mask scheme), `ablation_summary.json`, and `temperature.json`.
+Evaluation is deterministic: sources are fixed and
 masks are seeded per batch.
 
 ## Library use

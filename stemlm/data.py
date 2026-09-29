@@ -663,7 +663,6 @@ def create_dataloaders(
     splits_path: str | None = None,
     vocab_path: str | None = None,
     min_train_presences: int = MIN_TRAIN_PRESENCES,
-    heldout_sources: bool = False,
     source_cell_resolution: int = 7,
 ):
     if vocab_path is not None:
@@ -699,8 +698,7 @@ def create_dataloaders(
     cells = [h3.latlng_to_cell(float(la), float(lo), source_cell_resolution)
              for la, lo in zip(dataset.lats, dataset.lons)]
     dataset.cell = np.unique(cells, return_inverse=True)[1].ravel()
-    if heldout_sources:
-        dataset.heldout_split = heldout_split_ids(len(dataset), val_indices, test_indices)
+    dataset.heldout_split = heldout_split_ids(len(dataset), val_indices, test_indices)
     dataset.fill_env(train_indices)
     if train_exclusion:
         dataset.random_exclusion_rows = train_indices

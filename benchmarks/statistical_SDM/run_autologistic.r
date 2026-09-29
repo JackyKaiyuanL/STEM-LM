@@ -22,6 +22,8 @@ dat      <- read.csv(DATA_FILE, check.names = FALSE)
 env_cols <- grep("^env_", names(dat), value = TRUE)
 all_sp   <- readLines(need("SPECIES_FILE"))
 dat      <- cbind(dat, read.csv(need("AUTOCOV_FILE"), check.names = FALSE))
+auto_train <- read.csv(need("AUTOCOV_TRAIN_FILE"), check.names = FALSE)
+SOURCES  <- c("heldout", "train")
 
 doy_cols <- character(0)
 if ("time" %in% names(dat)) {
@@ -66,11 +68,13 @@ fit_predict_species <- function(sp, cs, out_dir) {
   if (is.null(m)) return(data.frame(species = sp, cov_set = cs, converged = FALSE))
   for (split in SPLITS) {
     rows <- dat[idx[[split]], ]
-    rows$auto <- rows[[auto_col]]
-    write.csv(data.frame(row_index = idx[[split]] - 1L, species = sp, cov_set = cs, split = split,
-                         logit = as.numeric(predict(m, newdata = rows, type = "link")),
-                         actual = rows[[sp]]),
-              file.path(out_dir, paste0(sp_safe, "_", split, ".csv")), row.names = FALSE)
+    for (src in SOURCES) {
+      rows$auto <- if (src == "heldout") rows[[auto_col]] else auto_train[idx[[split]], auto_col]
+      write.csv(data.frame(row_index = idx[[split]] - 1L, species = sp, cov_set = cs, split = split, sources = src,
+                           logit = as.numeric(predict(m, newdata = rows, type = "link")),
+                           actual = rows[[sp]]),
+                file.path(out_dir, paste0(sp_safe, "_", split, "_", src, ".csv")), row.names = FALSE)
+    }
   }
   data.frame(species = sp, cov_set = cs, converged = isTRUE(m$converged))
 }
@@ -84,9 +88,11 @@ for (cs in COV_SETS) {
                   mc.cores = N_CORES, mc.preschedule = FALSE)
   conv_log <- c(conv_log, res[!sapply(res, is.null)])
   for (split in SPLITS) {
-    files <- list.files(out_dir, pattern = paste0("_", split, "\\.csv$"), full.names = TRUE)
-    write.csv(do.call(rbind, lapply(files, read.csv, check.names = FALSE)),
-              file.path(results_dir, cs, paste0("predictions_", split, "_all.csv")), row.names = FALSE)
+    for (src in SOURCES) {
+      files <- list.files(out_dir, pattern = paste0("_", split, "_", src, "\\.csv$"), full.names = TRUE)
+      write.csv(do.call(rbind, lapply(files, read.csv, check.names = FALSE)),
+                file.path(results_dir, cs, paste0("predictions_", split, "_", src, "_all.csv")), row.names = FALSE)
+    }
   }
   unlink(out_dir, recursive = TRUE)
   cat(sprintf("%s: %.1f min\n", cs, as.numeric(difftime(Sys.time(), t0, units = "mins"))))
