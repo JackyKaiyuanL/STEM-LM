@@ -29,6 +29,7 @@ def test_all_artifacts_written(trained_run):
 def test_run_info_records_seed_and_wall_time(trained_run):
     info = json.loads((trained_run / "run_info.json").read_text())
     assert info["seed"] == 0 and info["wall_seconds"] > 0
+    assert info["split"] == {"file": None, "resolution": 2, "seed": 0, "train_frac": 0.8, "test_frac": 0.1}
 
 
 def test_config_matches_dataset(trained_run):

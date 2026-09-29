@@ -6,7 +6,6 @@ import logging
 import os
 import platform
 import shlex
-import socket
 import sys
 import time
 from contextlib import nullcontext
@@ -103,9 +102,16 @@ def log_main(env: "DistEnv", msg: str, level: int = logging.INFO):
 
 def run_info(args, env, device):
     cuda = device.type == "cuda"
+    if args.splits_path:
+        with open(args.splits_path) as f:
+            meta = json.load(f).get("meta", {})
+        split = {"file": os.path.abspath(args.splits_path),
+                 "resolution": meta.get("resolution"), "seed": meta.get("seed")}
+    else:
+        split = {"file": None, "resolution": args.resolution, "seed": args.seed,
+                 "train_frac": args.train_frac, "test_frac": args.test_frac}
     return {
         "started_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "hostname": socket.gethostname(),
         "platform": platform.platform(),
         "python": platform.python_version(),
         "torch": torch.__version__,
@@ -114,6 +120,7 @@ def run_info(args, env, device):
         "gpu": torch.cuda.get_device_name(device) if cuda else None,
         "gpu_memory_gib": round(torch.cuda.get_device_properties(device).total_memory / 2**30, 1) if cuda else None,
         "seed": args.seed,
+        "split": split,
         "command": shlex.join(sys.argv),
         "args": {k: v for k, v in vars(args).items() if k != "func"},
     }
@@ -413,8 +420,13 @@ def run_train(args):
         return
 
     info = run_info(args, env, device)
-    log_main(env, f"Run: {info['num_gpus']}x {info['gpu']} ({info['gpu_memory_gib']} GiB) on {info['hostname']}, "
+    log_main(env, f"Run: {info['num_gpus']}x {info['gpu']} ({info['gpu_memory_gib']} GiB), "
                   f"seed {args.seed}, torch {info['torch']}, CUDA {info['cuda']}, {info['platform']}")
+    split = info["split"]
+    log_main(env, f"Split: file {split['file']} (H3 resolution {split['resolution']}, split seed {split['seed']})"
+                  if split["file"] else
+                  f"Split: generated with H3 resolution {split['resolution']}, split seed {split['seed']}, "
+                  f"train fraction {split['train_frac']}, test fraction {split['test_frac']}")
     log_main(env, f"Command: {info['command']}")
     if env.is_main:
         with open(os.path.join(args.output_dir, "run_info.json"), "w") as f:
