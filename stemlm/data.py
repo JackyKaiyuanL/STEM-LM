@@ -161,6 +161,10 @@ class _SparseSpeciesData:
         return arr
 
 
+def read_table(path) -> pd.DataFrame:
+    return pd.read_parquet(path) if str(path).endswith(".parquet") else pd.read_csv(path)
+
+
 class JSDMDataset(Dataset):
     def __init__(
         self,
@@ -174,7 +178,7 @@ class JSDMDataset(Dataset):
     ):
         super().__init__()
         self.num_source_sites = num_source_sites
-        df = pd.read_csv(csv_path)
+        df = read_table(csv_path)
 
         has_time = _normalize_time_col(df, time_col, no_time)
         coord_cols = ([time_col] if has_time else []) + [lat_col, lon_col]

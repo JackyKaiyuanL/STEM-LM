@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from stemlm.data import MIN_TRAIN_PRESENCES, load_splits, species_with_presences  # noqa: E402
+from stemlm.data import MIN_TRAIN_PRESENCES, load_splits, read_table, species_with_presences  # noqa: E402
 from stemlm.metric import compute_per_species_metrics, summarize_per_species_metrics  # noqa: E402
 
 META_COLS = ("time", "latitude", "longitude")
@@ -34,7 +34,7 @@ def add_species_arg(parser):
 
 
 def load_dataset(csv_path, split_path, min_train_presences):
-    df = pd.read_csv(csv_path)
+    df = read_table(csv_path)
     env_cols = [c for c in df.columns if c.startswith("env_")]
     species_cols = [c for c in df.columns if c not in META_COLS and not c.startswith("env_")]
     train, val, test = load_splits(str(split_path), expected_num_rows=len(df))

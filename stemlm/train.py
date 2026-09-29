@@ -250,8 +250,8 @@ def evaluate(model, loader, device, dist_info, env, amp_dtype=None, **loss_kw):
 
 def add_train_args(parser):
     parser.add_argument("csv_path", type=str,
-                        help="Wide CSV, or (with --vocab_path) a sparse-parquet file or "
-                             "directory of parquet shards.")
+                        help="Wide table as .csv or .parquet (one column per species), or "
+                             "(with --vocab_path) a sparse-parquet file or directory of parquet shards.")
     parser.add_argument("--vocab_path", type=str, default=None,
                         help="species_vocab.json; if set, csv_path is read as sparse parquet "
                              "(species_idx) via JSDMSparseDataset.")

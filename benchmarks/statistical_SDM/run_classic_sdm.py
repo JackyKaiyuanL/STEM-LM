@@ -52,7 +52,11 @@ def main():
     species_file = output_dir / "species.txt"
     species_file.write_text("\n".join(species_cols) + "\n")
     script, cov_sets = METHODS[args.method]
-    environment = {**os.environ, "DATA_FILE": str(args.csv_path.resolve()),
+    data_file = args.csv_path.resolve()
+    if data_file.suffix == ".parquet":
+        data_file = output_dir / "data.csv"
+        df.to_csv(data_file, index=False)
+    environment = {**os.environ, "DATA_FILE": str(data_file),
                    "SPLITS_FILE": str(args.splits_path.resolve()),
                    "SPECIES_FILE": str(species_file),
                    "RESULTS_DIR": str(output_dir), "N_CORES": str(args.n_cores),
@@ -68,6 +72,8 @@ def main():
         write_autocovariate(dataset, environment["AUTOCOV_TRAIN_FILE"])
     with timed_phase(output_dir, "training"):
         subprocess.run([args.rscript, str(SCRIPT_DIR / script)], check=True, env=environment)
+    if data_file != args.csv_path.resolve():
+        data_file.unlink()
 
     test_idx = np.sort(splits["test"])
     labels_all = df[species_cols].to_numpy(dtype=np.int64)[test_idx]
