@@ -95,3 +95,14 @@ def no_time_run(tmp_path_factory, tiny_csv):
     result = _run_cli("train", str(tiny_csv), "--output_dir", str(out_dir), *TRAIN_ARGS, "--no_time")
     assert result.returncode == 0, f"stemlm train --no_time exited {result.returncode}\n{result.stderr}"
     return out_dir
+
+
+@pytest.fixture(scope="session")
+def resumed_run(tmp_path_factory, tiny_csv):
+    out_dir = tmp_path_factory.mktemp("run_resumed") / "out"
+    args = ("train", str(tiny_csv), "--output_dir", str(out_dir), *TRAIN_ARGS)
+    assert _run_cli(*args).returncode == 0
+    (out_dir / "test_results.csv").unlink()
+    result = _run_cli(*args)
+    assert result.returncode == 0, f"resumed stemlm train exited {result.returncode}\n{result.stderr}"
+    return out_dir

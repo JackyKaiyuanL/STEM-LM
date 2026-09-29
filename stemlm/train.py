@@ -606,12 +606,13 @@ def run_train(args):
     )
 
     log_csv = os.path.join(args.output_dir, "training_log.csv")
+    resume_path = os.path.join(args.output_dir, "latest_checkpoint.pt")
     per_p_header = []
     for p in args.val_p_list:
         per_p_header += [f"val_loss_p{p:.2f}", f"val_acc_p{p:.2f}",
                          f"val_auc_p{p:.2f}", f"val_auprc_p{p:.2f}",
                          f"val_cbi_p{p:.2f}"]
-    if env.is_main:
+    if env.is_main and not os.path.exists(resume_path):
         with open(log_csv, "w", newline="") as f:
             csv.writer(f).writerow(
                 ["epoch", "train_loss", "train_acc",
@@ -625,7 +626,6 @@ def run_train(args):
     best_val_cbi_mean = -float("inf")
     start_epoch = 1
 
-    resume_path = os.path.join(args.output_dir, "latest_checkpoint.pt")
     if os.path.exists(resume_path):
         log_main(env, f"Resuming from checkpoint: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)

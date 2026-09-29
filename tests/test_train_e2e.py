@@ -62,6 +62,10 @@ def test_no_time_run_finishes_without_time_windows(no_time_run):
     assert not (no_time_run / "test_sweep.csv").exists()
 
 
+def test_resume_keeps_training_log(resumed_run):
+    assert len(pd.read_csv(resumed_run / "training_log.csv")) == 2
+
+
 def test_test_results_has_finite_metrics(trained_run):
     df = pd.read_csv(trained_run / "test_results.csv")
     assert len(df) > 0
