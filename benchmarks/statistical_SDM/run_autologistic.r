@@ -15,7 +15,7 @@ N_CORES     <- as.integer(Sys.getenv("N_CORES", unset = "8"))
 DOY_PERIODS <- as.numeric(strsplit(Sys.getenv("DOY_PERIODS", unset = "365,182,122,91"), ",")[[1]])
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
-COV_SETS <- c("env", "full")
+COV_SETS <- c("env", "spatiotemporal", "full")
 SPLITS   <- c("test")
 
 dat      <- read.csv(DATA_FILE, check.names = FALSE)
@@ -46,8 +46,9 @@ train_dat <- dat[idx$train, ]
 env_terms <- paste(env_cols, collapse = " + ")
 st_terms  <- paste(c("latitude * longitude", doy_cols), collapse = " + ")
 formulas  <- list(
-  env  = paste("y ~ auto +", env_terms),
-  full = paste("y ~ auto +", env_terms, "+", st_terms)
+  env            = paste("y ~ auto +", env_terms),
+  spatiotemporal = paste("y ~ auto +", st_terms),
+  full           = paste("y ~ auto +", env_terms, "+", st_terms)
 )
 
 cat(sprintf("Data: %d rows | %d species | %d env | train %d val %d test %d\n",

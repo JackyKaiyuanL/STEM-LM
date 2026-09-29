@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import gzip
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -16,7 +18,7 @@ from stemlm.data import create_dataloaders  # noqa: E402
 SCRIPT_DIR = Path(__file__).resolve().parent
 METHODS = {
     "logistic": ("run_logistic.r", ("env", "spatiotemporal", "full")),
-    "autologistic": ("run_autologistic.r", ("env", "full")),
+    "autologistic": ("run_autologistic.r", ("env", "spatiotemporal", "full")),
     "gam": ("run_gam.r", ("env", "spatiotemporal", "full")),
     "maxnet": ("run_maxnet.r", ("env",)),
 }
@@ -93,6 +95,10 @@ def main():
                             np.where(fitted, labels_all, -100)))
     write_metrics(output_dir, args.method, results, species_cols,
                   df[species_cols].to_numpy()[splits["train"]].sum(0))
+    for f in [*output_dir.glob("*/predictions_test_*.csv"), *output_dir.glob("autocovariate*.csv")]:
+        with open(f, "rb") as src, gzip.open(f"{f}.gz", "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        f.unlink()
 
 
 if __name__ == "__main__":
