@@ -415,8 +415,10 @@ class JSDMModel(nn.Module):
         self.config = config
         self.target_input = TargetInput(config)
         self.use_env = config.ablation in ("full", "no_st")
+        self.use_source_env = config.ablation == "full"
         if self.use_env:
             self.target_env_module = TargetEnvModule(config)
+        if self.use_source_env:
             self.env_source_module = EnvSourceModule(config)
         self.encoder = JSDMEncoder(config)
 
@@ -445,10 +447,9 @@ class JSDMModel(nn.Module):
         source_emb = (source_basis, source_ids.long())
 
         if self.use_env:
-            env_emb = torch.cat([
-                self.env_source_module(env_data),
-                self.target_env_module(target_env),
-            ], dim=1)
+            env_emb = self.target_env_module(target_env)
+            if self.use_source_env:
+                env_emb = torch.cat([self.env_source_module(env_data), env_emb], dim=1)
         else:
             env_emb = None
 
