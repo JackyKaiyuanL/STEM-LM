@@ -668,6 +668,7 @@ def create_dataloaders(
     vocab_path: str | None = None,
     min_train_presences: int = MIN_TRAIN_PRESENCES,
     source_cell_resolution: int = 7,
+    train_sources_only: bool = False,
 ):
     if vocab_path is not None:
         dataset = JSDMSparseDataset(
@@ -702,7 +703,8 @@ def create_dataloaders(
     cells = [h3.latlng_to_cell(float(la), float(lo), source_cell_resolution)
              for la, lo in zip(dataset.lats, dataset.lons)]
     dataset.cell = np.unique(cells, return_inverse=True)[1].ravel()
-    dataset.heldout_split = heldout_split_ids(len(dataset), val_indices, test_indices)
+    if not train_sources_only:
+        dataset.heldout_split = heldout_split_ids(len(dataset), val_indices, test_indices)
     dataset.fill_env(train_indices)
     if train_exclusion:
         dataset.random_exclusion_rows = train_indices

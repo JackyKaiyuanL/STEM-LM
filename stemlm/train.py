@@ -335,8 +335,11 @@ def add_train_args(parser):
     parser.add_argument("--source_cell_resolution", type=int, default=7,
                         help="Validation and test targets draw sources from the training rows and from "
                              "the other rows of their own split outside the target's H3 cell at this "
-                             "resolution (default 7, about 1.4 km edge). The uniform test scheme is also "
-                             "scored with training rows as the only sources.")
+                             "resolution (default 7, about 1.4 km edge).")
+    parser.add_argument("--train_sources_only", action="store_true",
+                        help="Validation and test targets draw sources from the training rows only, "
+                             "with no cell exclusion, so checkpoint selection, T* and every test "
+                             "result follow that rule. --source_cell_resolution is then unused.")
     parser.add_argument("--env_cols", nargs="+", default=None,
                         help="Explicit list of env column names. If not set, columns with 'env_' "
                              "prefix are used. Useful for datasets with non-prefixed env columns "
@@ -451,6 +454,7 @@ def run_train(args):
         vocab_path=args.vocab_path,
         min_train_presences=args.min_train_presences,
         source_cell_resolution=args.source_cell_resolution,
+        train_sources_only=args.train_sources_only,
     )
 
     if env.is_distributed:
@@ -804,24 +808,6 @@ def run_train(args):
         f"AUC={best_mean_auc:.4f}  AUPRC={best_mean_auprc:.4f}  CBI={best_mean_cbi:.3f}"
     )
 
-    heldout_ids, dataset.heldout_split = dataset.heldout_split, None
-    other_per_p = {}
-    for p in args.val_p_list:
-        s = evaluate_at_p(
-            unwrap(model), dataset, eval_indices, dist_info,
-            p_value=p,
-            batch_size=args.batch_size, device=device,
-            num_workers=args.num_workers,
-            base_seed=args.seed + 10_000,
-            amp_dtype=amp_dtype,
-            distributed_sampler=env.is_distributed,
-            temperature=T_star,
-        )["summary"]
-        other_per_p[p] = s
-        log_main(env, f"{eval_split} sources=train p={p:.2f}  AUC={s['mean_auc_roc']:.4f}  "
-                      f"AUPRC={s['mean_auc_pr']:.4f}  CBI={s['mean_cbi']:.3f}  (n={s['n_species']})")
-    dataset.heldout_split = heldout_ids
-
     cbi_sel_per_p_auc = {}
     cbi_sel_per_p_auprc = {}
     cbi_sel_per_p_cbi = {}
@@ -981,17 +967,11 @@ def run_train(args):
             os.path.join(args.output_dir, "per_species_auc.csv"), index=False)
         logger.info(f"Per-species metrics saved to {args.output_dir}/per_species_auc.csv")
 
+        sources = "train" if args.train_sources_only else "heldout"
         test_rows = []
-        for p, s in other_per_p.items():
-            test_rows.append({
-                "mask_scheme": "uniform", "sources": "train", "p": p,
-                "auc": s["mean_auc_roc"], "auc_q25": s["auc_roc_q25"], "auc_q50": s["auc_roc_q50"],
-                "auc_q75": s["auc_roc_q75"], "auprc": s["mean_auc_pr"], "cbi": s["mean_cbi"],
-                "brier": s["mean_brier"], "ece": s["mean_ece"],
-            })
         for p in args.val_p_list:
             test_rows.append({
-                "mask_scheme": "uniform", "sources": "heldout", "p": p,
+                "mask_scheme": "uniform", "sources": sources, "p": p,
                 "auc": per_p_auc.get(p, float("nan")),
                 "auc_q25": per_p_q25.get(p, float("nan")),
                 "auc_q50": per_p_q50.get(p, float("nan")),
@@ -1004,7 +984,7 @@ def run_train(args):
         if not args.no_absence_mask_eval:
             for p in args.absence_mask_p_list:
                 test_rows.append({
-                    "mask_scheme": "absence_mask", "sources": "heldout", "p": p,
+                    "mask_scheme": "absence_mask", "sources": sources, "p": p,
                     "auc": absmask_per_p_auc.get(p, float("nan")),
                     "auc_q25": absmask_per_p_q25.get(p, float("nan")),
                     "auc_q50": absmask_per_p_q50.get(p, float("nan")),
