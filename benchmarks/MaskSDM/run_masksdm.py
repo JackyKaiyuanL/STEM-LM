@@ -36,7 +36,7 @@ def main():
     parser.add_argument("--output_dir", type=Path)
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--masksdm_repo", required=True, type=Path)
-    parser.add_argument("--num_epochs", type=int, default=1000)
+    parser.add_argument("--num_epochs", type=int, default=100)
     add_species_arg(parser)
     args = parser.parse_args()
 
@@ -66,9 +66,7 @@ def main():
     for name in splits:
         data[f"x_{name}"] = (data[f"x_{name}"] - mean) / (std + 1e-4)
 
-    evaluated = np.intersect1d(np.intersect1d(data["y_train"].sum(0).nonzero()[0],
-                                              data["y_val"].sum(0).nonzero()[0]),
-                               data["y_test"].sum(0).nonzero()[0]).tolist()
+    evaluated = data["y_val"].sum(0).nonzero()[0].tolist()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed_everything(args.seed)
     torch.set_default_device(device)

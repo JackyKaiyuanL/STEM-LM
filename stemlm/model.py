@@ -219,7 +219,7 @@ class SpeciesSelfAttention(Attention):
 
         # q/k/v are (B, T, heads, S, head_dim). The fused attention kernels only
         # accept 4-D inputs, so a 5-D call silently falls back to the math backend
-        # and materialises the S x S scores — 18 GB at S=3000, where it OOMs. Fold
+        # and materializes the S x S scores — 18 GB at S=3000, where it OOMs. Fold
         # the leading dims into the batch axis (attention is independent across
         # them) so flash/mem-efficient kernels apply: 3.4x faster at S=200, 6.8x
         # at S=1000, and S>=3000 becomes feasible at all.

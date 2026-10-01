@@ -42,8 +42,9 @@ def main():
     parser.add_argument("--rscript", default="Rscript")
     parser.add_argument("--n_cores", type=int, default=8)
     parser.add_argument("--source_cell_resolution", type=int, default=7,
-                        help="As in stemlm train: held-out rows outside the target's H3 cell at this "
-                             "resolution join the training rows as autologistic neighbours.")
+                        help="As in stemlm train: autologistic neighbours exclude the target's own H3 "
+                             "cell at this resolution, and held-out rows of the target's split join the "
+                             "training rows as neighbours.")
     add_species_arg(parser)
     args = parser.parse_args()
 

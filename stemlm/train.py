@@ -195,7 +195,7 @@ def train_epoch(model, loader, optimizer, scheduler, device, dist_info, epoch, e
                 f"LR: {scheduler.get_last_lr()[0]:.2e}"
             )
 
-    # Single sync per epoch to materialise the accumulators as Python scalars.
+    # Single sync per epoch to materialize the accumulators as Python scalars.
     total_loss = loss_sum.item()
     total_correct = int(correct_sum.item())
     total_masked = int(masked_sum.item())
