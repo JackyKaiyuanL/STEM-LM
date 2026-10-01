@@ -553,13 +553,14 @@ class AbsenceMaskCollator(_PerBatchSeededCollator):
 
 
 class FixedPValCollator(_PerBatchSeededCollator):
-    def mask(self, batch):
-        B, S = batch["target_species"].shape
-        g = self._generator(batch)
-
-        masked = torch.bernoulli(torch.full((B, S), self.p), generator=g).bool()
+    def draw(self, target_idx, num_species):
+        g = self._generator({"target_idx": target_idx})
+        masked = torch.bernoulli(torch.full((len(target_idx), num_species), self.p), generator=g).bool()
         self._force_one_masked(masked, g)
-        return self._finalize(batch, masked)
+        return masked
+
+    def mask(self, batch):
+        return self._finalize(batch, self.draw(batch["target_idx"], batch["target_species"].shape[1]))
 
 
 class MultiMaskCollator:

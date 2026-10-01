@@ -13,8 +13,9 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import add_species_arg, load_dataset, resolve_output_dir, timed_phase, write_metrics  # noqa: E402
+from stemlm.metric import fixed_p_masks  # noqa: E402
 
-KNOWN_RATIOS = (0.0, 0.25, 0.5, 0.75)
+P_VALUES = (1.0, 0.75, 0.5, 0.25)
 
 
 def prepare_data(df, env_cols, species_cols, splits, data_dir):
@@ -29,7 +30,7 @@ def prepare_data(df, env_cols, species_cols, splits, data_dir):
         np.save(data_dir / f"{name}_indices.npy", np.asarray(idx, dtype=np.int64))
 
 
-def infer(repo, config_path):
+def infer(repo, config_path, masked):
     from src.config import Config
     from src.dataloaders.splot_dataloader import sPlotDataModule
     from src.trainers.splot_trainer import sPlotTrainer
@@ -44,8 +45,12 @@ def infer(repo, config_path):
     task.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=False)["state_dict"])
     task.eval()
     logits, targets, masks = [], [], []
+    start = 0
     with torch.no_grad():
         for batch in data_module.test_dataloader(num_workers=0, persistent_workers=False):
+            rows = torch.as_tensor(masked[start:start + len(batch["targets"])])
+            start += len(rows)
+            batch["mask"] = torch.where(rows, -1, batch["targets"].long())
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
             logits.append(task(batch).float().cpu().numpy())
             targets.append(batch["targets"].cpu().numpy())
@@ -62,6 +67,11 @@ def main():
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--ciso_repo", required=True, type=Path)
     parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument("--mask_batch_size", type=int, default=128,
+                        help="STEM-LM's evaluation batch size; test masks are STEM-LM's masks for the same "
+                             "training seed, which depend on it.")
+    parser.add_argument("--evaluate_only", action="store_true",
+                        help="Skip training and score the best checkpoint already in --output_dir.")
     add_species_arg(parser)
     args = parser.parse_args()
 
@@ -105,8 +115,9 @@ def main():
         print("running:", " ".join(command), flush=True)
         subprocess.run(command, cwd=repo, check=True, env=environment)
 
-    with timed_phase(output_dir, "training"):
-        run(train_config)
+    if not args.evaluate_only:
+        with timed_phase(output_dir, "training"):
+            run(train_config)
     checkpoints = sorted(p for p in (output_dir / "checkpoints" / "ciso" / str(args.seed)).glob("*.ckpt")
                          if "last" not in p.name)
     if len(checkpoints) != 1:
@@ -115,19 +126,19 @@ def main():
 
     results = []
     with timed_phase(output_dir, "evaluation"):
-        for known in KNOWN_RATIOS:
-            test_config = copy.deepcopy(config)
-            test_config["mode"] = "test"
-            test_config["logger"]["checkpoint_name"] = checkpoints[0].name
-            test_config["data"]["partial_labels"]["eval_known_ratio"] = known
-            path = config_dir / f"test_known_{known}.yaml"
-            path.write_text(yaml.safe_dump(test_config, sort_keys=False))
-            logits, targets, masks = infer(repo, path)
+        test_config = copy.deepcopy(config)
+        test_config["mode"] = "test"
+        test_config["logger"]["checkpoint_name"] = checkpoints[0].name
+        path = config_dir / "test.yaml"
+        path.write_text(yaml.safe_dump(test_config, sort_keys=False))
+        for p in P_VALUES:
+            masked = fixed_p_masks(splits["test"], len(species_cols), p, args.seed + 10_000, args.mask_batch_size)
+            logits, targets, masks = infer(repo, path, masked)
             labels = np.where(masks == -1, targets, -100)
-            np.savez_compressed(output_dir / f"test_predictions_known_{known}.npz", logits=logits,
+            np.savez_compressed(output_dir / f"test_predictions_p{p:.2f}.npz", logits=logits,
                                 targets=targets, masks=masks, row_indices=splits["test"],
                                 species=np.asarray(species_cols))
-            results.append(({"cov_set": "env", "masking_p": 1.0 - known}, logits, labels))
+            results.append(({"cov_set": "env", "masking_p": p}, logits, labels))
     write_metrics(output_dir, "CISO", results, species_cols,
                   df[species_cols].to_numpy()[splits["train"]].sum(0))
 

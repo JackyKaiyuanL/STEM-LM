@@ -201,6 +201,17 @@ def evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float,
     return {"p": float(p_value), "summary": summarize_per_species_metrics(per_sp), "per_species": per_sp}
 
 
+def _mask_seed(base_seed: int, p_value: float) -> int:
+    return base_seed + round(p_value * 1000)
+
+
+def fixed_p_masks(eval_indices, num_species: int, p_value: float, base_seed: int,
+                  batch_size: int) -> np.ndarray:
+    collator = FixedPValCollator(p=p_value, base_seed=_mask_seed(base_seed, p_value))
+    return np.concatenate([collator.draw(torch.as_tensor(eval_indices[s:s + batch_size]), num_species).numpy()
+                           for s in range(0, len(eval_indices), batch_size)])
+
+
 @torch.no_grad()
 def gather_logits_at_p(model, dataset, eval_indices, dist_info, p_value: float,
                        batch_size: int, device,
@@ -212,7 +223,7 @@ def gather_logits_at_p(model, dataset, eval_indices, dist_info, p_value: float,
     dist_info_dev = move_dist_info_to_device(dist_info, device)
     is_distributed = bool(distributed_sampler) and torch.distributed.is_initialized()
 
-    mask_seed = base_seed + round(p_value * 1000)
+    mask_seed = _mask_seed(base_seed, p_value)
     collator = (collator_cls or FixedPValCollator)(p=p_value, base_seed=mask_seed)
     subset = Subset(dataset, eval_indices)
     np.random.seed(mask_seed)

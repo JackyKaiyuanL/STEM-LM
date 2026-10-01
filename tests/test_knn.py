@@ -188,6 +188,20 @@ def test_batched_matches_sequential_full_pool(tmp_path_factory):
         np.testing.assert_array_equal(r, g)
 
 
+def test_fixed_p_masks_match_the_test_loader(dataset):
+    from torch.utils.data import DataLoader, Subset
+
+    from stemlm.data import FixedPValCollator
+    from stemlm.metric import fixed_p_masks
+
+    idx = list(range(3, 160, 2))
+    for p in (0.25, 1.0):
+        collator = FixedPValCollator(p=p, base_seed=7 + round(p * 1000))
+        loader = DataLoader(Subset(dataset, idx), batch_size=16, shuffle=False, collate_fn=collator)
+        ref = np.concatenate([b["labels"].squeeze(-1).numpy() != -100 for b in loader])
+        np.testing.assert_array_equal(fixed_p_masks(idx, ref.shape[1], p, 7, 16), ref)
+
+
 def test_heldout_rows_are_sources_only_within_their_split_and_outside_their_cell(dataset):
     from stemlm.data import heldout_split_ids
 
