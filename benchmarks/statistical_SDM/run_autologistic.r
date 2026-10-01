@@ -22,8 +22,7 @@ dat      <- read.csv(DATA_FILE, check.names = FALSE)
 env_cols <- grep("^env_", names(dat), value = TRUE)
 all_sp   <- readLines(need("SPECIES_FILE"))
 dat      <- cbind(dat, read.csv(need("AUTOCOV_FILE"), check.names = FALSE))
-auto_train <- read.csv(need("AUTOCOV_TRAIN_FILE"), check.names = FALSE)
-SOURCES  <- c("heldout", "train")
+SOURCES  <- need("AUTOCOV_SOURCES")
 
 doy_cols <- character(0)
 if ("time" %in% names(dat)) {
@@ -68,7 +67,7 @@ fit_predict_species <- function(sp, cs, out_dir) {
   for (split in SPLITS) {
     rows <- dat[idx[[split]], ]
     for (src in SOURCES) {
-      rows$auto <- if (src == "heldout") rows[[auto_col]] else auto_train[idx[[split]], auto_col]
+      rows$auto <- rows[[auto_col]]
       write.csv(data.frame(row_index = idx[[split]] - 1L, species = sp, cov_set = cs, split = split, sources = src,
                            logit = as.numeric(predict(m, newdata = rows, type = "link")),
                            actual = rows[[sp]]),

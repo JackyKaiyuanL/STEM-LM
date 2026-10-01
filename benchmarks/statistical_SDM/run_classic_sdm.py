@@ -42,9 +42,12 @@ def main():
     parser.add_argument("--rscript", default="Rscript")
     parser.add_argument("--n_cores", type=int, default=8)
     parser.add_argument("--source_cell_resolution", type=int, default=7,
-                        help="As in stemlm train: autologistic neighbours exclude the target's own H3 "
-                             "cell at this resolution, and held-out rows of the target's split join the "
-                             "training rows as neighbours.")
+                        help="As in stemlm train: a training row's autologistic neighbors are its nearest "
+                             "training rows; a validation or test row's are the training rows and the other "
+                             "rows of its own split outside its H3 cell at this resolution.")
+    parser.add_argument("--train_sources_only", action="store_true",
+                        help="Autologistic neighbors of every row are its nearest training rows, with no "
+                             "cell exclusion. --source_cell_resolution is then unused.")
     add_species_arg(parser)
     args = parser.parse_args()
 
@@ -67,12 +70,11 @@ def main():
     if args.method == "autologistic":
         _, dataset, _, _ = create_dataloaders(str(args.csv_path.resolve()), splits_path=str(args.splits_path.resolve()),
                                               min_train_presences=args.min_train_presences,
-                                              source_cell_resolution=args.source_cell_resolution)
+                                              source_cell_resolution=args.source_cell_resolution,
+                                              train_sources_only=args.train_sources_only)
         environment["AUTOCOV_FILE"] = str(output_dir / "autocovariate.csv")
+        environment["AUTOCOV_SOURCES"] = "train" if args.train_sources_only else "heldout"
         write_autocovariate(dataset, environment["AUTOCOV_FILE"])
-        dataset.heldout_split = None
-        environment["AUTOCOV_TRAIN_FILE"] = str(output_dir / "autocovariate_train_sources.csv")
-        write_autocovariate(dataset, environment["AUTOCOV_TRAIN_FILE"])
     with timed_phase(output_dir, "training"):
         subprocess.run([args.rscript, str(SCRIPT_DIR / script)], check=True, env=environment)
     if data_file != args.csv_path.resolve():
@@ -81,7 +83,7 @@ def main():
     test_idx = np.sort(splits["test"])
     labels_all = df[species_cols].to_numpy(dtype=np.int64)[test_idx]
     results = []
-    sources = ("heldout", "train") if args.method == "autologistic" else ("none",)
+    sources = (environment["AUTOCOV_SOURCES"],) if args.method == "autologistic" else ("none",)
     for cov_set in cov_sets:
         for src in sources:
             name = "predictions_test_all.csv" if src == "none" else f"predictions_test_{src}_all.csv"
