@@ -63,10 +63,8 @@ fit_predict_species <- function(sp, cs, out_dir) {
   if (sum(y_tr) == 0 || sum(y_tr) == length(y_tr)) return(NULL)
   sp_safe <- gsub("[^A-Za-z0-9]", "_", sp)
   auto_col <- paste0("auto_", sp_safe)
-  m <- tryCatch(glm(as.formula(formulas[[cs]]), data = cbind(train_dat, y = y_tr, auto = train_dat[[auto_col]]),
-                    family = binomial(link = "logit"), control = glm.control(maxit = 200)),
-                error = function(e) { warning(conditionMessage(e)); NULL })
-  if (is.null(m)) return(data.frame(species = sp, cov_set = cs, converged = FALSE))
+  m <- glm(as.formula(formulas[[cs]]), data = cbind(train_dat, y = y_tr, auto = train_dat[[auto_col]]),
+           family = binomial(link = "logit"), control = glm.control(maxit = 200))
   for (split in SPLITS) {
     rows <- dat[idx[[split]], ]
     for (src in SOURCES) {
@@ -87,6 +85,8 @@ for (cs in COV_SETS) {
   t0 <- Sys.time()
   res <- mclapply(all_sp, fit_predict_species, cs = cs, out_dir = out_dir,
                   mc.cores = N_CORES, mc.preschedule = FALSE)
+  bad <- vapply(res, inherits, logical(1), "try-error")
+  if (any(bad)) stop(paste(all_sp[bad], unlist(res[bad]), sep = ": ", collapse = "\n"))
   conv_log <- c(conv_log, res[!sapply(res, is.null)])
   for (split in SPLITS) {
     for (src in SOURCES) {

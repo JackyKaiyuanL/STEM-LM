@@ -54,10 +54,8 @@ writeLines(c(paste0("data_file=", DATA_FILE), paste0("splits_file=", SPLITS_FILE
 fit_predict_species <- function(sp, cs, out_dir) {
   y_tr <- train_dat[[sp]]
   if (sum(y_tr) == 0 || sum(y_tr) == length(y_tr)) return(NULL)
-  m <- tryCatch(bam(as.formula(formulas[[cs]]), data = cbind(train_dat, y = y_tr),
-                    family = binomial(link = "logit"), discrete = TRUE, nthreads = 1),
-                error = function(e) { warning(conditionMessage(e)); NULL })
-  if (is.null(m)) return(data.frame(species = sp, cov_set = cs, converged = FALSE))
+  m <- bam(as.formula(formulas[[cs]]), data = cbind(train_dat, y = y_tr),
+           family = binomial(link = "logit"), discrete = TRUE, nthreads = 1)
   sp_safe <- gsub("[^A-Za-z0-9]", "_", sp)
   for (split in SPLITS) {
     rows <- dat[idx[[split]], ]
@@ -76,6 +74,8 @@ for (cs in COV_SETS) {
   t0 <- Sys.time()
   res <- mclapply(all_sp, fit_predict_species, cs = cs, out_dir = out_dir,
                   mc.cores = N_CORES, mc.preschedule = FALSE)
+  bad <- vapply(res, inherits, logical(1), "try-error")
+  if (any(bad)) stop(paste(all_sp[bad], unlist(res[bad]), sep = ": ", collapse = "\n"))
   conv_log <- c(conv_log, res[!sapply(res, is.null)])
   for (split in SPLITS) {
     files <- list.files(out_dir, pattern = paste0("_", split, "\\.csv$"), full.names = TRUE)

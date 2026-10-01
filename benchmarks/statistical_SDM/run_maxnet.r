@@ -17,7 +17,7 @@ N_CORES     <- as.integer(Sys.getenv("N_CORES", unset = "8"))
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
 SPLITS          <- c("test")
-REG_MULT_VALUES <- c(1, 2, 4, 6, 8, 10, 12, 16, 20, 24, 32)
+REG_MULT_VALUES <- c(0.125, 0.25, 0.5, 1, 2, 4, 6, 8, 10, 12, 16, 20, 24, 32)
 
 dat      <- read.csv(DATA_FILE, check.names = FALSE)
 env_cols <- grep("^env_", names(dat), value = TRUE)
@@ -34,6 +34,13 @@ cat(sprintf("Data: %d rows | %d species | %d env (%d with variance) | train %d v
             nrow(dat), length(all_sp), length(env_cols), length(features),
             length(idx$train), length(idx$val), length(idx$test)))
 
+parallel_fit <- function(X, f) {
+  res <- mclapply(X, f, mc.cores = N_CORES, mc.preschedule = FALSE)
+  bad <- vapply(res, inherits, logical(1), "try-error")
+  if (any(bad)) stop(paste(sprintf("job %d: %s", which(bad), unlist(res[bad])), collapse = "\n"))
+  res
+}
+
 val_auc <- function(labels, preds) {
   if (length(unique(labels)) < 2) return(NA_real_)
   as.numeric(roc(labels, preds, quiet = TRUE)$auc)
@@ -46,15 +53,12 @@ opt_one <- function(i) {
   rm <- opt_jobs$rm[i]; sp <- opt_jobs$sp[i]
   y_tr <- train_dat[[sp]]
   if (sum(y_tr) == 0 || sum(y_tr) == length(y_tr)) return(NULL)
-  model <- tryCatch(maxnet(p = y_tr, data = train_dat[, features, drop = FALSE], regmult = rm),
-                    error = function(e) NULL)
-  if (is.null(model)) return(NULL)
+  model <- maxnet(p = y_tr, data = train_dat[, features, drop = FALSE], regmult = rm)
   p_va <- as.numeric(predict(model, newdata = val_dat[, features, drop = FALSE],
                              type = "logistic", clamp = TRUE))
   data.frame(reg_mult = rm, species = sp, auc_roc_val = val_auc(val_dat[[sp]], p_va))
 }
-opt <- do.call(rbind, mclapply(seq_len(nrow(opt_jobs)), opt_one,
-                               mc.cores = N_CORES, mc.preschedule = FALSE))
+opt <- do.call(rbind, parallel_fit(seq_len(nrow(opt_jobs)), opt_one))
 write.csv(opt, file.path(results_dir, "reg_mult_optimization.csv"), row.names = FALSE)
 agg     <- aggregate(auc_roc_val ~ reg_mult, data = opt, FUN = mean)
 best_rm <- agg$reg_mult[which.max(agg$auc_roc_val)]
@@ -69,9 +73,7 @@ dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 fit_one_species <- function(sp) {
   y_tr <- train_dat[[sp]]
   if (sum(y_tr) == 0 || sum(y_tr) == length(y_tr)) return(NULL)
-  model <- tryCatch(maxnet(p = y_tr, data = train_dat[, features, drop = FALSE], regmult = best_rm),
-                    error = function(e) NULL)
-  if (is.null(model)) return(NULL)
+  model <- maxnet(p = y_tr, data = train_dat[, features, drop = FALSE], regmult = best_rm)
   sp_safe <- gsub("[^A-Za-z0-9]", "_", sp)
   for (split in SPLITS) {
     rows <- dat[idx[[split]], ]
@@ -84,7 +86,7 @@ fit_one_species <- function(sp) {
   TRUE
 }
 t0 <- Sys.time()
-invisible(mclapply(all_sp, fit_one_species, mc.cores = N_CORES, mc.preschedule = FALSE))
+invisible(parallel_fit(all_sp, fit_one_species))
 for (split in SPLITS) {
   files <- list.files(out_dir, pattern = paste0("_", split, "\\.csv$"), full.names = TRUE)
   write.csv(do.call(rbind, lapply(files, read.csv, check.names = FALSE)),
