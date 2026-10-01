@@ -248,7 +248,7 @@ class SpeciesRowAttention(nn.Module):
 class STCrossAttention(Attention):
 
     def forward(self, hidden_states, source_embeddings, st_dist_bias):
-        """Attend over source sites without ever materialising K or V."""
+        """Attend over source sites without ever materializing K or V."""
         query_layer = self.transpose_for_scores(self.query(hidden_states))
         basis, source_ids = source_embeddings
         n_bins, S, _ = basis.shape
@@ -440,7 +440,7 @@ class JSDMModel(nn.Module):
         # elements — but they only ever take 2*S distinct values, since
         # source_emb[b,s,n] = state_emb[source_ids[b,s,n]] + species_emb[s].
         # Hand cross-attention that small basis plus the ids and let it gather
-        # after projecting, so the (B, S, N, H) product is never materialised.
+        # after projecting, so the (B, S, N, H) product is never materialized.
         species_emb = self.target_input.species_embedding.weight        # (S, H)
         state_emb = self.target_input.embedding.weight
         source_basis = state_emb[:2, None, :] + species_emb[None, :, :]

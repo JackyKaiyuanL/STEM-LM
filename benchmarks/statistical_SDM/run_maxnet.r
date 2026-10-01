@@ -53,18 +53,21 @@ opt_one <- function(i) {
   rm <- opt_jobs$rm[i]; sp <- opt_jobs$sp[i]
   y_tr <- train_dat[[sp]]
   if (sum(y_tr) == 0 || sum(y_tr) == length(y_tr)) return(NULL)
-  model <- maxnet(p = y_tr, data = train_dat[, features, drop = FALSE], regmult = rm)
+  model <- tryCatch(maxnet(p = y_tr, data = train_dat[, features, drop = FALSE], regmult = rm),
+                    error = conditionMessage)
+  if (is.character(model)) return(data.frame(reg_mult = rm, species = sp, auc_roc_val = NA_real_, error = model))
   p_va <- as.numeric(predict(model, newdata = val_dat[, features, drop = FALSE],
                              type = "logistic", clamp = TRUE))
-  data.frame(reg_mult = rm, species = sp, auc_roc_val = val_auc(val_dat[[sp]], p_va))
+  data.frame(reg_mult = rm, species = sp, auc_roc_val = val_auc(val_dat[[sp]], p_va), error = NA_character_)
 }
 opt <- do.call(rbind, parallel_fit(seq_len(nrow(opt_jobs)), opt_one))
 write.csv(opt, file.path(results_dir, "reg_mult_optimization.csv"), row.names = FALSE)
-agg     <- aggregate(auc_roc_val ~ reg_mult, data = opt, FUN = mean)
+opt_ok  <- opt[!opt$species %in% opt$species[!is.na(opt$error)], ]
+agg     <- aggregate(auc_roc_val ~ reg_mult, data = opt_ok, FUN = mean)
 best_rm <- agg$reg_mult[which.max(agg$auc_roc_val)]
 print(agg, row.names = FALSE, digits = 4)
-cat(sprintf("Selected reg_mult %g by mean validation AUROC over %d species\n",
-            best_rm, length(opt_species)))
+cat(sprintf("Selected reg_mult %g by mean validation AUROC over %d species (%d excluded after a failed fit)\n",
+            best_rm, length(unique(opt_ok$species)), length(opt_species) - length(unique(opt_ok$species))))
 if (best_rm %in% range(REG_MULT_VALUES)) cat("WARNING: selected reg_mult is at the edge of the grid\n")
 writeLines(as.character(best_rm), file.path(results_dir, "best_reg_mult.txt"))
 
@@ -73,7 +76,9 @@ dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 fit_one_species <- function(sp) {
   y_tr <- train_dat[[sp]]
   if (sum(y_tr) == 0 || sum(y_tr) == length(y_tr)) return(NULL)
-  model <- maxnet(p = y_tr, data = train_dat[, features, drop = FALSE], regmult = best_rm)
+  model <- tryCatch(maxnet(p = y_tr, data = train_dat[, features, drop = FALSE], regmult = best_rm),
+                    error = conditionMessage)
+  if (is.character(model)) return(data.frame(species = sp, reg_mult = best_rm, error = model))
   sp_safe <- gsub("[^A-Za-z0-9]", "_", sp)
   for (split in SPLITS) {
     rows <- dat[idx[[split]], ]
@@ -83,10 +88,15 @@ fit_one_species <- function(sp) {
                          actual = rows[[sp]]),
               file.path(out_dir, paste0(sp_safe, "_", split, ".csv")), row.names = FALSE)
   }
-  TRUE
+  NULL
 }
 t0 <- Sys.time()
-invisible(parallel_fit(all_sp, fit_one_species))
+failed <- do.call(rbind, parallel_fit(all_sp, fit_one_species))
+if (!is.null(failed)) {
+  write.csv(failed, file.path(results_dir, "failed_species.csv"), row.names = FALSE)
+  cat(sprintf("Excluded %d species whose maxnet fit failed:\n", nrow(failed)))
+  print(failed, row.names = FALSE)
+}
 for (split in SPLITS) {
   files <- list.files(out_dir, pattern = paste0("_", split, "\\.csv$"), full.names = TRUE)
   write.csv(do.call(rbind, lapply(files, read.csv, check.names = FALSE)),

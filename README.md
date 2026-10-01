@@ -1,6 +1,6 @@
 # STEM-LM
 
-Masked-species Transformer for joint species distribution modelling. Each
+Masked-species Transformer for joint species distribution modeling. Each
 observation is a site–time with a binary vector over species and environmental
 covariates. A random subset of the species is masked and predicted from the
 rest of the vector, from the K nearest other observations in space (their

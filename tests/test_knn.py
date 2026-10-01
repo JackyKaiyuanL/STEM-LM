@@ -1,6 +1,6 @@
 """KNN source-sampling invariants.
 
-The per-sample BallTree query is the training bottleneck; it is vectorised by a
+The per-sample BallTree query is the training bottleneck; it is vectorized by a
 batched ``__getitems__`` path. These tests pin the invariant that batching must
 NOT change any draw: for the same RNG state, ``__getitems__(indices)`` must
 produce byte-identical ``source_idx`` to calling ``__getitem__`` on each index

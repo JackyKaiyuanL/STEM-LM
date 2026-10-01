@@ -27,7 +27,7 @@ _FAISS_IVF_MIN = 200_000   # below this, exact flat index (IVF training not wort
 _FAISS_NLIST_MAX = 8192
 _FAISS_NPROBE = 8          # 3D coords => recall is already 1.0 here (measured at
                            # 71M rows, k=4100: nprobe 8 and 32 both retrieve the
-                           # exact neighbour set, but 8 is 1.8x faster; 4 drops to
+                           # exact neighbor set, but 8 is 1.8x faster; 4 drops to
                            # recall 0.9976, so 8 is the floor that stays exact).
 
 
@@ -43,7 +43,7 @@ def _lonlat_to_xyz(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
 
 
 class _HaversineKNNIndex:
-    """FAISS nearest-neighbour index over unit-sphere xyz — drop-in for the
+    """FAISS nearest-neighbor index over unit-sphere xyz — drop-in for the
     sklearn BallTree. ~20x faster queries and ~90x faster build at 71M scale,
     with exact ordering (L2 on the sphere is monotone in great-circle distance).
     IVFFlat above _FAISS_IVF_MIN points; exact IndexFlatL2 below."""
@@ -66,7 +66,7 @@ class _HaversineKNNIndex:
         self._index = index
 
     def query(self, coords_deg: np.ndarray, k: int) -> np.ndarray:
-        """(B, k) global neighbour indices, nearest-first. Slots past the
+        """(B, k) global neighbor indices, nearest-first. Slots past the
         available count are -1 (FAISS padding)."""
         xyz = _lonlat_to_xyz(coords_deg[:, 0], coords_deg[:, 1])
         _, idx = self._index.search(xyz, k)
@@ -320,10 +320,10 @@ class JSDMDataset(Dataset):
         return self._random_window(d)
 
     def _candidates_batch(self, indices: list[int]) -> list[tuple[np.ndarray, np.ndarray]]:
-        """Neighbour indices + distances for a batch via ONE FAISS query.
+        """Neighbor indices + distances for a batch via ONE FAISS query.
 
         Distribution-identical to calling ``_knn_candidates`` per index: FAISS
-        ranks (recall ~1.0 in 3D) match the exact nearest, so kept neighbours and
+        ranks (recall ~1.0 in 3D) match the exact nearest, so kept neighbors and
         their order do not depend on batching, and any item too short after the
         shared query falls back to the scalar doubling path.
         """

@@ -6,8 +6,8 @@ Outputs one parquet row per input observation:
   id, lat, lon, date, <var>_min/_max/_mean/_sum...
 
 Strategy: obs are grouped by (year, month). For each month, one Zarr subset is
-loaded (NA+Meso bbox, hourly), resampled to daily, then vectorised-sampled at
-every obs point in that month via xarray nearest-neighbour indexing. Months run
+loaded (NA+Meso bbox, hourly), resampled to daily, then vectorized-sampled at
+every obs point in that month via xarray nearest-neighbor indexing. Months run
 concurrently via ThreadPoolExecutor (gcsfs + zarr are thread-safe).
 
 Requires:
@@ -103,10 +103,10 @@ def _ensure_era5_orog_nc(path):
 
 
 def _era5_orography_elev(store_ds):
-    """Return ERA5 surface elevation (metres) as a 2D (lat, lon) DataArray.
+    """Return ERA5 surface elevation (meters) as a 2D (lat, lon) DataArray.
 
     Reduces any non-(lat, lon) dims by selecting index 0, then converts
-    geopotential (m²/s²) → metres via /g. Picks the first matching candidate
+    geopotential (m²/s²) → meters via /g. Picks the first matching candidate
     name that exists in the store.
     """
     for name in ORO_CANDIDATE_NAMES:
