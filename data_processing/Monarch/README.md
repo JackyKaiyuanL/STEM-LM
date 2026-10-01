@@ -10,8 +10,8 @@ Builds the 0.5° North America grid used to render the monarch butterfly (*Danau
 2. **`enrich_grid_daily.py`** — for each requested date, runs the grid cells through the same covariate code as the eButterfly observations: `covariates/era5/extract_era5_at_points.py` for ARCO-ERA5 daily 2 m temperature (min/max/mean) and total precipitation (lapse-rate corrected to the DEM), and `covariates/modis_phenology/mod13q1.py` for NDVI/EVI from the 16-day composite nearest the date.
    - Output: one `monarch_grid_<DATE>.csv` per date with the 15-column env schema STEM-LM consumes.
 
-3. **`monarch_inference.py`** — loads a trained STEM-LM run, predicts the species at every grid cell with all species masked ($p=1$) and every eButterfly observation as the source pool, applies the run's temperature $T^\star$ (`temperature.json`, fitted on validation by `stemlm train --temperature_scaling`), and renders the 2×2 figure.
-   - Output (in `output/`): `monarch_pred_<DATE>.csv` per date (`suitability` with $T^\star$, `suitability_raw` without), `monarch_pred_full.png`, `monarch_pred_full_raw.png`.
+3. **`monarch_inference.py`** — loads a trained STEM-LM run, predicts the species at every grid cell with all species masked ($p=1$) and every eButterfly observation as the source pool, applies the run's temperature $T^\star$ (`temperature.json`, fitted on validation by `stemlm train --temperature_scaling`), and renders one panel per date in a single row.
+   - Output (in `--output_dir`): `monarch_pred_<DATE>.csv` per date (`suitability` with $T^\star$, `suitability_raw` without), `monarch_pred_full.png`, `monarch_pred_full_raw.png`.
 
 ## Reproducing the four panels
 
@@ -27,9 +27,9 @@ python enrich_grid_daily.py \
     --dates 2025-05-15 2025-07-15 2025-09-15 2025-11-15 \
     --workers 32
 
-# 3. inference + 2×2 plot
-python monarch_inference.py /path/to/ebutterfly_na_2011_2025.csv \
-    --run_dir /path/to/stemlm_run/artifacts --grid_dir .
+# 3. inference + 1×4 plot
+python monarch_inference.py /path/to/ebutterfly_na_2011_2025.parquet \
+    --run_dir /path/to/stemlm_run --grid_dir . --output_dir output
 ```
 
 Use `--workers` up to your core count; ARCO-ERA5 months are fetched concurrently.

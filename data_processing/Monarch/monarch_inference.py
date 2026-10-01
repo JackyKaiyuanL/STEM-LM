@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from stemlm.data import JSDMDataset, compute_dist_info  # noqa: E402
+from stemlm.data import JSDMDataset, compute_dist_info, read_table  # noqa: E402
 from stemlm.metric import gather_logits_at_p  # noqa: E402
 from stemlm.model import JSDMConfig, JSDMForMaskedSpeciesPrediction  # noqa: E402
 
@@ -81,8 +81,8 @@ def plot_panels(predictions, column, out_png, resolution=0.5):
     cmap = plt.get_cmap("inferno").copy()
     proj = ccrs.LambertConformal(central_longitude=-95, central_latitude=40, standard_parallels=(20, 60))
     angles = np.deg2rad(np.arange(0, 360, 60))
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8), subplot_kw={"projection": proj},
-                             gridspec_kw={"wspace": 0.02, "hspace": 0.02})
+    fig, axes = plt.subplots(1, len(filled), figsize=(5 * len(filled), 4), subplot_kw={"projection": proj},
+                             gridspec_kw={"wspace": 0.02})
     for ax, (date, values) in zip(axes.ravel(), filled.items()):
         verts = [np.column_stack([x + 0.72 * resolution * np.cos(angles), y + 0.72 * resolution * np.sin(angles)])
                  for x, y in zip(lon, lat)]
@@ -94,9 +94,11 @@ def plot_panels(predictions, column, out_png, resolution=0.5):
         ax.add_feature(cfeature.BORDERS, linewidth=0.25, edgecolor="white", alpha=0.6, zorder=3)
         ax.set_extent([-128, -65, 14, 60], crs=ccrs.PlateCarree())
         ax.set_aspect("auto")
-        ax.text(0.02, 0.96, date, transform=ax.transAxes, fontsize=11, verticalalignment="top", color="white",
-                path_effects=[pe.withStroke(linewidth=2.5, foreground="black")])
-    fig.colorbar(pc, ax=axes.ravel().tolist(), shrink=0.7, aspect=30, label="Predicted habitat suitability", pad=0.01)
+        ax.text(0.02, 0.96, date, transform=ax.transAxes, fontsize=16, verticalalignment="top", color="white",
+                path_effects=[pe.withStroke(linewidth=3, foreground="black")])
+    cbar = fig.colorbar(pc, ax=axes.ravel().tolist(), shrink=0.9, aspect=20, pad=0.01)
+    cbar.set_label("Predicted habitat suitability", fontsize=14)
+    cbar.ax.tick_params(labelsize=12)
     fig.savefig(out_png, dpi=180, bbox_inches="tight")
 
 
@@ -107,7 +109,7 @@ def main():
     parser.add_argument("--grid_dir", required=True, type=Path)
     parser.add_argument("--dates", nargs="+", default=["2025-05-15", "2025-07-15", "2025-09-15", "2025-11-15"])
     parser.add_argument("--species", default="Danaus plexippus")
-    parser.add_argument("--output_dir", type=Path, default=Path(__file__).resolve().parent / "output")
+    parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--no_plot", action="store_true")
     args = parser.parse_args()
 
@@ -115,7 +117,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, config, T = load_model(args.run_dir, device)
     env_mean = json.loads((args.run_dir / "env_stats.json").read_text())["mean"]
-    obs = pd.read_csv(args.csv_path)
+    obs = read_table(args.csv_path)
     species = json.loads((args.run_dir / "species_names.json").read_text())
     obs = obs[[c for c in obs.columns if c in META_COLS or c.startswith("env_")] + species]
     predictions = {}
