@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import gc
 import gzip
 import os
 import re
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import add_species_arg, load_dataset, resolve_output_dir, timed_phase, write_metrics  # noqa: E402
@@ -68,20 +70,25 @@ def main():
                    "RESULTS_DIR": str(output_dir), "N_CORES": str(args.n_cores),
                    "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
     if args.method == "autologistic":
-        _, dataset, _, _ = create_dataloaders(str(args.csv_path.resolve()), splits_path=str(args.splits_path.resolve()),
-                                              min_train_presences=args.min_train_presences,
-                                              source_cell_resolution=args.source_cell_resolution,
-                                              train_sources_only=args.train_sources_only)
+        loaders = create_dataloaders(str(args.csv_path.resolve()), splits_path=str(args.splits_path.resolve()),
+                                     min_train_presences=args.min_train_presences,
+                                     source_cell_resolution=args.source_cell_resolution,
+                                     train_sources_only=args.train_sources_only)
         environment["AUTOCOV_FILE"] = str(output_dir / "autocovariate.csv")
         environment["AUTOCOV_SOURCES"] = "train" if args.train_sources_only else "heldout"
-        write_autocovariate(dataset, environment["AUTOCOV_FILE"])
+        write_autocovariate(loaders[1], environment["AUTOCOV_FILE"])
+        del loaders
+    test_idx = np.sort(splits["test"])
+    labels_all = df[species_cols].to_numpy(dtype=np.int64)[test_idx]
+    train_presences = df[species_cols].to_numpy()[splits["train"]].sum(0)
+    del df
+    gc.collect()
+    pyarrow.default_memory_pool().release_unused()
     with timed_phase(output_dir, "training"):
         subprocess.run([args.rscript, str(SCRIPT_DIR / script)], check=True, env=environment)
     if data_file != args.csv_path.resolve():
         data_file.unlink()
 
-    test_idx = np.sort(splits["test"])
-    labels_all = df[species_cols].to_numpy(dtype=np.int64)[test_idx]
     results = []
     sources = (environment["AUTOCOV_SOURCES"],) if args.method == "autologistic" else ("none",)
     for cov_set in cov_sets:
@@ -96,8 +103,7 @@ def main():
             results.append(({"cov_set": cov_set, "masking_p": 1.0, "sources": src},
                             np.where(fitted, z, 0.0),
                             np.where(fitted, labels_all, -100)))
-    write_metrics(output_dir, args.method, results, species_cols,
-                  df[species_cols].to_numpy()[splits["train"]].sum(0))
+    write_metrics(output_dir, args.method, results, species_cols, train_presences)
     for f in [*output_dir.glob("*/predictions_test_*.csv"), *output_dir.glob("autocovariate*.csv")]:
         with open(f, "rb") as src, gzip.open(f"{f}.gz", "wb") as dst:
             shutil.copyfileobj(src, dst)
