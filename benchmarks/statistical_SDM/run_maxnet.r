@@ -46,9 +46,6 @@ val_auc <- function(labels, preds) {
   as.numeric(roc(labels, preds, quiet = TRUE)$auc)
 }
 
-set.seed(42)
-opt_species <- sample(all_sp, min(20L, length(all_sp)))
-opt_jobs    <- expand.grid(rm = REG_MULT_VALUES, sp = opt_species, stringsAsFactors = FALSE)
 opt_one <- function(i) {
   rm <- opt_jobs$rm[i]; sp <- opt_jobs$sp[i]
   y_tr <- train_dat[[sp]]
@@ -60,15 +57,23 @@ opt_one <- function(i) {
                              type = "logistic", clamp = TRUE))
   data.frame(reg_mult = rm, species = sp, auc_roc_val = val_auc(val_dat[[sp]], p_va), error = NA_character_)
 }
-opt <- do.call(rbind, parallel_fit(seq_len(nrow(opt_jobs)), opt_one))
-write.csv(opt, file.path(results_dir, "reg_mult_optimization.csv"), row.names = FALSE)
-opt_ok  <- opt[!opt$species %in% opt$species[!is.na(opt$error)], ]
-agg     <- aggregate(auc_roc_val ~ reg_mult, data = opt_ok, FUN = mean)
-best_rm <- agg$reg_mult[which.max(agg$auc_roc_val)]
-print(agg, row.names = FALSE, digits = 4)
-cat(sprintf("Selected reg_mult %g by mean validation AUROC over %d species (%d excluded after a failed fit)\n",
-            best_rm, length(unique(opt_ok$species)), length(opt_species) - length(unique(opt_ok$species))))
-if (best_rm %in% range(REG_MULT_VALUES)) cat("WARNING: selected reg_mult is at the edge of the grid\n")
+if (nzchar(Sys.getenv("MAXNET_REG_MULT"))) {
+  best_rm <- as.numeric(Sys.getenv("MAXNET_REG_MULT"))
+  cat(sprintf("Using reg_mult %g from MAXNET_REG_MULT\n", best_rm))
+} else {
+  set.seed(42)
+  opt_species <- sample(all_sp, min(20L, length(all_sp)))
+  opt_jobs    <- expand.grid(rm = REG_MULT_VALUES, sp = opt_species, stringsAsFactors = FALSE)
+  opt <- do.call(rbind, parallel_fit(seq_len(nrow(opt_jobs)), opt_one))
+  write.csv(opt, file.path(results_dir, "reg_mult_optimization.csv"), row.names = FALSE)
+  opt_ok  <- opt[!opt$species %in% opt$species[!is.na(opt$error)], ]
+  agg     <- aggregate(auc_roc_val ~ reg_mult, data = opt_ok, FUN = mean)
+  best_rm <- agg$reg_mult[which.max(agg$auc_roc_val)]
+  print(agg, row.names = FALSE, digits = 4)
+  cat(sprintf("Selected reg_mult %g by mean validation AUROC over %d species (%d excluded after a failed fit)\n",
+              best_rm, length(unique(opt_ok$species)), length(opt_species) - length(unique(opt_ok$species))))
+  if (best_rm %in% range(REG_MULT_VALUES)) cat("WARNING: selected reg_mult is at the edge of the grid\n")
+}
 writeLines(as.character(best_rm), file.path(results_dir, "best_reg_mult.txt"))
 
 out_dir <- file.path(results_dir, "env", "per_species")
@@ -76,10 +81,11 @@ dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 fit_one_species <- function(sp) {
   y_tr <- train_dat[[sp]]
   if (sum(y_tr) == 0 || sum(y_tr) == length(y_tr)) return(NULL)
+  sp_safe <- gsub("[^A-Za-z0-9]", "_", sp)
+  if (all(file.exists(file.path(out_dir, paste0(sp_safe, "_", SPLITS, ".csv"))))) return(NULL)
   model <- tryCatch(maxnet(p = y_tr, data = train_dat[, features, drop = FALSE], regmult = best_rm),
                     error = conditionMessage)
   if (is.character(model)) return(data.frame(species = sp, reg_mult = best_rm, error = model))
-  sp_safe <- gsub("[^A-Za-z0-9]", "_", sp)
   for (split in SPLITS) {
     rows <- dat[idx[[split]], ]
     write.csv(data.frame(row_index = idx[[split]] - 1L, species = sp, cov_set = "env", split = split,
