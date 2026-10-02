@@ -34,8 +34,79 @@ cat(sprintf("Data: %d rows | %d species | %d env (%d with variance) | train %d v
             nrow(dat), length(all_sp), length(env_cols), length(features),
             length(idx$train), length(idx$val), length(idx$test)))
 
-maxnet_exact <- function(p, data, f = maxnet.formula(p, data), regmult = 1,
-                         regfun = maxnet.default.regularization, addsamplestobackground = TRUE, ...) {
+design_matrix <- function(f, data) {
+  tt <- terms(f)
+  vars <- as.list(attr(tt, "variables"))[-1]
+  fac <- attr(tt, "factors")
+  labels <- attr(tt, "term.labels")
+  env <- environment(f)
+  width <- vapply(vars, function(v) NCOL(eval(v, data[1, , drop = FALSE], env)), 1L)
+  term_width <- vapply(seq_along(labels), function(j) as.integer(prod(width[fac[, j] > 0])), 1L)
+  mm <- matrix(0, nrow(data), sum(term_width))
+  names_out <- character(ncol(mm))
+  at <- 0L
+  for (j in seq_along(labels)) {
+    used <- which(fac[, j] > 0)
+    block <- eval(vars[[used[1]]], data, env)
+    for (u in used[-1]) block <- block * eval(vars[[u]], data, env)
+    cols <- at + seq_len(term_width[j])
+    mm[, cols] <- block
+    names_out[cols] <- if (is.matrix(block)) paste0(labels[j], colnames(block)) else labels[j]
+    at <- at + term_width[j]
+  }
+  dimnames(mm) <- list(row.names(data), names_out)
+  attr(mm, "assign") <- rep(seq_along(labels), term_width)
+  mm
+}
+
+column_apply <- function(m, f) setNames(vapply(seq_len(ncol(m)), function(j) f(m[, j]), 0), colnames(m))
+
+regularization_exact <- function(p, m, range_m) {
+  isproduct <- function(x) grepl(":", x) & !grepl("\\(", x)
+  isquadratic <- function(x) grepl("^I\\(.*\\^2\\)", x)
+  ishinge <- function(x) grepl("^hinge\\(", x)
+  isthreshold <- function(x) grepl("^thresholds\\(", x)
+  iscategorical <- function(x) grepl("^categorical\\(", x)
+  regtable <- function(name, default) {
+    if (ishinge(name)) return(list(c(0, 1), c(0.5, 0.5)))
+    if (iscategorical(name)) return(list(c(0, 10, 17), c(0.65, 0.5, 0.25)))
+    if (isthreshold(name)) return(list(c(0, 100), c(2, 1)))
+    default
+  }
+  lregtable <- list(c(0, 10, 30, 100), c(1, 1, 0.2, 0.05))
+  qregtable <- list(c(0, 10, 17, 30, 100), c(1.3, 0.8, 0.5, 0.25, 0.05))
+  pregtable <- list(c(0, 10, 17, 30, 100), c(2.6, 1.6, 0.9, 0.55, 0.05))
+  mm <- m[p == 1, ]
+  np <- nrow(mm)
+  lqpreg <- lregtable
+  if (sum(isquadratic(colnames(mm)))) lqpreg <- qregtable
+  if (sum(isproduct(colnames(mm)))) lqpreg <- pregtable
+  classregularization <- sapply(colnames(mm), function(n) {
+    t <- regtable(n, lqpreg)
+    approx(t[[1]], t[[2]], np, rule = 2)$y
+  })/sqrt(np)
+  ishinge <- grepl("^hinge\\(", colnames(mm))
+  hmindev <- sapply(1:ncol(mm), function(i) {
+    if (!ishinge[i]) return(0)
+    std <- max(sd(mm[, i]), 1/sqrt(np))
+    std * 0.5/sqrt(np)
+  })
+  tmindev <- sapply(1:ncol(mm), function(i) {
+    ifelse(isthreshold(colnames(mm)[i]) && (sum(mm[, i]) == 0 || sum(mm[, i]) == nrow(mm)), 1, 0)
+  })
+  pmax(0.001 * range_m, hmindev, tmindev, apply(as.matrix(mm), 2, sd) * classregularization)
+}
+
+glmnet_exact <- local({
+  src <- deparse(glmnet::glmnet, width.cutoff = 500L)
+  src <- sub("if (any(is.na(x)))", "if (anyNA(x))", src, fixed = TRUE)
+  src <- sub("storage.mode(x) <- \"double\"", "if (storage.mode(x) != \"double\") storage.mode(x) <- \"double\"", src, fixed = TRUE)
+  f <- eval(parse(text = src))
+  environment(f) <- asNamespace("glmnet")
+  f
+})
+
+maxnet_exact <- function(p, data, f = maxnet.formula(p, data), regmult = 1, addsamplestobackground = TRUE, ...) {
   if (anyNA(data))
     stop("NA values in data table. Please remove them and rerun.")
   if (addsamplestobackground) {
@@ -46,13 +117,16 @@ maxnet_exact <- function(p, data, f = maxnet.formula(p, data), regmult = 1,
     p <- c(p, rep(0, sum(toadd)))
     data <- rbind(data, pdata[toadd, ])
   }
-  mm <- model.matrix(f, data)
-  reg <- regfun(p, mm) * regmult
+  mm <- design_matrix(f, data)
+  featuremins <- column_apply(mm, min)
+  featuremaxs <- column_apply(mm, max)
+  reg <- regularization_exact(p, mm, featuremaxs - featuremins) * regmult
   weights <- p + (1 - p) * 100
   glmnet::glmnet.control(pmin = 1e-08, fdev = 0)
-  model <- glmnet::glmnet(x = mm, y = as.factor(p), family = "binomial", standardize = F, penalty.factor = reg,
-                          lambda = 10^(seq(4, 0, length.out = 200)) * sum(reg)/length(reg) * sum(p)/sum(weights),
-                          weights = weights, ...)
+  model <- glmnet_exact(x = mm, y = as.factor(p), family = "binomial", standardize = F, penalty.factor = reg,
+                        lambda = 10^(seq(4, 0, length.out = 200)) * sum(reg)/length(reg) * sum(p)/sum(weights),
+                        weights = weights, ...)
+  rm(mm)
   class(model) <- c("maxnet", class(model))
   if (length(model$lambda) < 200) {
     msg <- "Error: glmnet failed to complete regularization path.  Model may be infeasible."
@@ -68,8 +142,8 @@ maxnet_exact <- function(p, data, f = maxnet.formula(p, data), regmult = 1,
   model$entropy <- -sum(raw * log(raw))
   model$alpha <- -log(sum(rr))
   model$penalty.factor <- reg
-  model$featuremins <- apply(mm, 2, min)
-  model$featuremaxs <- apply(mm, 2, max)
+  model$featuremins <- featuremins
+  model$featuremaxs <- featuremaxs
   vv <- (sapply(data, class) != "factor")
   model$varmin <- apply(data[, vv, drop = FALSE], 2, min)
   model$varmax <- apply(data[, vv, drop = FALSE], 2, max)
@@ -134,7 +208,7 @@ fit_one_species <- function(sp) {
                     error = conditionMessage)
   if (is.character(model)) return(data.frame(species = sp, reg_mult = best_rm, error = model))
   for (split in SPLITS) {
-    rows <- dat[idx[[split]], ]
+    rows <- dat[idx[[split]], c(features, sp)]
     write.csv(data.frame(row_index = idx[[split]] - 1L, species = sp, cov_set = "env", split = split,
                          logit = qlogis(as.numeric(predict(model, newdata = rows[, features, drop = FALSE],
                                                            type = "logistic", clamp = TRUE))),
