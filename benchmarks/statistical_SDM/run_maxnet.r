@@ -59,8 +59,6 @@ design_matrix <- function(f, data) {
   mm
 }
 
-column_apply <- function(m, f) setNames(vapply(seq_len(ncol(m)), function(j) f(m[, j]), 0), colnames(m))
-
 regularization_exact <- function(p, m, range_m) {
   isproduct <- function(x) grepl(":", x) & !grepl("\\(", x)
   isquadratic <- function(x) grepl("^I\\(.*\\^2\\)", x)
@@ -118,10 +116,12 @@ maxnet_exact <- function(p, data, f = maxnet.formula(p, data), regmult = 1, adds
     data <- rbind(data, pdata[toadd, ])
   }
   mm <- design_matrix(f, data)
-  featuremins <- column_apply(mm, min)
-  featuremaxs <- column_apply(mm, max)
+  feature_range <- vapply(seq_len(ncol(mm)), function(j) range(mm[, j]), numeric(2))
+  featuremins <- setNames(feature_range[1, ], colnames(mm))
+  featuremaxs <- setNames(feature_range[2, ], colnames(mm))
   reg <- regularization_exact(p, mm, featuremaxs - featuremins) * regmult
   weights <- p + (1 - p) * 100
+  gc()
   glmnet::glmnet.control(pmin = 1e-08, fdev = 0)
   model <- glmnet_exact(x = mm, y = as.factor(p), family = "binomial", standardize = F, penalty.factor = reg,
                         lambda = 10^(seq(4, 0, length.out = 200)) * sum(reg)/length(reg) * sum(p)/sum(weights),
