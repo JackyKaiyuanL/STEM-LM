@@ -34,6 +34,53 @@ cat(sprintf("Data: %d rows | %d species | %d env (%d with variance) | train %d v
             nrow(dat), length(all_sp), length(env_cols), length(features),
             length(idx$train), length(idx$val), length(idx$test)))
 
+maxnet_exact <- function(p, data, f = maxnet.formula(p, data), regmult = 1,
+                         regfun = maxnet.default.regularization, addsamplestobackground = TRUE, ...) {
+  if (anyNA(data))
+    stop("NA values in data table. Please remove them and rerun.")
+  if (addsamplestobackground) {
+    pdata <- data[p == 1, ]
+    ndata <- data[p == 0, ]
+    row_key <- function(d) do.call(paste, c(lapply(as.data.frame(as.matrix(d) + 0), sprintf, fmt = "%a"), sep = "|"))
+    toadd <- !(row_key(pdata) %in% row_key(ndata))
+    p <- c(p, rep(0, sum(toadd)))
+    data <- rbind(data, pdata[toadd, ])
+  }
+  mm <- model.matrix(f, data)
+  reg <- regfun(p, mm) * regmult
+  weights <- p + (1 - p) * 100
+  glmnet::glmnet.control(pmin = 1e-08, fdev = 0)
+  model <- glmnet::glmnet(x = mm, y = as.factor(p), family = "binomial", standardize = F, penalty.factor = reg,
+                          lambda = 10^(seq(4, 0, length.out = 200)) * sum(reg)/length(reg) * sum(p)/sum(weights),
+                          weights = weights, ...)
+  class(model) <- c("maxnet", class(model))
+  if (length(model$lambda) < 200) {
+    msg <- "Error: glmnet failed to complete regularization path.  Model may be infeasible."
+    if (!addsamplestobackground)
+      msg <- paste(msg, " Try re-running with addsamplestobackground=T.")
+    stop(msg)
+  }
+  bb <- model$beta[, 200]
+  model$betas <- bb[bb != 0]
+  model$alpha <- 0
+  rr <- maxnet:::predict.maxnet(model, data[p == 0, , drop = FALSE], type = "exponent", clamp = F)
+  raw <- rr/sum(rr)
+  model$entropy <- -sum(raw * log(raw))
+  model$alpha <- -log(sum(rr))
+  model$penalty.factor <- reg
+  model$featuremins <- apply(mm, 2, min)
+  model$featuremaxs <- apply(mm, 2, max)
+  vv <- (sapply(data, class) != "factor")
+  model$varmin <- apply(data[, vv, drop = FALSE], 2, min)
+  model$varmax <- apply(data[, vv, drop = FALSE], 2, max)
+  means <- apply(data[p == 1, vv, drop = FALSE], 2, mean)
+  majorities <- sapply(names(data)[!vv], function(n) which.max(table(data[p == 1, n, drop = FALSE])))
+  names(majorities) <- names(data)[!vv]
+  model$samplemeans <- unlist(c(means, majorities))
+  model$levels <- lapply(data, levels)
+  model
+}
+
 parallel_fit <- function(X, f) {
   res <- mclapply(X, f, mc.cores = N_CORES, mc.preschedule = FALSE)
   bad <- vapply(res, inherits, logical(1), "try-error")
@@ -50,7 +97,7 @@ opt_one <- function(i) {
   rm <- opt_jobs$rm[i]; sp <- opt_jobs$sp[i]
   y_tr <- train_dat[[sp]]
   if (sum(y_tr) == 0 || sum(y_tr) == length(y_tr)) return(NULL)
-  model <- tryCatch(maxnet(p = y_tr, data = train_dat[, features, drop = FALSE], regmult = rm),
+  model <- tryCatch(maxnet_exact(p = y_tr, data = train_dat[, features, drop = FALSE], regmult = rm),
                     error = conditionMessage)
   if (is.character(model)) return(data.frame(reg_mult = rm, species = sp, auc_roc_val = NA_real_, error = model))
   p_va <- as.numeric(predict(model, newdata = val_dat[, features, drop = FALSE],
@@ -83,7 +130,7 @@ fit_one_species <- function(sp) {
   if (sum(y_tr) == 0 || sum(y_tr) == length(y_tr)) return(NULL)
   sp_safe <- gsub("[^A-Za-z0-9]", "_", sp)
   if (all(file.exists(file.path(out_dir, paste0(sp_safe, "_", SPLITS, ".csv"))))) return(NULL)
-  model <- tryCatch(maxnet(p = y_tr, data = train_dat[, features, drop = FALSE], regmult = best_rm),
+  model <- tryCatch(maxnet_exact(p = y_tr, data = train_dat[, features, drop = FALSE], regmult = best_rm),
                     error = conditionMessage)
   if (is.character(model)) return(data.frame(species = sp, reg_mult = best_rm, error = model))
   for (split in SPLITS) {
