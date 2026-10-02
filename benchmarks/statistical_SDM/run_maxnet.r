@@ -156,7 +156,8 @@ maxnet_exact <- function(p, data, f = maxnet.formula(p, data), regmult = 1, adds
 }
 
 parallel_fit <- function(X, f) {
-  res <- mclapply(X, f, mc.cores = N_CORES, mc.preschedule = FALSE)
+  res <- withCallingHandlers(mclapply(X, f, mc.cores = N_CORES, mc.preschedule = FALSE),
+                             warning = function(w) if (grepl("did not deliver", conditionMessage(w))) stop(w))
   bad <- vapply(res, inherits, logical(1), "try-error")
   if (any(bad)) stop(paste(sprintf("job %d: %s", which(bad), unlist(res[bad])), collapse = "\n"))
   res

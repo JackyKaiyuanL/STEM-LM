@@ -82,8 +82,9 @@ for (cs in COV_SETS) {
   out_dir <- file.path(results_dir, cs, "per_species")
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
   t0 <- Sys.time()
-  res <- mclapply(all_sp, fit_predict_species, cs = cs, out_dir = out_dir,
-                  mc.cores = N_CORES, mc.preschedule = FALSE)
+  res <- withCallingHandlers(mclapply(all_sp, fit_predict_species, cs = cs, out_dir = out_dir,
+                                      mc.cores = N_CORES, mc.preschedule = FALSE),
+                             warning = function(w) if (grepl("did not deliver", conditionMessage(w))) stop(w))
   bad <- vapply(res, inherits, logical(1), "try-error")
   if (any(bad)) stop(paste(all_sp[bad], unlist(res[bad]), sep = ": ", collapse = "\n"))
   conv_log <- c(conv_log, res[!sapply(res, is.null)])
