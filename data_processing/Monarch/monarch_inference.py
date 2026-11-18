@@ -102,6 +102,34 @@ def plot_panels(predictions, column, out_png, resolution=0.5):
     fig.savefig(out_png, dpi=180, bbox_inches="tight")
 
 
+def plot_records(obs, species, dates, half_window, out_png):
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    import matplotlib.patheffects as pe
+    import matplotlib.pyplot as plt
+
+    day = pd.to_datetime(obs["time"])
+    proj = ccrs.LambertConformal(central_longitude=-95, central_latitude=40, standard_parallels=(20, 60))
+    fig, axes = plt.subplots(1, len(dates), figsize=(5 * len(dates), 4), subplot_kw={"projection": proj},
+                             gridspec_kw={"wspace": 0.02})
+    for ax, date in zip(axes.ravel(), dates):
+        near = obs[(day - pd.Timestamp(date)).abs() <= pd.Timedelta(days=half_window)]
+        present = near[species] == 1
+        ax.add_feature(cfeature.LAND, facecolor="0.92", edgecolor="none")
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.4, edgecolor="0.4")
+        ax.add_feature(cfeature.BORDERS, linewidth=0.25, edgecolor="0.4", alpha=0.6)
+        ax.scatter(near.longitude[~present], near.latitude[~present], s=4, color="0.55", linewidths=0,
+                   transform=ccrs.PlateCarree(), label="not recorded")
+        ax.scatter(near.longitude[present], near.latitude[present], s=9, color="tab:orange", linewidths=0,
+                   transform=ccrs.PlateCarree(), label="recorded")
+        ax.set_extent([-128, -65, 14, 60], crs=ccrs.PlateCarree())
+        ax.set_aspect("auto")
+        ax.text(0.02, 0.96, f"{date} ± {half_window} d", transform=ax.transAxes, fontsize=16,
+                verticalalignment="top", path_effects=[pe.withStroke(linewidth=3, foreground="white")])
+    axes.ravel()[-1].legend(loc="lower right", fontsize=12, markerscale=2, title=species)
+    fig.savefig(out_png, dpi=180, bbox_inches="tight")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Predict one species over the enriched grid with a trained STEM-LM run.")
     parser.add_argument("csv_path", type=Path)
@@ -111,6 +139,8 @@ def main():
     parser.add_argument("--species", default="Danaus plexippus")
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--no_plot", action="store_true")
+    parser.add_argument("--records_days", type=int, default=15,
+                        help="monarch_records.png shows the observations within this many days of each date.")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -133,6 +163,7 @@ def main():
     if not args.no_plot:
         plot_panels(predictions, "suitability", args.output_dir / "monarch_pred_full.png")
         plot_panels(predictions, "suitability_raw", args.output_dir / "monarch_pred_full_raw.png")
+        plot_records(obs, args.species, args.dates, args.records_days, args.output_dir / "monarch_records.png")
 
 
 if __name__ == "__main__":
