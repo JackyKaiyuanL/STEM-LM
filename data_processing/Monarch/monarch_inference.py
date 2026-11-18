@@ -126,7 +126,8 @@ def plot_records(obs, species, dates, half_window, out_png):
         ax.set_aspect("auto")
         ax.text(0.02, 0.96, f"{date} ± {half_window} d", transform=ax.transAxes, fontsize=16,
                 verticalalignment="top", path_effects=[pe.withStroke(linewidth=3, foreground="white")])
-    axes.ravel()[-1].legend(loc="lower right", fontsize=12, markerscale=2, title=species)
+    fig.legend(*axes.ravel()[-1].get_legend_handles_labels(), loc="upper center", bbox_to_anchor=(0.5, 0.08),
+               ncol=2, fontsize=12, markerscale=2, title=species, frameon=False)
     fig.savefig(out_png, dpi=180, bbox_inches="tight")
 
 

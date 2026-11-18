@@ -11,7 +11,7 @@ Builds the 0.5° North America grid used to render the monarch butterfly (*Danau
    - Output: one `monarch_grid_<DATE>.csv` per date with the 15-column env schema STEM-LM consumes.
 
 3. **`monarch_inference.py`** — loads a trained STEM-LM run, predicts the species at every grid cell with all species masked ($p=1$) and every eButterfly observation as the source pool, applies the run's temperature $T^\star$ (`temperature.json`, fitted on validation by `stemlm train --temperature_scaling`), and renders one panel per date in a single row.
-   - Output (in `--output_dir`): `monarch_pred_<DATE>.csv` per date (`suitability` with $T^\star$, `suitability_raw` without), `monarch_pred_full.png`, `monarch_pred_full_raw.png`.
+   - Output (in `--output_dir`): `monarch_pred_<DATE>.csv` per date (`suitability` with $T^\star$, `suitability_raw` without), `monarch_pred_full.png`, `monarch_pred_full_raw.png`, and `monarch_records.png` with the observations within `--records_days` (default 15) of each date.
 
 ## Reproducing the four panels
 
