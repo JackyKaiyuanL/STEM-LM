@@ -83,6 +83,22 @@ def test_resume_keeps_training_log(resumed_run):
     assert len(pd.read_csv(resumed_run / "training_log.csv")) == 2
 
 
+def test_resume_drops_log_rows_past_the_checkpoint(cli, tiny_csv, tmp_path):
+    from conftest import TRAIN_ARGS
+
+    args = ("train", str(tiny_csv), "--output_dir", str(tmp_path), *TRAIN_ARGS[2:], "--num_epochs")
+    assert TRAIN_ARGS[:2] == ["--num_epochs", "2"]
+    assert cli(*args, "1").returncode == 0
+    log = tmp_path / "training_log.csv"
+    first = log.read_text().splitlines()[1]
+    log.write_text(log.read_text() + "2" + first[1:] + "\n2,0.5")
+    (tmp_path / "test_results.csv").unlink()
+    result = cli(*args, "2")
+    assert result.returncode == 0, result.stderr
+    assert pd.read_csv(log).epoch.tolist() == [1, 2]
+    assert json.loads((tmp_path / "run_info.json").read_text())["resumed_at_epoch"] == 2
+
+
 def test_test_results_has_finite_metrics(trained_run):
     df = pd.read_csv(trained_run / "test_results.csv")
     assert len(df) > 0

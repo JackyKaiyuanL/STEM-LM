@@ -100,6 +100,11 @@ def log_main(env: "DistEnv", msg: str, level: int = logging.INFO):
         logger.log(level, msg)
 
 
+def save_atomic(obj, path):
+    torch.save(obj, path + ".tmp")
+    os.replace(path + ".tmp", path)
+
+
 def run_info(args, env, device):
     cuda = device.type == "cuda"
     if args.splits_path:
@@ -650,6 +655,14 @@ def run_train(args):
         if grad_scaler is not None and ckpt.get("grad_scaler_state_dict") is not None:
             grad_scaler.load_state_dict(ckpt["grad_scaler_state_dict"])
         start_epoch = ckpt["epoch"] + 1
+        info["resumed_at_epoch"] = start_epoch
+        if env.is_main:
+            with open(log_csv, newline="") as f:
+                rows = list(csv.reader(f))
+            with open(log_csv + ".tmp", "w", newline="") as f:
+                csv.writer(f).writerows(
+                    [rows[0]] + [r for r in rows[1:] if len(r) == len(rows[0]) and int(r[0]) < start_epoch])
+            os.replace(log_csv + ".tmp", log_csv)
         best_val_auc_mean   = ckpt.get("best_val_auc_mean",   -float("inf"))
         best_val_auprc_mean = ckpt.get("best_val_auprc_mean", -float("inf"))
         best_val_cbi_mean   = ckpt.get("best_val_cbi_mean",   -float("inf"))
@@ -714,21 +727,15 @@ def run_train(args):
             if val_auc_mean > best_val_auc_mean:
                 best_val_auc_mean = val_auc_mean
                 best_val_auprc_mean = val_auprc_mean
-                torch.save(
-                    unwrap(model).state_dict(),
-                    os.path.join(args.output_dir, "best_model.pt"),
-                )
+                save_atomic(unwrap(model).state_dict(), os.path.join(args.output_dir, "best_model.pt"))
                 logger.info(f"  → Best model saved (val_auc_mean={val_auc_mean:.4f})")
 
             if np.isfinite(val_cbi_mean) and val_cbi_mean > best_val_cbi_mean:
                 best_val_cbi_mean = val_cbi_mean
-                torch.save(
-                    unwrap(model).state_dict(),
-                    os.path.join(args.output_dir, "best_model_by_cbi.pt"),
-                )
+                save_atomic(unwrap(model).state_dict(), os.path.join(args.output_dir, "best_model_by_cbi.pt"))
                 logger.info(f"  → Best-by-CBI model saved (val_cbi_mean={val_cbi_mean:.4f})")
 
-            torch.save({
+            save_atomic({
                 "epoch": epoch,
                 "model_state_dict": unwrap(model).state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -1097,8 +1104,9 @@ def run_train(args):
         info.update(ended_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     wall_seconds=round(wall, 1),
                     wall_hm=f"{int(wall // 3600)}:{int(wall % 3600 // 60):02d}")
-        with open(os.path.join(args.output_dir, "run_info.json"), "w") as f:
+        with open(os.path.join(args.output_dir, "run_info.json.tmp"), "w") as f:
             json.dump(info, f, indent=2)
+        os.replace(os.path.join(args.output_dir, "run_info.json.tmp"), os.path.join(args.output_dir, "run_info.json"))
         logger.info(f"Done. Wall time {info['wall_hm']} (h:mm) on {info['num_gpus']}x {info['gpu']}. "
                     f"Output: {args.output_dir}")
 
