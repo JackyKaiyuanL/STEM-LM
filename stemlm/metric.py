@@ -1,4 +1,5 @@
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -194,11 +195,14 @@ def evaluate_at_p(model, dataset, eval_indices, dist_info, p_value: float,
                   num_workers: int = 0, base_seed: int = 0,
                   amp_dtype=None, distributed_sampler: bool = False,
                   collator_cls=None, temperature: float = 1.0) -> dict:
+    started = time.monotonic()
     z, y = gather_logits_at_p(model, dataset, eval_indices, dist_info, p_value, batch_size, device,
                               num_workers=num_workers, base_seed=base_seed, amp_dtype=amp_dtype,
                               distributed_sampler=distributed_sampler, collator_cls=collator_cls)
+    seconds = time.monotonic() - started
     per_sp = compute_per_species_metrics(z.astype(np.float64) / temperature, y)
-    return {"p": float(p_value), "summary": summarize_per_species_metrics(per_sp), "per_species": per_sp}
+    return {"p": float(p_value), "summary": summarize_per_species_metrics(per_sp), "per_species": per_sp,
+            "logits": z, "labels": y, "seconds": seconds}
 
 
 def _mask_seed(base_seed: int, p_value: float) -> int:

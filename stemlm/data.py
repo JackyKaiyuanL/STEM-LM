@@ -404,6 +404,17 @@ class JSDMDataset(Dataset):
         return [self._select_sources(i, c, s)
                 for i, (c, s) in zip(indices, cands, strict=True)]
 
+    def source_distances(self, indices) -> tuple[np.ndarray, np.ndarray]:
+        km = np.empty((len(indices), self.num_source_sites), dtype=np.float32)
+        days = np.empty_like(km)
+        for start in range(0, len(indices), 2048):
+            chunk = [int(i) for i in indices[start:start + 2048]]
+            for row, (i, item) in enumerate(zip(chunk, self.__getitems__(chunk), strict=True), start):
+                src = item["source_idx"].numpy()
+                km[row] = haversine_pairs_np(self.lats[i], self.lons[i], self.lats[src], self.lons[src])
+                days[row] = self._time_gap(i, src)
+        return km, days
+
 
 class JSDMSparseDataset(JSDMDataset):
     def __init__(
