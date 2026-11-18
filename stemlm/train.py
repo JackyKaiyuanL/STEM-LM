@@ -311,6 +311,13 @@ def add_train_args(parser):
     parser.add_argument("--no_time", action="store_true",
                         help="Ignore the time column (purely spatial model). The temporal FIRE "
                              "bias is also disabled automatically when every time value is equal.")
+    parser.add_argument("--no_temporal_bias", action="store_true",
+                        help="Remove only the temporal FIRE bias from the model. Source selection, "
+                             "time windows and the day-of-year covariates still use the time column.")
+    parser.add_argument("--no_coord_covariates", action="store_true",
+                        help="Do not append the unit-sphere coordinates (x, y, z) and the sine and "
+                             "cosine of day of year at each --temporal_fire_init_periods value to "
+                             "the covariates.")
     parser.add_argument("--train_exclusion", action=argparse.BooleanOptionalAction, default=True,
                         help="Per training target, remove candidate sources within a radius and, "
                              "independently, within a time window; each is 0 with probability 1/2 "
@@ -367,9 +374,9 @@ def add_train_args(parser):
                              "(summed residual); the others disable one or both.")
     parser.add_argument("--temporal_fire_init_periods", type=float, nargs="+", default=None,
                         help="Init periods (days) for learnable sin/cos channels added to "
-                             "FIRE temporal distance bias on ST attention scores. "
-                             "Periodic on Δt directly; per-species scales (if enabled) "
-                             "rescale Δt before the cos/sin. Omit to disable.")
+                             "FIRE temporal distance bias on ST attention scores, periodic on Δt. "
+                             "The day-of-year covariates use the same periods when the time "
+                             "column holds dates. Omit to disable both.")
     parser.add_argument("--per_species_env_rank", type=int, default=8,
                         help="Rank of the parallel per-species env head bolted in "
                              "alongside the shared env encoder. Reads raw target_env "
@@ -455,6 +462,8 @@ def run_train(args):
         min_train_presences=args.min_train_presences,
         source_cell_resolution=args.source_cell_resolution,
         train_sources_only=args.train_sources_only,
+        periods=args.temporal_fire_init_periods,
+        coord_covariates=not args.no_coord_covariates,
     )
 
     if env.is_distributed:
@@ -514,13 +523,15 @@ def run_train(args):
     use_temporal = dist_info["max_temporal_dist"] > 0
     if not use_temporal:
         log_main(env, "Temporal FIRE bias and test-sweep time windows disabled (no temporal variation in data)")
+    elif args.no_temporal_bias:
+        log_main(env, "Temporal FIRE bias disabled (--no_temporal_bias)")
 
     config = JSDMConfig(
         num_species=dataset.num_species,
         num_source_sites=args.num_source_sites,
         max_spatial_dist=dist_info["max_spatial_dist"] * 1.1,
         max_temporal_dist=dist_info["max_temporal_dist"] * 1.1,
-        use_temporal=use_temporal,
+        use_temporal=use_temporal and not args.no_temporal_bias,
         num_env_vars=dataset.num_env_vars,
         num_env_groups=args.num_env_groups,
         hidden_size=args.hidden_size,
@@ -586,8 +597,7 @@ def run_train(args):
             f"(effective batch = {args.batch_size * args.grad_accum_steps * env.world_size})"
         )
 
-    no_decay_keys = ("norm", "bias",
-                     "species_spatial_log_scale", "species_temporal_log_scale")
+    no_decay_keys = ("norm", "bias", "spatial_log_scale", "temporal_log_scale")
     decay_params, nodecay_params = [], []
     for n, p in model.named_parameters():
         (nodecay_params if any(k in n for k in no_decay_keys) else decay_params).append(p)

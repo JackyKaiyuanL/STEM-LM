@@ -141,7 +141,7 @@ def test_no_time_drops_time_column_from_species(tmp_path):
 
     ds = JSDMDataset(str(tmp_path / "static.csv"), num_source_sites=4, no_time=True)
     assert ds.species_cols == ["sp_0", "sp_1"]
-    assert ds.env_cols == ["env_a"]
+    assert ds.env_cols == ["env_a", "env_x", "env_y", "env_z"]
     assert not ds.has_time
 
 
@@ -163,7 +163,8 @@ def test_missing_covariates_filled_and_unselected_env_dropped(tmp_path):
     df.loc[5, "env_b"] = np.nan
     df.to_csv(tmp_path / "missing.csv", index=False)
 
-    ds = JSDMDataset(str(tmp_path / "missing.csv"), num_source_sites=4, no_time=True, env_cols=["env_a"])
+    ds = JSDMDataset(str(tmp_path / "missing.csv"), num_source_sites=4, no_time=True, env_cols=["env_a"],
+                     coord_covariates=False)
     assert ds.species_cols == ["sp_0", "sp_1"]
     assert ds.env_cols == ["env_a"]
     rows = np.arange(20)
@@ -172,6 +173,36 @@ def test_missing_covariates_filled_and_unselected_env_dropped(tmp_path):
     expected = (raw - np.nanmean(raw[rows])) / np.nanstd(raw[rows])
     expected[[3, 7]] = 0.0
     np.testing.assert_allclose(ds.env_data[:, 0], expected, rtol=1e-5, atol=1e-6)
+
+
+def test_coord_covariates(tmp_path):
+    from stemlm.data import JSDMDataset
+
+    rng = np.random.default_rng(6)
+    n = 40
+    dates = pd.Timestamp("2021-01-01") + pd.to_timedelta(rng.integers(0, 730, n), unit="D")
+    df = pd.DataFrame({
+        "time": dates.strftime("%Y-%m-%d"),
+        "latitude": rng.uniform(25, 55, n),
+        "longitude": rng.uniform(-120, -70, n),
+        "env_a": rng.normal(size=n),
+        "sp_0": rng.integers(0, 2, n),
+    })
+    df.to_csv(tmp_path / "dated.csv", index=False)
+
+    ds = JSDMDataset(str(tmp_path / "dated.csv"), num_source_sites=4, periods=(365.0, 182.0))
+    assert ds.env_cols == ["env_a", "env_x", "env_y", "env_z", "env_doy_sin_365", "env_doy_cos_365",
+                           "env_doy_sin_182", "env_doy_cos_182"]
+    assert ds.num_env_vars == 8
+    lat, lon = np.radians(df.latitude.to_numpy()), np.radians(df.longitude.to_numpy())
+    np.testing.assert_allclose(ds.env_data[:, 1:4], np.column_stack(
+        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)]), rtol=1e-6)
+    doy = dates.dayofyear.to_numpy()
+    np.testing.assert_allclose(ds.env_data[:, 4], np.sin(2 * np.pi * doy / 365), atol=1e-6)
+    np.testing.assert_allclose(ds.env_data[:, 7], np.cos(2 * np.pi * doy / 182), atol=1e-6)
+
+    no_time = JSDMDataset(str(tmp_path / "dated.csv"), num_source_sites=4, periods=(365.0, 182.0), no_time=True)
+    assert no_time.env_cols == ["env_a", "env_x", "env_y", "env_z"]
 
     df.loc[9, "sp_1"] = np.nan
     df.to_csv(tmp_path / "bad.csv", index=False)

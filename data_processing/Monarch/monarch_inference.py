@@ -26,13 +26,14 @@ def load_model(run_dir, device):
     return model, config, json.loads(temperature.read_text())["T_star"] if temperature.exists() else 1.0
 
 
-def predict_grid(model, config, env_stats, obs, grid_csv, species, work_csv, device):
+def predict_grid(model, config, coord_covariates, env_stats, obs, grid_csv, species, work_csv, device):
     grid = pd.read_csv(grid_csv)
     species_cols = [c for c in obs.columns if c not in META_COLS and not c.startswith("env_")]
     grid = pd.concat([grid, pd.DataFrame(0, index=grid.index, columns=species_cols, dtype=np.int8)],
                      axis=1)[obs.columns]
     pd.concat([obs, grid], ignore_index=True).to_csv(work_csv, index=False)
-    dataset = JSDMDataset(str(work_csv), num_source_sites=config.num_source_sites)
+    dataset = JSDMDataset(str(work_csv), num_source_sites=config.num_source_sites,
+                          periods=config.temporal_fire_init_periods, coord_covariates=coord_covariates)
     dataset.source_pool = np.arange(len(obs))
     dataset.fill_env(mean=env_stats["mean"], std=env_stats["std"])
     logits, _ = gather_logits_at_p(model, dataset, np.arange(len(obs), len(obs) + len(grid)),
@@ -148,12 +149,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, config, T = load_model(args.run_dir, device)
     env_stats = json.loads((args.run_dir / "env_stats.json").read_text())
+    coord_covariates = not json.loads((args.run_dir / "run_info.json").read_text())["args"]["no_coord_covariates"]
     obs = read_table(args.csv_path)
     species = json.loads((args.run_dir / "species_names.json").read_text())
     obs = obs[[c for c in obs.columns if c in META_COLS or c.startswith("env_")] + species]
     predictions = {}
     for date in args.dates:
-        cells, z = predict_grid(model, config, env_stats, obs, args.grid_dir / f"monarch_grid_{date}.csv", args.species,
+        cells, z = predict_grid(model, config, coord_covariates, env_stats, obs,
+                                args.grid_dir / f"monarch_grid_{date}.csv", args.species,
                                 args.output_dir / "_combined.csv", device)
         pred = cells.assign(suitability=1.0 / (1.0 + np.exp(-z / T)), suitability_raw=1.0 / (1.0 + np.exp(-z)))
         pred.to_csv(args.output_dir / f"monarch_pred_{date}.csv", index=False)

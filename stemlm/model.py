@@ -290,23 +290,23 @@ class STColAttention(nn.Module):
                 n_frequencies=len(periods) if periods else 0,
                 freq_init_periods=periods,
             )
-        self.species_spatial_log_scale = nn.Parameter(torch.zeros(config.num_species))
+        self.spatial_log_scale = nn.Parameter(torch.zeros(1))
         if self.use_temporal:
-            self.species_temporal_log_scale = nn.Parameter(torch.zeros(config.num_species))
-        self.species_gate_threshold = nn.Parameter(torch.zeros(config.num_species))
+            self.temporal_log_scale = nn.Parameter(torch.zeros(1))
+        self.gate_threshold = nn.Parameter(torch.zeros(1))
 
     def forward(self, hidden_states, source_embeddings, st_dist):
+        S = hidden_states.shape[1]
         spatial_bias = self.fire_spatial(st_dist[..., 0])
-        s_scale = F.softplus(self.species_spatial_log_scale) + 1e-4
+        s_scale = F.softplus(self.spatial_log_scale.expand(S)) + 1e-4
         st_dist_bias = spatial_bias[:, None, :, :] * s_scale[None, :, None, None]
 
         if self.use_temporal:
             temporal_bias = self.fire_temporal(st_dist[..., 1])
-            t_scale = F.softplus(self.species_temporal_log_scale) + 1e-4
+            t_scale = F.softplus(self.temporal_log_scale.expand(S)) + 1e-4
             st_dist_bias = st_dist_bias + temporal_bias[:, None, :, :] * t_scale[None, :, None, None]
 
-        gate = torch.sigmoid(self.species_gate_threshold[None, :, None]
-                             - torch.logsumexp(st_dist_bias.float(), dim=-1))
+        gate = torch.sigmoid(self.gate_threshold - torch.logsumexp(st_dist_bias.float(), dim=-1))
         context = self.cross_attn(hidden_states, source_embeddings, st_dist_bias)
         return self.output(context * (1.0 - gate).unsqueeze(-1).to(context.dtype))
 

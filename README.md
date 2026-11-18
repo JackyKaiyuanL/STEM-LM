@@ -70,8 +70,10 @@ which species are kept.
 | `--hidden_size`, `--num_attention_heads`, `--num_hidden_layers`, `--intermediate_size` | 256, 8, 4, 512 | Transformer size |
 | `--num_env_groups` | 5 | learned queries pooling the sources' environments |
 | `--per_species_env_rank` | 8 | rank of the per-species linear environmental head |
-| `--temporal_fire_init_periods` | none | periods (days) of the periodic terms in the temporal distance bias; omit for a static dataset |
+| `--temporal_fire_init_periods` | none | periods (days) of the periodic terms in the temporal distance bias and of the day-of-year covariates; omit for a static dataset |
 | `--no_time` | off | ignore the time column |
+| `--no_temporal_bias` | off | remove only the temporal distance bias |
+| `--no_coord_covariates` | off | do not append the unit-sphere coordinates (x, y, z) and the sine and cosine of day of year to the covariates; day of year needs `time` as dates |
 | `--ablation` | `full` | `no_st`, `no_env` or `no_st_env` remove cross-attention pathways |
 | `--p` | `unif:0.0,1.0` | mask rate per row: a number or `unif:lo,hi` |
 | `--loss_type` | `focal` | `focal` (`--focal_alpha 0.25 --focal_gamma 2.0`) or `bce` |

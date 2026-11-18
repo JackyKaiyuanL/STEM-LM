@@ -98,10 +98,10 @@ def test_gate_threshold_scales_the_context():
     st_dist = torch.stack([torch.rand(B, 1, N) * 100.0, torch.rand(B, 1, N) * 365.0], dim=-1)
 
     with torch.no_grad():
-        mod.species_gate_threshold.fill_(-50.0)
+        mod.gate_threshold.fill_(-50.0)
     open_gate = mod(hidden_states, (basis, source_ids), st_dist)
     with torch.no_grad():
-        mod.species_gate_threshold.fill_(50.0)
+        mod.gate_threshold.fill_(50.0)
     closed_gate = mod(hidden_states, (basis, source_ids), st_dist)
 
     torch.testing.assert_close(closed_gate, mod.output(torch.zeros(B, S, 1, mod.output.dense.in_features)),
@@ -116,8 +116,8 @@ def test_gate_responds_to_a_uniform_bias_shift():
     mod = STColAttention(cfg).eval()
     B, S, N = 2, 5, 6
     bias = torch.randn(B, S, 1, N)
-    g_a = torch.sigmoid(mod.species_gate_threshold[None, :, None] - torch.logsumexp(bias, dim=-1))
-    g_b = torch.sigmoid(mod.species_gate_threshold[None, :, None] - torch.logsumexp(bias - 3.0, dim=-1))
+    g_a = torch.sigmoid(mod.gate_threshold - torch.logsumexp(bias, dim=-1))
+    g_b = torch.sigmoid(mod.gate_threshold - torch.logsumexp(bias - 3.0, dim=-1))
     assert (g_b > g_a).all()
 
 
