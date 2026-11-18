@@ -47,6 +47,9 @@ def main():
                         help="As in stemlm train: a training row's autologistic neighbors are its nearest "
                              "training rows; a validation or test row's are the training rows and the other "
                              "rows of its own split outside its H3 cell at this resolution.")
+    parser.add_argument("--training_rows_exclude_cell", action="store_true",
+                        help="A training row's autologistic neighbors also exclude its own H3 cell at "
+                             "--source_cell_resolution.")
     parser.add_argument("--train_sources_only", action="store_true",
                         help="Autologistic neighbors of every row are its nearest training rows, with no "
                              "cell exclusion. --source_cell_resolution is then unused.")
@@ -76,6 +79,7 @@ def main():
                                      train_sources_only=args.train_sources_only)
         environment["AUTOCOV_FILE"] = str(output_dir / "autocovariate.csv")
         environment["AUTOCOV_SOURCES"] = "train" if args.train_sources_only else "heldout"
+        loaders[1].training_rows_exclude_cell = args.training_rows_exclude_cell
         write_autocovariate(loaders[1], environment["AUTOCOV_FILE"])
         del loaders
     test_idx = np.sort(splits["test"])

@@ -231,6 +231,7 @@ class JSDMDataset(Dataset):
         self.causal_context = False
         self.heldout_split = None
         self.cell = None
+        self.training_rows_exclude_cell = False
 
     def restrict_species(self, rows, min_presences):
         sparse = isinstance(self.species_data, _SparseSpeciesData)
@@ -279,7 +280,7 @@ class JSDMDataset(Dataset):
 
     def _source_ok(self, idx: int, neigh: np.ndarray) -> np.ndarray:
         ok = self._source_pool_mask[neigh]
-        if self.heldout_split is not None and self.heldout_split[idx] >= 0:
+        if self.heldout_split is not None and (self.training_rows_exclude_cell or self.heldout_split[idx] >= 0):
             ok = (ok | (self.heldout_split[neigh] == self.heldout_split[idx])) & (self.cell[neigh] != self.cell[idx])
         return ok
 

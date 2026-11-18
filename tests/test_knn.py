@@ -220,3 +220,25 @@ def test_heldout_rows_are_sources_only_within_their_split_and_outside_their_cell
     finally:
         dataset.heldout_split = None
         dataset.cell = None
+
+
+def test_training_rows_exclude_cell(dataset):
+    from stemlm.data import heldout_split_ids
+
+    pool = set(range(0, 160, 2))
+    dataset.heldout_split = heldout_split_ids(160, sorted(range(1, 160, 4)), sorted(range(3, 160, 4)))
+    nearest = {i: dataset[i]["source_idx"].numpy()[0] for i in [0, 4, 40]}
+    dataset.cell = np.zeros(160, dtype=np.int64)
+    for i, j in nearest.items():
+        dataset.cell[[i, j]] = i + 1
+    try:
+        for i, j in nearest.items():
+            assert j in dataset[i]["source_idx"].numpy()
+        dataset.training_rows_exclude_cell = True
+        for i, j in nearest.items():
+            src = dataset[i]["source_idx"].numpy()
+            assert set(src) <= pool and (dataset.cell[src] != dataset.cell[i]).all()
+    finally:
+        dataset.heldout_split = None
+        dataset.cell = None
+        dataset.training_rows_exclude_cell = False
