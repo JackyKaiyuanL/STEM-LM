@@ -740,6 +740,10 @@ def run_train(args):
             best_val_auc_mean, best_val_auprc_mean = best_state.tolist()
         env.barrier()
 
+    if device.type == "cuda":
+        info["train_peak_gpu_mb"] = round(torch.cuda.max_memory_allocated(device) / 2**20)
+        torch.cuda.reset_peak_memory_stats(device)
+
     eval_split   = "test" if len(splits["test"]) > 0 else "val (no test set)"
     eval_indices = splits["test"] if len(splits["test"]) > 0 else splits["val"]
     log_main(env, f"Evaluating best model on fixed-p {eval_split} set...")
@@ -771,6 +775,8 @@ def run_train(args):
     per_p_q50 = {}
     per_p_q75 = {}
     per_p_per_species: dict = {}
+    predictions = {}
+    test_seconds = {}
     for p in args.val_p_list:
         result = evaluate_at_p(
             unwrap(model), dataset, eval_indices, dist_info,
@@ -782,6 +788,9 @@ def run_train(args):
             distributed_sampler=env.is_distributed,
             temperature=T_star,
         )
+        predictions[f"logits_p{p:.2f}"] = result["logits"]
+        predictions[f"labels_p{p:.2f}"] = result["labels"].astype(np.int8)
+        test_seconds[f"{p:.2f}"] = round(result["seconds"], 2)
         s = result["summary"]
         per_p_auc[p]    = s["mean_auc_roc"]
         per_p_auprc[p]  = s["mean_auc_pr"]
@@ -808,6 +817,17 @@ def run_train(args):
         f"{eval_split} mean over p={list(per_p_auc.keys())}: "
         f"AUC={best_mean_auc:.4f}  AUPRC={best_mean_auprc:.4f}  CBI={best_mean_cbi:.3f}"
     )
+    if device.type == "cuda":
+        info["test_peak_gpu_mb"] = round(torch.cuda.max_memory_allocated(device) / 2**20)
+    info["test_sites"] = len(eval_indices)
+    info["test_seconds_by_p"] = test_seconds
+    if env.is_main:
+        site_idx = np.sort(eval_indices)
+        km, days = dataset.source_distances(site_idx)
+        if use_temporal:
+            predictions["source_days"] = days
+        np.savez_compressed(os.path.join(args.output_dir, "test_predictions.npz"),
+                            site_idx=site_idx, temperature=T_star, source_km=km, **predictions)
 
     cbi_sel_per_p_auc = {}
     cbi_sel_per_p_auprc = {}

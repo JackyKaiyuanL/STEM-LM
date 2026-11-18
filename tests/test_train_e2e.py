@@ -4,6 +4,8 @@ import json
 import numpy as np
 import pandas as pd
 
+from stemlm.metric import compute_per_species_metrics, summarize_per_species_metrics
+
 # Mirrors the synthetic dataset built in conftest.py.
 SPECIES = [f"species_{i}" for i in range(6)]
 
@@ -15,6 +17,7 @@ EXPECTED_ARTIFACTS = [
     "splits.json",
     "training_log.csv",
     "test_results.csv",
+    "test_predictions.npz",
     "per_species_auc.csv",
     "ablation_summary.json",
     "run_info.json",
@@ -30,6 +33,20 @@ def test_run_info_records_seed_and_wall_time(trained_run):
     info = json.loads((trained_run / "run_info.json").read_text())
     assert info["seed"] == 0 and info["wall_seconds"] > 0
     assert info["split"] == {"file": None, "resolution": 2, "seed": 0, "train_frac": 0.8, "test_frac": 0.1}
+
+
+def test_predictions_file(trained_run):
+    saved = np.load(trained_run / "test_predictions.npz")
+    info = json.loads((trained_run / "run_info.json").read_text())
+    fixed = (pd.read_csv(trained_run / "test_results.csv")
+             .query("mask_scheme == 'uniform' and sources == 'heldout'").set_index("p"))
+    for p in (0.5, 1.0):
+        per_sp = compute_per_species_metrics(saved[f"logits_p{p:.2f}"].astype(np.float64) / saved["temperature"],
+                                             saved[f"labels_p{p:.2f}"].astype(np.int64))
+        np.testing.assert_allclose(summarize_per_species_metrics(per_sp)["mean_auc_roc"], fixed.loc[p, "auc"],
+                                   rtol=0, atol=1e-12)
+    assert saved["source_km"].shape == saved["source_days"].shape == (info["test_sites"], 8)
+    assert len(saved["site_idx"]) == info["test_sites"] and set(info["test_seconds_by_p"]) == {"0.50", "1.00"}
 
 
 def test_config_matches_dataset(trained_run):
