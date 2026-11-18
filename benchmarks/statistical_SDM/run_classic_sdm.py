@@ -50,6 +50,10 @@ def main():
     parser.add_argument("--training_rows_exclude_cell", action="store_true",
                         help="A training row's autologistic neighbors also exclude its own H3 cell at "
                              "--source_cell_resolution.")
+    parser.add_argument("--train_exclusion", action="store_true",
+                        help="As in stemlm train: per training row, remove autologistic neighbors within a "
+                             "random radius and time window.")
+    parser.add_argument("--train_exclusion_seed", type=int, default=42)
     parser.add_argument("--train_sources_only", action="store_true",
                         help="Autologistic neighbors of every row are its nearest training rows, with no "
                              "cell exclusion. --source_cell_resolution is then unused.")
@@ -76,10 +80,12 @@ def main():
         loaders = create_dataloaders(str(args.csv_path.resolve()), splits_path=str(args.splits_path.resolve()),
                                      min_train_presences=args.min_train_presences,
                                      source_cell_resolution=args.source_cell_resolution,
-                                     train_sources_only=args.train_sources_only)
+                                     train_sources_only=args.train_sources_only,
+                                     train_exclusion=args.train_exclusion)
         environment["AUTOCOV_FILE"] = str(output_dir / "autocovariate.csv")
         environment["AUTOCOV_SOURCES"] = "train" if args.train_sources_only else "heldout"
         loaders[1].training_rows_exclude_cell = args.training_rows_exclude_cell
+        np.random.seed(args.train_exclusion_seed)
         write_autocovariate(loaders[1], environment["AUTOCOV_FILE"])
         del loaders
     test_idx = np.sort(splits["test"])
