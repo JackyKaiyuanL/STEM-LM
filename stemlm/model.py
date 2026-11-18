@@ -61,9 +61,9 @@ class JSDMConfig:
                 f"hidden_size ({self.hidden_size}) must be divisible by "
                 f"num_attention_heads ({self.num_attention_heads})."
             )
-        if self.ablation not in ("full", "no_st", "no_env", "no_st_env"):
+        if self.ablation not in ("full", "no_st", "no_env", "no_st_env", "no_source_env"):
             raise ValueError(
-                f"ablation must be one of full/no_st/no_env/no_st_env; got {self.ablation!r}"
+                f"ablation must be one of full/no_st/no_env/no_st_env/no_source_env; got {self.ablation!r}"
             )
 
         tfp = self.temporal_fire_init_periods
@@ -342,8 +342,8 @@ class JSDMAttention(nn.Module):
         super().__init__()
         self.row_attention = SpeciesRowAttention(config)
 
-        self.use_st  = config.ablation in ("full", "no_env")
-        self.use_env = config.ablation in ("full", "no_st")
+        self.use_st  = config.ablation in ("full", "no_env", "no_source_env")
+        self.use_env = config.ablation in ("full", "no_st", "no_source_env")
         if self.use_st:
             self.st_col_attention = STColAttention(config)
         if self.use_env:
@@ -414,7 +414,7 @@ class JSDMModel(nn.Module):
         super().__init__()
         self.config = config
         self.target_input = TargetInput(config)
-        self.use_env = config.ablation in ("full", "no_st")
+        self.use_env = config.ablation in ("full", "no_st", "no_source_env")
         self.use_source_env = config.ablation == "full"
         if self.use_env:
             self.target_env_module = TargetEnvModule(config)
@@ -504,7 +504,7 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
         self.config = config
         self.model = JSDMModel(config)
         self.cls = JSDMPredictionHead(config)
-        if config.per_species_env_rank > 0 and config.ablation in ("full", "no_st"):
+        if config.per_species_env_rank > 0 and config.ablation in ("full", "no_st", "no_source_env"):
             self.per_species_env_head = PerSpeciesEnvHead(
                 num_env_vars=config.num_env_vars,
                 num_species=config.num_species,

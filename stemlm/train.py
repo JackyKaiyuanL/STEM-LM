@@ -373,10 +373,11 @@ def add_train_args(parser):
                              "Mean AUC across these drives best_model.pt selection. "
                              "AUPRC is reported but not used for selection. "
                              "Default 0.25 0.5 0.75 1.0.")
-    parser.add_argument("--ablation", choices=["full", "no_st", "no_env", "no_st_env"],
+    parser.add_argument("--ablation", choices=["full", "no_st", "no_env", "no_st_env", "no_source_env"],
                         default="full",
                         help="Ablation mode. 'full' uses both ST and Env cross-attention "
-                             "(summed residual); the others disable one or both.")
+                             "(summed residual); no_st, no_env and no_st_env disable one or both; "
+                             "no_source_env keeps both and drops only the pooled source covariates.")
     parser.add_argument("--temporal_fire_init_periods", type=float, nargs="+", default=None,
                         help="Init periods (days) for learnable sin/cos channels added to "
                              "FIRE temporal distance bias on ST attention scores, periodic on Δt. "
