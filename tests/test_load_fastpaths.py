@@ -168,9 +168,10 @@ def test_missing_covariates_filled_and_unselected_env_dropped(tmp_path):
     assert ds.env_cols == ["env_a"]
     rows = np.arange(20)
     ds.fill_env(rows)
-    expected = pd.read_csv(tmp_path / "missing.csv")["env_a"].to_numpy(dtype=np.float32)
-    expected[[3, 7]] = np.nanmean(expected[rows])
-    np.testing.assert_array_equal(ds.env_data[:, 0], expected)
+    raw = pd.read_csv(tmp_path / "missing.csv")["env_a"].to_numpy(dtype=np.float32)
+    expected = (raw - np.nanmean(raw[rows])) / np.nanstd(raw[rows])
+    expected[[3, 7]] = 0.0
+    np.testing.assert_allclose(ds.env_data[:, 0], expected, rtol=1e-5, atol=1e-6)
 
     df.loc[9, "sp_1"] = np.nan
     df.to_csv(tmp_path / "bad.csv", index=False)

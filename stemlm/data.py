@@ -266,10 +266,19 @@ class JSDMDataset(Dataset):
         mask[np.asarray(value)] = True
         self._random_exclusion_mask = mask
 
-    def fill_env(self, rows=None, mean=None):
-        self.env_mean = (np.nanmean(self.env_data[np.asarray(rows)], axis=0) if mean is None
-                         else np.asarray(mean)).astype(np.float32)
-        self.env_data = np.where(np.isnan(self.env_data), self.env_mean, self.env_data).astype(np.float32)
+    def fill_env(self, rows=None, mean=None, std=None):
+        if mean is None:
+            train = self.env_data[np.asarray(rows)]
+            mean, std = np.nanmean(train, axis=0), np.nanstd(train, axis=0)
+        self.env_mean = np.asarray(mean, dtype=np.float32)
+        self.env_std = np.asarray(std, dtype=np.float32)
+        if not self.env_cols:
+            return
+        constant = [c for c, s in zip(self.env_cols, self.env_std, strict=True) if s == 0]
+        if constant:
+            raise ValueError(f"covariates constant on the training rows: {constant}")
+        filled = np.where(np.isnan(self.env_data), self.env_mean, self.env_data)
+        self.env_data = ((filled - self.env_mean) / self.env_std).astype(np.float32)
 
     def __len__(self):
         return len(self.species_data)
