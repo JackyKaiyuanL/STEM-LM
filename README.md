@@ -69,7 +69,6 @@ which species are kept.
 |---|---|---|
 | `--hidden_size`, `--num_attention_heads`, `--num_hidden_layers`, `--intermediate_size` | 256, 8, 4, 512 | Transformer size |
 | `--num_env_groups` | 5 | learned queries pooling the sources' environments |
-| `--per_species_env_rank` | 8 | rank of the per-species linear environmental head |
 | `--temporal_fire_init_periods` | none | periods (days) of the periodic terms in the temporal distance bias and of the day-of-year covariates; omit for a static dataset |
 | `--no_time` | off | ignore the time column |
 | `--no_temporal_bias` | off | remove only the temporal distance bias |

@@ -383,12 +383,6 @@ def add_train_args(parser):
                              "FIRE temporal distance bias on ST attention scores, periodic on Δt. "
                              "The day-of-year covariates use the same periods when the time "
                              "column holds dates. Omit to disable both.")
-    parser.add_argument("--per_species_env_rank", type=int, default=8,
-                        help="Rank of the parallel per-species env head bolted in "
-                             "alongside the shared env encoder. Reads raw target_env "
-                             "via low-rank A∈(E,r)·B∈(r,S) (A zero-init, monotone safe) "
-                             "+ per-species bias. Active in full / no_st ablations; "
-                             "silent in no_env / no_st_env. 0 disables it.")
     parser.add_argument("--loss_type", choices=["bce", "focal"], default="focal",
                         help="Loss function. 'focal' = sigmoid focal loss "
                              "(Lin et al. 2017; default, alpha=0.25, gamma=2.0 "
@@ -552,7 +546,6 @@ def run_train(args):
         ),
         ablation=args.ablation,
         p=args.p,
-        per_species_env_rank=args.per_species_env_rank,
     )
 
     if env.is_main:
