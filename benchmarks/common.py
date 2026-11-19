@@ -9,7 +9,8 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from stemlm.data import MIN_TRAIN_PRESENCES, load_splits, read_table, species_with_presences  # noqa: E402
+from stemlm.data import (MIN_TRAIN_PRESENCES, _coord_covariates, _normalize_time_col, load_splits,  # noqa: E402
+                         read_table, species_with_presences)
 from stemlm.metric import compute_per_species_metrics, summarize_per_species_metrics  # noqa: E402
 
 META_COLS = ("time", "latitude", "longitude")
@@ -33,10 +34,22 @@ def add_species_arg(parser):
                         help="Keep the species with at least this many presences in the training rows.")
 
 
-def load_dataset(csv_path, split_path, min_train_presences):
+def add_coord_args(parser):
+    parser.add_argument("--coord_covariates", action="store_true",
+                        help="Add STEM-LM's coordinate covariates (unit-sphere x, y, z and day-of-year "
+                             "sines and cosines at --periods) to the environmental covariates.")
+    parser.add_argument("--periods", nargs="+", type=float,
+                        help="Day-of-year periods for --coord_covariates; none gives x, y, z only.")
+
+
+def load_dataset(csv_path, split_path, min_train_presences, coord_covariates=False, periods=None):
     df = read_table(csv_path)
-    env_cols = [c for c in df.columns if c.startswith("env_")]
     species_cols = [c for c in df.columns if c not in META_COLS and not c.startswith("env_")]
+    if coord_covariates:
+        doy = _normalize_time_col(df.copy(), "time", no_time=not periods)[1]
+        names, values = _coord_covariates(df.latitude.to_numpy(), df.longitude.to_numpy(), doy, periods)
+        df = pd.concat([df, pd.DataFrame(values, columns=names, index=df.index)], axis=1)
+    env_cols = [c for c in df.columns if c.startswith("env_")]
     train, val, test = load_splits(str(split_path), expected_num_rows=len(df))
     keep = species_with_presences(df[species_cols].to_numpy(dtype=np.float32), train, min_train_presences)
     return df, env_cols, [species_cols[i] for i in keep], {"train": train, "val": val, "test": test}

@@ -66,7 +66,7 @@ def main():
         description="Time and peak GPU memory of one STEM-LM step on random inputs, by number of species "
                     "and sources. The batch size is halved until the step fits in GPU memory.")
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--num_species", type=int, nargs="+", default=[171, 1201, 5000, 20000, 50000])
+    parser.add_argument("--num_species", type=int, nargs="+", default=[171, 1201, 2500, 5000, 10000, 20000, 50000])
     parser.add_argument("--num_source_sites", type=int, nargs="+", default=[32, 128, 512])
     parser.add_argument("--num_env_vars", type=int, default=15)
     parser.add_argument("--batch_size", type=int, default=128)
