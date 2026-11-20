@@ -82,7 +82,7 @@ def plot_panels(predictions, column, out_png, resolution=0.5):
     cmap = plt.get_cmap("inferno").copy()
     proj = ccrs.LambertConformal(central_longitude=-95, central_latitude=40, standard_parallels=(20, 60))
     angles = np.deg2rad(np.arange(0, 360, 60))
-    fig, axes = plt.subplots(1, len(filled), figsize=(5 * len(filled), 4), subplot_kw={"projection": proj},
+    fig, axes = plt.subplots(1, len(filled), figsize=(5 * len(filled), 3.8), subplot_kw={"projection": proj},
                              gridspec_kw={"wspace": 0.02})
     for ax, (date, values) in zip(axes.ravel(), filled.items()):
         verts = [np.column_stack([x + 0.72 * resolution * np.cos(angles), y + 0.72 * resolution * np.sin(angles)])
@@ -94,7 +94,7 @@ def plot_panels(predictions, column, out_png, resolution=0.5):
         ax.add_feature(cfeature.COASTLINE, linewidth=0.4, edgecolor="white", zorder=3)
         ax.add_feature(cfeature.BORDERS, linewidth=0.25, edgecolor="white", alpha=0.6, zorder=3)
         ax.set_extent([-128, -65, 14, 60], crs=ccrs.PlateCarree())
-        ax.set_aspect("auto")
+        ax.set_adjustable("box")
         ax.text(0.02, 0.96, date, transform=ax.transAxes, fontsize=16, verticalalignment="top", color="white",
                 path_effects=[pe.withStroke(linewidth=3, foreground="black")])
     cbar = fig.colorbar(pc, ax=axes.ravel().tolist(), shrink=0.9, aspect=20, pad=0.01)
@@ -124,7 +124,7 @@ def plot_records(obs, species, dates, half_window, out_png):
         ax.scatter(near.longitude[present], near.latitude[present], s=9, color="tab:orange", linewidths=0,
                    transform=ccrs.PlateCarree(), label="recorded")
         ax.set_extent([-128, -65, 14, 60], crs=ccrs.PlateCarree())
-        ax.set_aspect("auto")
+        ax.set_adjustable("box")
         ax.text(0.02, 0.96, f"{date} ± {half_window} d", transform=ax.transAxes, fontsize=16,
                 verticalalignment="top", path_effects=[pe.withStroke(linewidth=3, foreground="white")])
     fig.legend(*axes.ravel()[-1].get_legend_handles_labels(), loc="upper center", bbox_to_anchor=(0.5, 0.08),
