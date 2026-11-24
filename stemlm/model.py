@@ -46,6 +46,8 @@ class JSDMConfig:
 
     ablation: str = "full"
 
+    per_species_env_rank: int = 8
+
     p: "float | str" = "unif:0.0,1.0"
 
     def __post_init__(self):
@@ -288,23 +290,23 @@ class STColAttention(nn.Module):
                 n_frequencies=len(periods) if periods else 0,
                 freq_init_periods=periods,
             )
-        self.spatial_log_scale = nn.Parameter(torch.zeros(1))
+        self.species_spatial_log_scale = nn.Parameter(torch.zeros(config.num_species))
         if self.use_temporal:
-            self.temporal_log_scale = nn.Parameter(torch.zeros(1))
-        self.gate_threshold = nn.Parameter(torch.zeros(1))
+            self.species_temporal_log_scale = nn.Parameter(torch.zeros(config.num_species))
+        self.species_gate_threshold = nn.Parameter(torch.zeros(config.num_species))
 
     def forward(self, hidden_states, source_embeddings, st_dist):
-        S = hidden_states.shape[1]
         spatial_bias = self.fire_spatial(st_dist[..., 0])
-        s_scale = F.softplus(self.spatial_log_scale.expand(S)) + 1e-4
+        s_scale = F.softplus(self.species_spatial_log_scale) + 1e-4
         st_dist_bias = spatial_bias[:, None, :, :] * s_scale[None, :, None, None]
 
         if self.use_temporal:
             temporal_bias = self.fire_temporal(st_dist[..., 1])
-            t_scale = F.softplus(self.temporal_log_scale.expand(S)) + 1e-4
+            t_scale = F.softplus(self.species_temporal_log_scale) + 1e-4
             st_dist_bias = st_dist_bias + temporal_bias[:, None, :, :] * t_scale[None, :, None, None]
 
-        gate = torch.sigmoid(self.gate_threshold - torch.logsumexp(st_dist_bias.float(), dim=-1))
+        gate = torch.sigmoid(self.species_gate_threshold[None, :, None]
+                             - torch.logsumexp(st_dist_bias.float(), dim=-1))
         context = self.cross_attn(hidden_states, source_embeddings, st_dist_bias)
         return self.output(context * (1.0 - gate).unsqueeze(-1).to(context.dtype))
 
@@ -470,6 +472,18 @@ class JSDMOutput:
     logits: torch.FloatTensor = None
 
 
+class PerSpeciesEnvHead(nn.Module):
+    def __init__(self, num_env_vars: int, num_species: int, rank: int):
+        super().__init__()
+        self.A = nn.Parameter(torch.zeros(num_env_vars, rank))
+        self.B = nn.Parameter(torch.empty(rank, num_species))
+        nn.init.normal_(self.B, mean=0.0, std=0.02)
+        self.bias = nn.Parameter(torch.zeros(num_species))
+
+    def forward(self, target_env: torch.Tensor) -> torch.Tensor:
+        return target_env @ self.A @ self.B + self.bias
+
+
 class JSDMPredictionHead(nn.Module):
     def __init__(self, config: JSDMConfig):
         super().__init__()
@@ -490,10 +504,20 @@ class JSDMForMaskedSpeciesPrediction(nn.Module):
         self.config = config
         self.model = JSDMModel(config)
         self.cls = JSDMPredictionHead(config)
+        if config.per_species_env_rank > 0 and config.ablation in ("full", "no_st", "no_source_env"):
+            self.per_species_env_head = PerSpeciesEnvHead(
+                num_env_vars=config.num_env_vars,
+                num_species=config.num_species,
+                rank=config.per_species_env_rank,
+            )
+        else:
+            self.per_species_env_head = None
 
     def forward(self, labels=None, loss_type: str = "bce",
                 focal_alpha: float = 0.25, focal_gamma: float = 2.0, **kwargs):
         logits = self.cls(self.model(**kwargs))
+        if self.per_species_env_head is not None:
+            logits = logits + self.per_species_env_head(kwargs["target_env"]).unsqueeze(-1)
 
         loss = None
         if labels is not None:

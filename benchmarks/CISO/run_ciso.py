@@ -12,8 +12,7 @@ import torch
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common import (add_coord_args, add_species_arg, load_dataset, resolve_output_dir, timed_phase,  # noqa: E402
-                    write_metrics)
+from common import add_species_arg, load_dataset, resolve_output_dir, timed_phase, write_metrics  # noqa: E402
 from stemlm.metric import fixed_p_masks  # noqa: E402
 
 P_VALUES = (1.0, 0.75, 0.5, 0.25)
@@ -74,14 +73,13 @@ def main():
     parser.add_argument("--evaluate_only", action="store_true",
                         help="Skip training and score the best checkpoint already in --output_dir.")
     add_species_arg(parser)
-    add_coord_args(parser)
     args = parser.parse_args()
 
     output_dir = resolve_output_dir(args, __file__)
     data_dir, config_dir = output_dir / "data", output_dir / "configs"
     config_dir.mkdir(parents=True, exist_ok=True)
     df, env_cols, species_cols, splits = load_dataset(args.csv_path.resolve(), args.splits_path.resolve(),
-                                                      args.min_train_presences, args.coord_covariates, args.periods)
+                                                      args.min_train_presences)
     prepare_data(df, env_cols, species_cols, splits, data_dir)
 
     repo = args.ciso_repo.resolve()
@@ -140,7 +138,7 @@ def main():
             np.savez_compressed(output_dir / f"test_predictions_p{p:.2f}.npz", logits=logits,
                                 targets=targets, masks=masks, row_indices=splits["test"],
                                 species=np.asarray(species_cols))
-            results.append(({"cov_set": "full" if args.coord_covariates else "env", "masking_p": p}, logits, labels))
+            results.append(({"cov_set": "env", "masking_p": p}, logits, labels))
     write_metrics(output_dir, "CISO", results, species_cols,
                   df[species_cols].to_numpy()[splits["train"]].sum(0))
 

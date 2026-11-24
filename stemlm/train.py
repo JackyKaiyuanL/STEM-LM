@@ -317,12 +317,8 @@ def add_train_args(parser):
                         help="Ignore the time column (purely spatial model). The temporal FIRE "
                              "bias is also disabled automatically when every time value is equal.")
     parser.add_argument("--no_temporal_bias", action="store_true",
-                        help="Remove only the temporal FIRE bias from the model. Source selection, "
-                             "time windows and the day-of-year covariates still use the time column.")
-    parser.add_argument("--no_coord_covariates", action="store_true",
-                        help="Do not append the unit-sphere coordinates (x, y, z) and the sine and "
-                             "cosine of day of year at each --temporal_fire_init_periods value to "
-                             "the covariates.")
+                        help="Remove only the temporal FIRE bias from the model. Source selection "
+                             "and time windows still use the time column.")
     parser.add_argument("--train_exclusion", action=argparse.BooleanOptionalAction, default=True,
                         help="Per training target, remove candidate sources within a radius and, "
                              "independently, within a time window; each is 0 with probability 1/2 "
@@ -380,9 +376,15 @@ def add_train_args(parser):
                              "no_source_env keeps both and drops only the pooled source covariates.")
     parser.add_argument("--temporal_fire_init_periods", type=float, nargs="+", default=None,
                         help="Init periods (days) for learnable sin/cos channels added to "
-                             "FIRE temporal distance bias on ST attention scores, periodic on Δt. "
-                             "The day-of-year covariates use the same periods when the time "
-                             "column holds dates. Omit to disable both.")
+                             "FIRE temporal distance bias on ST attention scores. "
+                             "Periodic on Δt directly; per-species scales (if enabled) "
+                             "rescale Δt before the cos/sin. Omit to disable.")
+    parser.add_argument("--per_species_env_rank", type=int, default=8,
+                        help="Rank of the parallel per-species env head bolted in "
+                             "alongside the shared env encoder. Reads raw target_env "
+                             "via low-rank A∈(E,r)·B∈(r,S) (A zero-init, monotone safe) "
+                             "+ per-species bias. Active in full / no_st / no_source_env "
+                             "ablations; silent in no_env / no_st_env. 0 disables it.")
     parser.add_argument("--loss_type", choices=["bce", "focal"], default="focal",
                         help="Loss function. 'focal' = sigmoid focal loss "
                              "(Lin et al. 2017; default, alpha=0.25, gamma=2.0 "
@@ -462,8 +464,6 @@ def run_train(args):
         min_train_presences=args.min_train_presences,
         source_cell_resolution=args.source_cell_resolution,
         train_sources_only=args.train_sources_only,
-        periods=args.temporal_fire_init_periods,
-        coord_covariates=not args.no_coord_covariates,
     )
 
     if env.is_distributed:
@@ -509,8 +509,7 @@ def run_train(args):
         logger.info(f"Splits saved to {splits_out}")
     if env.is_main:
         with open(os.path.join(args.output_dir, "env_stats.json"), "w") as f:
-            json.dump({"env_cols": dataset.env_cols, "mean": dataset.env_mean.tolist(),
-                       "std": dataset.env_std.tolist()}, f, indent=2)
+            json.dump({"env_cols": dataset.env_cols, "mean": dataset.env_mean.tolist()}, f, indent=2)
     env.barrier()
 
     if args.loss_type == "focal":
@@ -546,6 +545,7 @@ def run_train(args):
         ),
         ablation=args.ablation,
         p=args.p,
+        per_species_env_rank=args.per_species_env_rank,
     )
 
     if env.is_main:
@@ -596,7 +596,8 @@ def run_train(args):
             f"(effective batch = {args.batch_size * args.grad_accum_steps * env.world_size})"
         )
 
-    no_decay_keys = ("norm", "bias", "spatial_log_scale", "temporal_log_scale")
+    no_decay_keys = ("norm", "bias",
+                     "species_spatial_log_scale", "species_temporal_log_scale")
     decay_params, nodecay_params = [], []
     for n, p in model.named_parameters():
         (nodecay_params if any(k in n for k in no_decay_keys) else decay_params).append(p)

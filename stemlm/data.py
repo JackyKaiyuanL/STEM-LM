@@ -97,14 +97,14 @@ def _bbox_max_distance(lats: np.ndarray, lons: np.ndarray, times: np.ndarray):
     return max_sp, float(times.max() - times.min())
 
 
-def _normalize_time_col(df: pd.DataFrame, time_col: str, no_time: bool) -> tuple[bool, np.ndarray | None]:
+def _normalize_time_col(df: pd.DataFrame, time_col: str, no_time: bool) -> bool:
     has_time = (not no_time) and (time_col in df.columns)
     if not has_time:
         reason = "--no_time" if no_time else f"column '{time_col}' not found"
         print(f"  Time ignored ({reason}) — purely spatial model")
         if time_col in df.columns:
             df.drop(columns=[time_col], inplace=True)
-        return False, None
+        return False
     col = df[time_col]
     is_stringlike = (col.dtype == "object"
                      or pd.api.types.is_datetime64_any_dtype(col)
@@ -112,20 +112,9 @@ def _normalize_time_col(df: pd.DataFrame, time_col: str, no_time: bool) -> tuple
     if is_stringlike:
         dt = pd.to_datetime(col)
         df[time_col] = (dt - dt.min()).dt.days.astype(float)
-        return True, dt.dt.dayofyear.to_numpy()
-    df[time_col] = df[time_col].astype(float)
-    return True, None
-
-
-def _coord_covariates(lats, lons, doy, periods) -> tuple[list[str], np.ndarray]:
-    names = ["env_x", "env_y", "env_z"]
-    columns = [_lonlat_to_xyz(lats, lons)]
-    if doy is not None:
-        for period in periods or ():
-            names += [f"env_doy_sin_{period:g}", f"env_doy_cos_{period:g}"]
-            phase = 2.0 * np.pi * doy / period
-            columns.append(np.column_stack([np.sin(phase), np.cos(phase)]))
-    return names, np.column_stack(columns).astype(np.float32)
+    else:
+        df[time_col] = df[time_col].astype(float)
+    return True
 
 
 def _list_column_to_csr_arrays(column) -> tuple[np.ndarray, np.ndarray]:
@@ -186,14 +175,12 @@ class JSDMDataset(Dataset):
         lon_col: str = "longitude",
         env_cols: list[str] | None = None,
         no_time: bool = False,
-        periods: tuple[float, ...] | None = None,
-        coord_covariates: bool = True,
     ):
         super().__init__()
         self.num_source_sites = num_source_sites
         df = read_table(csv_path)
 
-        has_time, doy = _normalize_time_col(df, time_col, no_time)
+        has_time = _normalize_time_col(df, time_col, no_time)
         coord_cols = ([time_col] if has_time else []) + [lat_col, lon_col]
         if env_cols is None:
             env_cols = [c for c in df.columns if c not in coord_cols and c.startswith("env_")]
@@ -205,21 +192,13 @@ class JSDMDataset(Dataset):
 
         species_data = df[species_cols].values.astype(np.float32)
         self._setup_post_load(df, species_data, species_cols, env_cols,
-                              time_col, lat_col, lon_col, has_time, doy, periods, coord_covariates)
+                              time_col, lat_col, lon_col, has_time)
 
     def _setup_post_load(self, df, species_data, species_cols, env_cols,
-                         time_col, lat_col, lon_col, has_time, doy, periods, coord_covariates):
+                         time_col, lat_col, lon_col, has_time):
         self.species_cols = species_cols
-        self.num_species = len(species_cols)
-        env_data = df[env_cols].values.astype(np.float32)
-        if coord_covariates:
-            names, values = _coord_covariates(df[lat_col].values, df[lon_col].values, doy, periods)
-            env_cols = env_cols + names
-            env_data = np.column_stack([env_data, values])
-            print(f"  Coordinate covariates: {', '.join(names)}")
-            if periods and has_time and doy is None:
-                print("  Time column is numeric: no day-of-year covariates")
         self.env_cols = env_cols
+        self.num_species = len(species_cols)
         if not env_cols:
             print(
                 "WARNING: no environmental columns detected (none with 'env_' prefix "
@@ -234,7 +213,10 @@ class JSDMDataset(Dataset):
         N = len(df)
         self.times = df[time_col].values.astype(np.float32) if has_time else np.zeros(N, dtype=np.float32)
         self.species_data = species_data
-        self.env_data = env_data if env_cols else np.zeros((N, 1), dtype=np.float32)
+        self.env_data = (
+            df[env_cols].values.astype(np.float32) if env_cols
+            else np.zeros((N, 1), dtype=np.float32)
+        )
         self.has_time = bool(has_time)
 
         print(f"Dataset: {N} observations, {self.num_species} species, {self.num_env_vars} env vars")
@@ -284,19 +266,10 @@ class JSDMDataset(Dataset):
         mask[np.asarray(value)] = True
         self._random_exclusion_mask = mask
 
-    def fill_env(self, rows=None, mean=None, std=None):
-        if mean is None:
-            train = self.env_data[np.asarray(rows)]
-            mean, std = np.nanmean(train, axis=0), np.nanstd(train, axis=0)
-        self.env_mean = np.asarray(mean, dtype=np.float32)
-        self.env_std = np.asarray(std, dtype=np.float32)
-        if not self.env_cols:
-            return
-        constant = [c for c, s in zip(self.env_cols, self.env_std, strict=True) if s == 0]
-        if constant:
-            raise ValueError(f"covariates constant on the training rows: {constant}")
-        filled = np.where(np.isnan(self.env_data), self.env_mean, self.env_data)
-        self.env_data = ((filled - self.env_mean) / self.env_std).astype(np.float32)
+    def fill_env(self, rows=None, mean=None):
+        self.env_mean = (np.nanmean(self.env_data[np.asarray(rows)], axis=0) if mean is None
+                         else np.asarray(mean)).astype(np.float32)
+        self.env_data = np.where(np.isnan(self.env_data), self.env_mean, self.env_data).astype(np.float32)
 
     def __len__(self):
         return len(self.species_data)
@@ -445,8 +418,6 @@ class JSDMSparseDataset(JSDMDataset):
         lon_col: str = "longitude",
         env_cols: list[str] | None = None,
         no_time: bool = False,
-        periods: tuple[float, ...] | None = None,
-        coord_covariates: bool = True,
     ):
         Dataset.__init__(self)
         self.num_source_sites = num_source_sites
@@ -476,7 +447,7 @@ class JSDMSparseDataset(JSDMDataset):
         df = table.drop(["species_idx"]).to_pandas()
         del table
 
-        has_time, doy = _normalize_time_col(df, time_col, no_time)
+        has_time = _normalize_time_col(df, time_col, no_time)
         coord_cols = ([time_col] if has_time else []) + [lat_col, lon_col]
         if env_cols is None:
             env_cols = [c for c in df.columns if c not in coord_cols and c.startswith("env_")]
@@ -491,7 +462,7 @@ class JSDMSparseDataset(JSDMDataset):
         species_data = _SparseSpeciesData(csr)
 
         self._setup_post_load(df, species_data, species_cols, env_cols,
-                              time_col, lat_col, lon_col, has_time, doy, periods, coord_covariates)
+                              time_col, lat_col, lon_col, has_time)
 
 
 class JSDMDataCollator:
@@ -711,8 +682,6 @@ def create_dataloaders(
     min_train_presences: int = MIN_TRAIN_PRESENCES,
     source_cell_resolution: int = 7,
     train_sources_only: bool = False,
-    periods=None,
-    coord_covariates: bool = True,
 ):
     if vocab_path is not None:
         dataset = JSDMSparseDataset(
@@ -721,8 +690,6 @@ def create_dataloaders(
             num_source_sites=num_source_sites,
             env_cols=env_cols,
             no_time=no_time,
-            periods=periods,
-            coord_covariates=coord_covariates,
         )
     else:
         dataset = JSDMDataset(
@@ -730,8 +697,6 @@ def create_dataloaders(
             num_source_sites=num_source_sites,
             env_cols=env_cols,
             no_time=no_time,
-            periods=periods,
-            coord_covariates=coord_covariates,
         )
 
     dist_info = compute_dist_info(dataset)
